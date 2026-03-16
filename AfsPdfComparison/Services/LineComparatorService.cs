@@ -4,17 +4,26 @@
 // ║                                                                              ║
 // ║  Author  : Mamishi Tonny Madire                                              ║
 // ║  Date    : 2026-03-15                                                        ║
-// ║  Version : 4.3                                                               ║
+// ║  Version : 4.3.2                                                             ║
 // ║                                                                              ║
 // ║  SERVICE — LineComparatorService                                             ║
 // ║  Core diff engine: line comparison, word diff, number extraction.            ║
 // ║                                                                              ║
+// ║  v4.3.2 FIX — Gate 5: Word-overlap line-wrap artefact gate                  ║
+// ║  ROOT CAUSE: pdfplumber/PdfPig wraps long paragraphs at different column    ║
+// ║  widths per PDF. The sentence:                                               ║
+// ║    "used. The separate financial statements...IAS 27 Consolidated"           ║
+// ║  in AFS1 continues in AFS2 as:                                               ║
+// ║    "used. The separate financial statements...IAS 27 Consolidated            ║
+// ║     and Separate Financial Statements."                                      ║
+// ║  These score 0.87–0.91 — above SIM_RELATED(0.55) so they are matched,      ║
+// ║  but below SIM_EXACT(0.94) so they were falsely flagged "changed".          ║
+// ║  Gate 5 fix: if >=85% of shorter line's words appear in the longer line     ║
+// ║  AND shorter is >=55% the length of longer → line-wrap artefact → "same"    ║
+// ║                                                                              ║
 // ║  References:                                                                 ║
 // ║   • Ratcliff/Obershelp string similarity — see PageAlignmentService         ║
-// ║   • Canonical normalisation: strips whitespace, punctuation, number         ║
-// ║     formatting artefacts before equality comparison                          ║
-// ║   • Number extraction: strips page-number stamps before tokenising          ║
-// ║   • Python equivalent: LineComparator class in the notebook                 ║
+// ║   • Python equivalent: LineComparator._determine_status() in notebook       ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 using System.Globalization;
@@ -39,12 +48,14 @@ namespace AfsPdfComparison.Services;
 //      d. Determine final status using the three-gate equality check.
 //   4. AFS 1 lines that were never matched are flagged as "removed".
 //
-// Three-gate equality:
+// Five-gate equality (v4.3.2):
 //   Gate 1 — Canonical string equality (ignores whitespace, punctuation, number fmt)
 //   Gate 2 — Similarity score ≥ SIM_EXACT (0.94)
 //   Gate 3 — All numbers match AND score ≥ 0.80
+//   Gate 4 — Normalised text equality
+//   Gate 5 — Word-overlap ≥ 0.85 AND length ratio ≥ 0.55 (line-wrap artefact)
 //
-// Reference: Python LineComparator class in the notebook.
+// Reference: Python LineComparator class in the notebook v4.3.2
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// <summary>
@@ -54,12 +65,12 @@ namespace AfsPdfComparison.Services;
 public class LineComparatorService
 {
     // ── Similarity thresholds ────────────────────────────────────────────────
-    // SIM_EXACT:   score at or above which lines are considered identical
-    //              (captures minor whitespace differences from PDF extraction)
-    // SIM_RELATED: minimum score to accept a line as a "changed" match;
-    //              below this threshold the line is treated as added/removed
     private const double SimExact   = 0.94;
     private const double SimRelated = 0.55;
+
+    // Gate 5 thresholds (word-overlap line-wrap artefact gate)
+    private const double WordOverlapThreshold = 0.85;
+    private const double LengthRatioThreshold = 0.55;
 
     // Regex: strip page-number stamps before number extraction.
     // Matches lines that are PURELY a page stamp (e.g. "- 40 -", "Page 3 of 10").
@@ -211,25 +222,23 @@ public class LineComparatorService
         var alignedI1   = new HashSet<int>();
         int pairIndex   = 0;
 
-        // Matched pairs
         foreach (var entry in alignment.Where(a => a.I2 >= 0))
         {
             int i1 = entry.I1, i2 = entry.I2;
-            double alignSim = entry.Sim;
             alignedI1.Add(i1);
-            var diff   = CompareLines(report1.Pages[i1], report2.Pages[i2]);
-            int same   = diff.Count(d => d.Status == "same");
-            int chg    = diff.Count(d => d.Status == "changed");
-            int add    = diff.Count(d => d.Status == "added");
-            int rem    = diff.Count(d => d.Status == "removed");
-            int total  = Math.Max(diff.Count, 1);
+            var diff  = CompareLines(report1.Pages[i1], report2.Pages[i2]);
+            int same  = diff.Count(d => d.Status == "same");
+            int chg   = diff.Count(d => d.Status == "changed");
+            int add   = diff.Count(d => d.Status == "added");
+            int rem   = diff.Count(d => d.Status == "removed");
+            int total = Math.Max(diff.Count, 1);
 
             results.Add(new PageDiffResult
             {
                 PairIndex  = pairIndex++,
                 PageAfs1   = i1 + 1,
                 PageAfs2   = i2 + 1,
-                AlignSim   = alignSim,
+                AlignSim   = entry.Sim,
                 Same       = same,
                 Changed    = chg,
                 Added      = add,
@@ -240,7 +249,6 @@ public class LineComparatorService
             });
         }
 
-        // Unmatched AFS 1 pages
         for (int i1 = 0; i1 < report1.Pages.Count; i1++)
         {
             if (alignedI1.Contains(i1)) continue;
@@ -345,21 +353,70 @@ public class LineComparatorService
         return Math.Min(1.0, sim + bonus + penalty);
     }
 
-    // Three-gate equality determination.
-    // Reference: Python LineComparator._determine_status()
+    /// <summary>
+    /// Five-gate equality determination. (v4.3.2)
+    ///
+    /// Gate 1 — Canonical string equality
+    /// Gate 2 — Similarity score ≥ SIM_EXACT (0.94)
+    /// Gate 3 — All numbers identical AND score ≥ 0.80
+    /// Gate 4 — Normalised text equality
+    /// Gate 5 — Word-overlap line-wrap artefact gate (NEW in v4.3.2)
+    ///
+    /// Gate 5 rationale:
+    /// PDF text extraction wraps long paragraphs at the column width of each
+    /// individual PDF. Two PDFs with slightly different margins produce the
+    /// same sentence broken at different points, e.g.:
+    ///   AFS1: "...requirements of IAS 27 Consolidated"         (line ends here)
+    ///   AFS2: "...requirements of IAS 27 Consolidated and Separate Financial..."
+    /// These score ~0.87–0.91 — matched but below SIM_EXACT — causing a false
+    /// "changed" flag and incorrect yellow highlight on the snapshot.
+    /// Gate 5: if ≥85% of the shorter line's word tokens appear in the longer
+    /// line AND the shorter is ≥55% the length of the longer, this is a
+    /// line-wrap artefact, not a genuine content change → return "same".
+    /// </summary>
     private static string DetermineStatus(string l1, string l2, double rawScore)
     {
+        // Gate 1: Canonical string equality
         if (Canonical(l1) == Canonical(l2))        return "same";
-        if (rawScore >= SimExact)                   return "same";
+
+        // Gate 2: Similarity score above exact threshold
+        if (rawScore >= SimExact)                  return "same";
+
+        // Gate 3: Numbers identical at lower score
         var n1 = ExtractNumbers(l1);
         var n2 = ExtractNumbers(l2);
         if (n1.SetEquals(n2) && rawScore >= 0.80)  return "same";
+
+        // Gate 4: Normalised text equality
+        if (Normalise(l1) == Normalise(l2))        return "same";
+
+        // Gate 5: Word-overlap line-wrap artefact gate
+        var w1 = new HashSet<string>(
+            Normalise(l1).Split(' ', StringSplitOptions.RemoveEmptyEntries),
+            StringComparer.OrdinalIgnoreCase);
+        var w2 = new HashSet<string>(
+            Normalise(l2).Split(' ', StringSplitOptions.RemoveEmptyEntries),
+            StringComparer.OrdinalIgnoreCase);
+
+        if (w1.Count > 0 && w2.Count > 0)
+        {
+            int    intersection = w1.Intersect(w2).Count();
+            int    maxLen       = Math.Max(w1.Count, w2.Count);
+            int    minLen       = Math.Min(w1.Count, w2.Count);
+            double overlap      = (double)intersection / maxLen;
+            double lenRatio     = (double)minLen / maxLen;
+
+            if (overlap >= WordOverlapThreshold && lenRatio >= LengthRatioThreshold)
+                return "same";
+        }
+
         return "changed";
     }
 
     // Normalise: lowercase, collapse whitespace, strip pure page-number lines.
+    // internal static — also used by Gate 4 / Gate 5 in DetermineStatus.
     // Reference: Python _normalise()
-    private static string Normalise(string s)
+    internal static string Normalise(string s)
     {
         string t = Regex.Replace((s ?? "").Trim().ToLowerInvariant(), @"\s+", " ");
         t = Regex.Replace(t, @"^[-–—\s]*\d{1,4}[-–—\s]*$", "").Trim();

@@ -2,14 +2,18 @@
 // ║  AFS PDF COMPARISON ANALYZER  — C# ASP.NET Core Web Application             ║
 // ║  SNG Grant Thornton | CAATs Platform                                         ║
 // ║                                                                              ║
-// ║  SERVICE — LineComparisonService                                             ║
+// ║  SERVICE — LineComparisonService  v4.3.2                                     ║
 // ║  Line-diff engine using F23.StringSimilarity.NormalizedLevenshtein for      ║
 // ║  the matching score, paired with TextNormaliser for canonicalisation.        ║
 // ║                                                                              ║
-// ║  NOTE: This service is additive alongside the existing LineComparatorService.║
-// ║   The existing LineComparatorService uses Ratcliff-Obershelp (SequenceMatcher║
-// ║   ratio) and populates LineDiffResult objects for the main app pipeline.    ║
-// ║   This service is used by the new ComparisonController (MVC route).         ║
+// ║  v4.3.2 FIX — Gate 5: Word-overlap line-wrap artefact gate                  ║
+// ║  ROOT CAUSE: PDF text extraction wraps long paragraphs at different column  ║
+// ║  widths per file. The same sentence broken differently scores 0.87-0.91 —   ║
+// ║  above SIM_RELATED (matched) but below SIM_EXACT (flagged "changed").       ║
+// ║  Gate 5: word overlap ≥ 85% AND length ratio ≥ 55% → "same"                ║
+// ║                                                                              ║
+// ║  NOTE: This service is used by ComparisonController (MVC route).            ║
+// ║  The main pipeline uses LineComparatorService (Ratcliff-Obershelp).         ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 using F23.StringSimilarity;
@@ -40,10 +44,13 @@ namespace AfsPdfComparison.Services
 
     public class LineComparisonService
     {
-        // SIM_EXACT:    score ≥ this → treat as Same (minor whitespace/format differences)
-        // SIM_RELATED:  score ≥ this → treat as a Changed pair (below = Added + Removed)
+        // ── Similarity thresholds ────────────────────────────────────────────────
         private const double SIM_EXACT   = 0.94;
         private const double SIM_RELATED = 0.55;
+
+        // Gate 5 thresholds (word-overlap line-wrap artefact gate)
+        private const double WORD_OVERLAP_THRESHOLD = 0.85;
+        private const double LENGTH_RATIO_THRESHOLD = 0.55;
 
         private readonly NormalizedLevenshtein _lev = new();
 
@@ -96,16 +103,63 @@ namespace AfsPdfComparison.Services
             return sim;
         }
 
-        private DiffStatus DetermineStatus(string l1, string l2, double rawScore)
+        /// <summary>
+        /// Determines whether two matched lines are "same" or "changed".
+        ///
+        /// Gate 1 — Canonical string equality
+        /// Gate 2 — Similarity score ≥ SIM_EXACT (0.94)
+        /// Gate 3 — All numbers identical AND score ≥ 0.80
+        /// Gate 4 — Normalised text equality (catches soft-hyphen / space variants)
+        /// Gate 5 — Word-overlap line-wrap artefact gate (v4.3.2)
+        ///
+        /// Gate 5 eliminates false highlights caused by PDF column-width differences.
+        /// Example: pdfplumber extracts the same paragraph as:
+        ///   AFS1: "...requirements of IAS 27 Consolidated"
+        ///   AFS2: "...requirements of IAS 27 Consolidated and Separate Financial..."
+        /// These score 0.87-0.91 and were falsely flagged as "changed".
+        /// Gate 5: if ≥85% of the shorter line's words appear in the longer
+        /// AND shorter ≥55% the length of longer → line-wrap artefact → "same".
+        /// </summary>
+        private static DiffStatus DetermineStatus(string l1, string l2, double rawScore)
         {
+            // Gate 1: Canonical string equality
             if (TextNormaliser.Canonicalise(l1) == TextNormaliser.Canonicalise(l2))
                 return DiffStatus.Same;
+
+            // Gate 2: Similarity score above exact threshold
             if (rawScore >= SIM_EXACT)
                 return DiffStatus.Same;
+
+            // Gate 3: Numbers identical at lower score
             var n1 = TextNormaliser.ExtractNumbers(l1);
             var n2 = TextNormaliser.ExtractNumbers(l2);
             if (n1.SetEquals(n2) && rawScore >= 0.80)
                 return DiffStatus.Same;
+
+            // Gate 4: Normalised text equality
+            if (TextNormaliser.Normalise(l1) == TextNormaliser.Normalise(l2))
+                return DiffStatus.Same;
+
+            // Gate 5: Word-overlap line-wrap artefact gate
+            var w1 = new HashSet<string>(
+                TextNormaliser.Normalise(l1).Split(' ', StringSplitOptions.RemoveEmptyEntries),
+                StringComparer.OrdinalIgnoreCase);
+            var w2 = new HashSet<string>(
+                TextNormaliser.Normalise(l2).Split(' ', StringSplitOptions.RemoveEmptyEntries),
+                StringComparer.OrdinalIgnoreCase);
+
+            if (w1.Count > 0 && w2.Count > 0)
+            {
+                int    intersection = w1.Intersect(w2).Count();
+                int    maxLen       = Math.Max(w1.Count, w2.Count);
+                int    minLen       = Math.Min(w1.Count, w2.Count);
+                double overlap      = (double)intersection / maxLen;
+                double lenRatio     = (double)minLen / maxLen;
+
+                if (overlap >= WORD_OVERLAP_THRESHOLD && lenRatio >= LENGTH_RATIO_THRESHOLD)
+                    return DiffStatus.Same;
+            }
+
             return DiffStatus.Changed;
         }
 

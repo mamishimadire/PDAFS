@@ -2,12 +2,15 @@
 // ║  AFS PDF COMPARISON ANALYZER  — C# ASP.NET Core Web Application             ║
 // ║  SNG Grant Thornton | CAATs Platform                                         ║
 // ║                                                                              ║
-// ║  SERVICE — TextNormaliser                                                    ║
+// ║  SERVICE — TextNormaliser  v4.3.2                                            ║
 // ║  Centralised text-normalisation utilities shared by PdfExtractionService,   ║
-// ║  LineComparisonService, and PageSnapshotService.                             ║
+// ║  LineComparisonService, LineComparatorService, and PageSnapshotService.      ║
+// ║                                                                              ║
+// ║  v4.3.2 CHANGE: Normalise() method made public so Gate 4 in                 ║
+// ║  LineComparisonService.DetermineStatus() can call it directly.              ║
 // ║                                                                              ║
 // ║  References:                                                                 ║
-// ║   • Python notebook v4.3 supplement — TextNormaliser                        ║
+// ║   • Python notebook v4.3.2 — _normalise() function                          ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 using System.Text.RegularExpressions;
@@ -48,8 +51,24 @@ namespace AfsPdfComparison.Services
         }
 
         /// <summary>
-        /// Strips whitespace/punctuation/number-format differences so that
-        /// "R 1 234 567" and "R1,234,567" compare as equal.
+        /// Lightweight normalisation: lowercase, collapse whitespace, strip
+        /// pure page-number lines.
+        /// Used by Gate 4 in DetermineStatus() — catches lines that are
+        /// identical after basic normalisation but survive Canonicalise().
+        /// Mirrors Python _normalise() function.
+        /// </summary>
+        public static string Normalise(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            string t = Regex.Replace(s.Trim().ToLowerInvariant(), @"\s+", " ");
+            t = Regex.Replace(t, @"^[-–—\s]*\d{1,4}[-–—\s]*$", "").Trim();
+            return t;
+        }
+
+        /// <summary>
+        /// Aggressive canonical form: strips whitespace/punctuation/number-format
+        /// differences so "R 1 234 567" and "R1,234,567" compare as equal.
+        /// Used by Gate 1 in DetermineStatus().
         /// </summary>
         public static string Canonicalise(string s)
         {
