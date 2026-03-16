@@ -626,37 +626,41 @@ async function showSnapshot() {
     const statusEl = document.getElementById('snap-status');
     const wrap = document.getElementById('snap-results');
     if (statusEl) statusEl.textContent = 'Loading...';
-    if (wrap) wrap.innerHTML = '<div style="color:#A78BFA;font-family:\'IBM Plex Mono\',monospace;font-size:11px;padding:6px">Rendering page images via Poppler…</div>';
+    if (wrap) wrap.innerHTML = '<div style="color:#A78BFA;font-family:\'IBM Plex Mono\',monospace;font-size:11px;padding:6px">Rendering page snapshots with highlights…</div>';
     try {
-        const res = await fetch('/api/snapshot?pairIndex=' + k).then(r => r.json());
+        // Fetch AFS1 and AFS2 snapshots in parallel — each call returns one image
+        const [r1, r2] = await Promise.all([
+            fetch('/api/snapshot?pairIndex=' + k + '&afsNum=1').then(r => r.json()),
+            fetch('/api/snapshot?pairIndex=' + k + '&afsNum=2').then(r => r.json()),
+        ]);
         if (statusEl) statusEl.textContent = '';
-        if (!res.b64Afs1 && !res.b64Afs2) {
+        if (!r1.success && !r2.success) {
             wrap.innerHTML = `<div style="background:#1C1A00;border:1px solid #F59E0B;color:#FCD34D;padding:10px 14px;border-radius:7px;font-size:12px;font-family:'IBM Plex Mono',monospace">
-                ⚠ ${esc(res.message || 'Page images unavailable — Poppler not installed.')}<br>
+                ⚠ ${esc(r1.message || r2.message || 'Snapshots unavailable.')}<br>
                 <span style="color:#94A3B8;font-size:11px">The page diff text view is available in the "Page Map" tab.</span>
             </div>`;
             return;
         }
-        const pct = res.pctSame;
+        const pct = r1.pctSame ?? r2.pctSame ?? 0;
         const fc  = pct === 100 ? '#10B981' : pct >= 70 ? '#F59E0B' : '#EF4444';
         const p   = window._cmpData?.pageDiffs?.[k];
+        const pg1 = (r1.pageAfs1 ?? 0) + 1;   // 0-based → 1-based display
+        const pg2 = r1.pageAfs2 != null ? r1.pageAfs2 + 1 : null;
         let html  = `<div style="background:#111827;border-radius:7px;padding:8px 12px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:#CBD5E1;margin-bottom:8px">
-            <b style="color:#A78BFA">Pair ${k+1}</b>  |
-            <span style="color:#7B4FFF"> ${esc(res.afs1Label)}</span>  |
-            <span style="color:#10B981"> ✓ ${res.same} same</span>
-            <span style="color:#F59E0B"> ~ ${res.changed} changed</span>
-            <span style="color:#3B82F6"> + ${res.added} added</span>
-            <span style="color:#EF4444"> − ${res.removed} removed</span>  |
+            <b style="color:#A78BFA">Pair ${k+1}</b>  |  AFS 1 p${pg1} ↔ AFS 2 p${pg2 ?? '?'}  |
+            <span style="color:#10B981"> ✓ ${r1.same ?? 0} same</span>
+            <span style="color:#F59E0B"> ~ ${r1.changed ?? 0} changed</span>
+            <span style="color:#3B82F6"> + ${r1.added ?? 0} added</span>
+            <span style="color:#EF4444"> − ${r1.removed ?? 0} removed</span>  |
             <span style="color:${fc}">${pct}% same</span>
         </div>`;
-        // Side-by-side page images
-        html += '<div style="color:#64748B;font-size:10px;font-family:\'IBM Plex Mono\',monospace;margin-bottom:4px">Yellow bands = changed / added / removed lines — from the Page Map text diff</div>';
+        html += '<div style="color:#64748B;font-size:10px;font-family:\'IBM Plex Mono\',monospace;margin-bottom:4px">Yellow bands = changed / added / removed lines</div>';
         html += '<table style="width:100%;border-collapse:collapse"><tr>';
-        html += res.b64Afs1
-            ? `<td style="width:50%;padding:3px;vertical-align:top"><img src="data:image/png;base64,${res.b64Afs1}" style="width:100%;border-radius:6px;border:1px solid rgba(255,255,255,0.1);box-shadow:0 4px 16px rgba(0,0,0,0.5)"/><div style="font-size:10px;color:#64748B;text-align:center;margin-top:3px;font-family:'IBM Plex Mono',monospace">${esc(res.afs1Label)}</div></td>`
-            : `<td style="width:50%;padding:3px;vertical-align:top"><div style="background:#111827;border:1px dashed #374151;border-radius:6px;padding:40px;text-align:center;color:#64748B">Image unavailable</div></td>`;
-        html += res.b64Afs2
-            ? `<td style="width:50%;padding:3px;vertical-align:top"><img src="data:image/png;base64,${res.b64Afs2}" style="width:100%;border-radius:6px;border:1px solid rgba(255,255,255,0.1);box-shadow:0 4px 16px rgba(0,0,0,0.5)"/><div style="font-size:10px;color:#64748B;text-align:center;margin-top:3px;font-family:'IBM Plex Mono',monospace">${esc(res.afs2Label)}</div></td>`
+        html += r1.success && r1.b64
+            ? `<td style="width:50%;padding:3px;vertical-align:top"><div style="font-size:10px;color:#A78BFA;font-family:'IBM Plex Mono',monospace;margin-bottom:3px">AFS 1 — page ${pg1} <span style="color:#F59E0B">(yellow = changed/removed)</span></div><img src="data:image/png;base64,${r1.b64}" style="width:100%;border-radius:6px;border:1px solid rgba(255,255,255,0.1);box-shadow:0 4px 16px rgba(0,0,0,0.5)"/></td>`
+            : `<td style="width:50%;padding:3px;vertical-align:top"><div style="background:#111827;border:1px dashed #374151;border-radius:6px;padding:40px;text-align:center;color:#64748B">AFS 1 unavailable<br><small>${esc(r1.message||'')}</small></div></td>`;
+        html += r2.success && r2.b64
+            ? `<td style="width:50%;padding:3px;vertical-align:top"><div style="font-size:10px;color:#A78BFA;font-family:'IBM Plex Mono',monospace;margin-bottom:3px">AFS 2 — page ${pg2 ?? '?'} <span style="color:#F59E0B">(yellow = changed/added)</span></div><img src="data:image/png;base64,${r2.b64}" style="width:100%;border-radius:6px;border:1px solid rgba(255,255,255,0.1);box-shadow:0 4px 16px rgba(0,0,0,0.5)"/></td>`
             : `<td style="width:50%;padding:3px;vertical-align:top"><div style="background:#1C1400;border-radius:6px;padding:40px;text-align:center;color:#F59E0B;font-size:12px">Page has no match in AFS 2</div></td>`;
         html += '</tr></table>';
         // Change list for this page pair
@@ -675,7 +679,7 @@ async function showSnapshot() {
             });
             html += '</tbody></table>';
         }
-        html += commentBox('page:'+k, `AFS1 p${p?.pageAfs1||k+1} ↔ AFS2 p${p?.pageAfs2||'?'} findings`);
+        html += commentBox('page:'+k, `AFS1 p${pg1} ↔ AFS2 p${pg2||'?'} findings`);
         wrap.innerHTML = html;
     } catch (e) {
         if (statusEl) statusEl.textContent = '';

@@ -833,82 +833,76 @@ public class AfsController : Controller
     }
 
     // ── API: Page Visual Snapshot ─────────────────────────────────────────────
-    // Renders a PDF page to PNG using Poppler pdftoppm (already installed by notebook).
-    // Returns base64-encoded PNG strings for both pages in the selected pair.
+    // Renders one PDF page side (AFS1 or AFS2) with yellow highlight bands over changed lines.
+    // Called twice in parallel by the JS — once with afsNum=1 and once with afsNum=2.
+    // Uses SkiaSharp renderer exclusively (no Poppler dependency).
     // Reference: Python _pdf_page_to_b64() + _show_page_snapshot()
     [HttpGet("api/snapshot")]
-    public IActionResult ApiSnapshot([FromQuery] int pairIndex)
+    public IActionResult ApiSnapshot([FromQuery] int pairIndex = 0, [FromQuery] int afsNum = 1)
     {
         var cmp = _session.GetComparison();
         if (cmp == null)
-            return Json(new { success = false, message = "No comparison found. Run Step 4 first." });
+            return Json(new { success = false, message = "No comparison in session." });
 
         if (pairIndex < 0 || pairIndex >= cmp.PageDiffs.Count)
             return Json(new { success = false, message = "Pair index out of range." });
 
-        var pd  = cmp.PageDiffs[pairIndex];
-        string? b1 = null, b2 = null;
+        var pageDiff = cmp.PageDiffs[pairIndex];
 
-        // Collect highlight texts — lines that changed/were removed on AFS1 side,
-        // and lines that changed/were added on AFS2 side (mirrors Python hl1/hl2).
-        var hl1 = pd.Diffs
-            .Where(d => d.Status == "changed" || d.Status == "removed")
-            .Select(d => d.Line1)
-            .Where(l => !string.IsNullOrWhiteSpace(l))
-            .ToArray();
-        var hl2 = pd.Diffs
-            .Where(d => d.Status == "changed" || d.Status == "added")
-            .Select(d => d.Line2)
-            .Where(l => !string.IsNullOrWhiteSpace(l))
-            .ToArray();
+        string? pdfPath;
+        int     pageIdx;
+        List<string> highlightTexts;
 
-        try { b1 = RenderPageToPngWithHighlights(cmp.Report1.PdfPath, (pd.PageAfs1 ?? 1) - 1, hl1); } catch { }
-        if (pd.PageAfs2.HasValue)
-            try { b2 = RenderPageToPngWithHighlights(cmp.Report2.PdfPath, pd.PageAfs2.Value - 1, hl2); } catch { }
-
-        // BUG FIX #2: Fallback to SkiaSharp-based renderer when Poppler is not available.
-        // PageSnapshotService uses PdfPig + SkiaSharp (no external process required),
-        // ensuring yellow highlight bands always appear even without Poppler installed.
-        if (b1 == null && !string.IsNullOrEmpty(cmp.Report1.PdfPath) &&
-            System.IO.File.Exists(cmp.Report1.PdfPath))
+        if (afsNum == 1)
         {
-            try
-            {
-                var bytes = System.IO.File.ReadAllBytes(cmp.Report1.PdfPath);
-                b1 = _snapshots.RenderPageToBase64(bytes, (pd.PageAfs1 ?? 1) - 1, hl1.ToList());
-                if (b1 == "") b1 = null;
-            }
-            catch { }
+            pdfPath = cmp.Report1.PdfPath;
+            // PageAfs1 is 1-based; RenderPageToBase64 takes 0-based index
+            pageIdx = (pageDiff.PageAfs1 ?? 1) - 1;
+            highlightTexts = pageDiff.Diffs
+                .Where(d => d.Status == "changed" || d.Status == "removed")
+                .Select(d => d.Line1 ?? "")
+                .Where(l => l.Length >= 4)
+                .Take(50)
+                .ToList();
         }
-        if (b2 == null && pd.PageAfs2.HasValue && !string.IsNullOrEmpty(cmp.Report2.PdfPath) &&
-            System.IO.File.Exists(cmp.Report2.PdfPath))
+        else
         {
-            try
-            {
-                var bytes = System.IO.File.ReadAllBytes(cmp.Report2.PdfPath);
-                b2 = _snapshots.RenderPageToBase64(bytes, pd.PageAfs2.Value - 1, hl2.ToList());
-                if (b2 == "") b2 = null;
-            }
-            catch { }
+            pdfPath = cmp.Report2.PdfPath;
+            // PageAfs2 is 1-based; RenderPageToBase64 takes 0-based index
+            pageIdx = (pageDiff.PageAfs2 ?? 1) - 1;
+            highlightTexts = pageDiff.Diffs
+                .Where(d => d.Status == "changed" || d.Status == "added")
+                .Select(d => d.Line2 ?? "")
+                .Where(l => l.Length >= 4)
+                .Take(50)
+                .ToList();
         }
 
-        bool ok = b1 != null || b2 != null;
-        return Json(new
+        if (string.IsNullOrEmpty(pdfPath) || !System.IO.File.Exists(pdfPath))
+            return Json(new { success = false, message = "PDF file not found on server." });
+
+        try
         {
-            success   = ok,
-            b64Afs1   = b1,
-            b64Afs2   = b2,
-            afs1Label = $"AFS 1 — page {pd.PageAfs1} — {cmp.Report1.Filename}",
-            afs2Label = pd.PageAfs2.HasValue
-                ? $"AFS 2 — page {pd.PageAfs2} — {cmp.Report2.Filename}"
-                : "UNMATCHED",
-            message   = ok ? "ok" : "Images unavailable — Poppler not found.",
-            pctSame   = pd.PctSame,
-            same      = pd.Same,
-            changed   = pd.Changed,
-            added     = pd.Added,
-            removed   = pd.Removed,
-        });
+            byte[] pdfBytes = System.IO.File.ReadAllBytes(pdfPath);
+            string b64      = _snapshots.RenderPageToBase64(pdfBytes, pageIdx, highlightTexts);
+            return Json(new
+            {
+                success  = true,
+                b64      = b64,
+                // Return 0-based pageIdx so JS can display pageIdx+1 as the 1-based page number
+                pageAfs1 = (pageDiff.PageAfs1 ?? 1) - 1,
+                pageAfs2 = pageDiff.PageAfs2.HasValue ? pageDiff.PageAfs2.Value - 1 : (int?)null,
+                pctSame  = pageDiff.PctSame,
+                changed  = pageDiff.Changed,
+                added    = pageDiff.Added,
+                removed  = pageDiff.Removed,
+                same     = pageDiff.Same,
+            });
+        }
+        catch (Exception ex)
+        {
+            return Json(new { success = false, message = "Snapshot error: " + ex.Message });
+        }
     }
 
     // ── Poppler path discovery (mirrors Python _find_poppler()) ──────────────
