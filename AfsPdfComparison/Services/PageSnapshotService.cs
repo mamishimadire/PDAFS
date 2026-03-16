@@ -93,22 +93,28 @@ namespace AfsPdfComparison.Services
                 foreach (var grp in lineGroups)
                 {
                     var words = grp.ToList();
-                    var lineText = string.Join(" ",
-                        words.OrderBy(w => w.BoundingBox.Left).Select(w => w.Text ?? ""))
-                        .ToLower();
+                    // Collapse whitespace, same as AfsController.RenderPageToPngWithHighlights
+                    var lineText = System.Text.RegularExpressions.Regex.Replace(
+                        string.Join(" ", words.OrderBy(w => w.BoundingBox.Left).Select(w => w.Text ?? "")),
+                        @"\s+", " ").Trim().ToLower();
 
-                    // Exact Python port: needle = ht.strip().lower()[:30]
-                    // if needle and (needle in line_txt or line_txt[:30] in needle)
-                    // Guard: only allow reverse-contains when lineHead30 >= 6 chars to prevent
-                    // single-digit page numbers (e.g. "2" from "-2-") matching inside the needle.
+                    // Forward check:  needle (first 30 chars of highlight text) appears
+                    //                 verbatim in the rendered line.
+                    // Reverse check:  the rendered line is a PREFIX of the needle —
+                    //                 handles the case where PdfPig groups fewer words into
+                    //                 the Y-bucket than the comparison extractor did.
+                    //                 StartsWith (not Contains) prevents phrases that appear
+                    //                 in the MIDDLE of the needle from matching wrong lines.
+                    // Min length 4: same floor as TextNormaliser.IsNoise (mirrors Python 'if needle').
                     bool matched = highlightTexts.Any(ht =>
                     {
-                        var rawN = (ht ?? "").Trim().ToLower();
+                        var rawN = System.Text.RegularExpressions.Regex
+                            .Replace((ht ?? "").Trim(), @"\s+", " ").ToLower();
                         if (rawN.Length < 4) return false;
-                        var needle     = rawN.Length    > 30 ? rawN[..30]       : rawN;
-                        var lineHead30 = lineText.Length > 30 ? lineText[..30] : lineText;
+                        var needle     = rawN.Length      > 30 ? rawN[..30]       : rawN;
+                        var lineHead30 = lineText.Length  > 30 ? lineText[..30]  : lineText;
                         return lineText.Contains(needle) ||
-                               (lineHead30.Length >= 6 && needle.Contains(lineHead30));
+                               (lineHead30.Length >= 4 && needle.StartsWith(lineHead30));
                     });
 
                     if (!matched) continue;

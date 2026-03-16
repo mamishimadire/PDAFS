@@ -1059,16 +1059,24 @@ public class AfsController : Controller
                     string rawNeedle = System.Text.RegularExpressions.Regex
                         .Replace(ht.Trim(), @"\s+", " ")
                         .ToLowerInvariant();
+                    // Skip noise-level needles (mirrors Python: 'if needle').
+                    // 4 chars is the same floor used by TextNormaliser.IsNoise.
                     if (rawNeedle.Length < 4) continue;
                     string needle      = rawNeedle.Length > 30 ? rawNeedle[..30] : rawNeedle;
                     string lineHead30  = lineTxt.Length   > 30 ? lineTxt[..30]   : lineTxt;
 
-                    // Mirrors Python: needle in line_txt OR line_txt[:30] in needle
-                    // Guard: only allow reverse-contains when lineHead30 is >= 6 chars.
-                    // PdfPig can split "-2-" into separate Y-buckets so lineHead30="2"
-                    // which would false-match inside needle (e.g. "...2008...").
+                    // Forward check:  the needle (first 30 chars of the highlight text)
+                    //                 appears verbatim anywhere in the rendered line.
+                    // Reverse check:  the rendered line is a PREFIX of the needle — i.e.
+                    //                 PdfPig split the table row into a shorter bucket
+                    //                 (description only, numbers in a separate bucket).
+                    //                 StartsWith (not Contains) is the key false-positive fix:
+                    //                 a phrase inside the needle (e.g. "before tax") cannot
+                    //                 match a different line whose text does not START with it.
+                    //                 Guard >= 4 still blocks 1-3 char page-stamp buckets
+                    //                 like "-2-" which PdfPig splits into a bucket of just "2".
                     bool matched = lineTxt.Contains(needle) ||
-                                   (lineHead30.Length >= 6 && needle.Contains(lineHead30));
+                                   (lineHead30.Length >= 4 && needle.StartsWith(lineHead30));
 
                     if (matched)
                     {
