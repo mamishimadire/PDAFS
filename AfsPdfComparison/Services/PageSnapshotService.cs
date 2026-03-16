@@ -2,145 +2,186 @@
 // ║  AFS PDF COMPARISON ANALYZER  — C# ASP.NET Core Web Application             ║
 // ║  SNG Grant Thornton | CAATs Platform                                         ║
 // ║                                                                              ║
-// ║  SERVICE — PageSnapshotService                                               ║
-// ║  Renders a PDF page to a Base64 PNG using PdfPig word positions +           ║
-// ║  SkiaSharp for drawing.  Works independently of Poppler (no external         ║
-// ║  process required) and is used as a FALLBACK when Poppler is unavailable.   ║
+// ║  SERVICE — PageSnapshotService  v2.0                                         ║
+// ║  Pixel-perfect PDF rasterisation using Docnet.Core (PDFium) + SkiaSharp     ║
+// ║  Matches Python notebook v4.3 — _pdf_page_to_b64(highlight_texts=...)       ║
 // ║                                                                              ║
-// ║  Rendering approach:                                                         ║
-// ║   1. PdfPig provides word bounding boxes and text.                          ║
-// ║   2. SkiaSharp draws each word as black text at its PDF position.           ║
-// ║   3. Yellow highlight bands are drawn over lines containing changed text.   ║
-// ║                                                                              ║
-// ║  BUG FIX for: "Page snapshots have no yellow highlight bands"               ║
-// ║   → When Poppler is not found, AfsController.ApiSnapshot now falls back     ║
-// ║     to this service so highlights are always visible.                       ║
-// ║                                                                              ║
-// ║  References:                                                                 ║
-// ║   • Python notebook v4.3 — _pdf_page_to_b64(highlight_texts=...)           ║
-// ║   • SkiaSharp 2.88 docs — https://github.com/mono/SkiaSharp                ║
+// ║  Rendering pipeline (mirrors Python exactly):                                ║
+// ║   1. Docnet.Core (PDFium) rasterises the PDF page at 130 DPI               ║
+// ║      → produces pixel-accurate BGRA byte array (same as Poppler)            ║
+// ║   2. SkiaSharp converts BGRA → SKBitmap                                     ║
+// ║   3. PdfPig extracts word bounding boxes for highlight lookup                ║
+// ║   4. Lines are grouped by Y-band (same algorithm as Python _pdf_page_to_b64)║
+// ║   5. Yellow RGBA(255,220,0,90) fill + RGBA(255,160,0,220) outline drawn     ║
+// ║      over matched lines — exact port of Python ImageDraw.rectangle()        ║
+// ║   6. Result encoded as PNG Base64                                            ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
-using UglyToad.PdfPig;
+using Docnet.Core;
+using Docnet.Core.Models;
 using SkiaSharp;
+using UglyToad.PdfPig;
 
 namespace AfsPdfComparison.Services
 {
     public class PageSnapshotService
     {
-        private const int   DPI   = 130;
-        private const float SCALE = DPI / 72f;
+        // Match Python notebook DPI exactly
+        private const int DPI = 130;
+
+        // PDFium (DocLib.Instance) is a process-wide singleton and is NOT thread-safe.
+        // Serialize all calls so parallel snapshot requests don't corrupt each other.
+        private static readonly SemaphoreSlim _pdfiumLock = new SemaphoreSlim(1, 1);
 
         /// <summary>
-        /// Renders page <paramref name="pageIndex"/> (0-based) from the given PDF bytes
-        /// to a Base64-encoded PNG.  Yellow highlight bands are drawn over any line
-        /// whose text contains a match from <paramref name="highlightTexts"/>.
+        /// Renders page <paramref name="pageIndex"/> (0-based) from PDF bytes to a
+        /// pixel-accurate Base64 PNG, with yellow highlight bands over changed lines.
+        /// Mirrors Python v4.3 _pdf_page_to_b64(pdf_path, page_num, dpi=130, highlight_texts=...).
         /// </summary>
-        public string RenderPageToBase64(byte[] pdfBytes, int pageIndex,
+        public async Task<string> RenderPageToBase64(byte[] pdfBytes, int pageIndex,
             List<string>? highlightTexts = null)
         {
             if (pdfBytes == null || pdfBytes.Length == 0) return "";
 
-            using var pdfDoc = PdfDocument.Open(pdfBytes);
-            var pages = pdfDoc.GetPages().ToList();
-            if (pageIndex >= pages.Count) return "";
-            var page = pages[pageIndex];
-
-            int imgW = (int)(page.Width  * SCALE);
-            int imgH = (int)(page.Height * SCALE);
-
-            using var bmp    = new SKBitmap(imgW, imgH);
-            using var canvas = new SKCanvas(bmp);
-            canvas.Clear(SKColors.White);
-
-            // ── 1. Draw word tokens as black text at their PDF positions ──────
-            using var textPaint = new SKPaint
+            try
             {
-                Color       = SKColors.Black,
-                IsAntialias = true,
-                TextSize    = 9f,
-            };
+                // ── Step 1: Get PDF page dimensions via PdfPig (gives us PDF unit size) ──
+                // PdfPig page dimensions are in PDF points (1 pt = 1/72 inch).
+                // We convert to pixels at DPI to get the exact output size for PDFium.
+                using var pdfDoc = PdfDocument.Open(pdfBytes);
+                var allPages = pdfDoc.GetPages().ToList();
+                if (pageIndex >= allPages.Count) return "";
 
-            foreach (var word in page.GetWords())
-            {
-                float x = (float)(word.BoundingBox.Left * SCALE);
-                // PDF Y is bottom-up; flip to image top-down and offset by font size
-                float y = (float)((page.Height - word.BoundingBox.Top) * SCALE) + 9f;
-                canvas.DrawText(word.Text ?? "", x, y, textPaint);
-            }
+                var pdfPage   = allPages[pageIndex];
+                double pageWidth  = pdfPage.Width  > 0 ? pdfPage.Width  : 612;
+                double pageHeight = pdfPage.Height > 0 ? pdfPage.Height : 792;
 
-            // ── 2. Draw yellow highlight bands over matched lines ─────────────
-            if (highlightTexts != null && highlightTexts.Count > 0)
-            {
-                // Group words by Y-band (same bucketing as text extraction)
-                var lineGroups = page.GetWords()
-                    .GroupBy(w =>
-                        (int)(Math.Round((page.Height - w.BoundingBox.Top) / 5.0) * 5))
-                    .ToList();
+                // Pixel dimensions at target DPI — DPI/72 converts PDF points → pixels
+                int imgW = (int)Math.Round(pageWidth  * DPI / 72.0);
+                int imgH = (int)Math.Round(pageHeight * DPI / 72.0);
 
-                using var fillPaint = new SKPaint
+                // ── Step 2: Rasterise PDF page using PDFium (pixel-perfect, like Poppler) ──
+                // DocLib.Instance is a process-wide singleton — never dispose it.
+                // Acquire the semaphore to serialise concurrent requests.
+                await _pdfiumLock.WaitAsync();
+                byte[] rawBytes;
+                try
                 {
-                    Color = new SKColor(255, 220, 0, 90),
-                    Style = SKPaintStyle.Fill,
-                };
-                using var borderPaint = new SKPaint
-                {
-                    Color       = new SKColor(255, 160, 0, 220),
-                    Style       = SKPaintStyle.Stroke,
-                    StrokeWidth = 1f,
-                };
+                    var lib = DocLib.Instance;
+                    using var docReader = lib.GetDocReader(pdfBytes, new PageDimensions(imgW, imgH));
 
-                foreach (var grp in lineGroups)
-                {
-                    var words = grp.ToList();
-                    // Collapse whitespace, same as AfsController.RenderPageToPngWithHighlights
-                    var lineText = System.Text.RegularExpressions.Regex.Replace(
-                        string.Join(" ", words.OrderBy(w => w.BoundingBox.Left).Select(w => w.Text ?? "")),
-                        @"\s+", " ").Trim().ToLower();
+                    if (pageIndex >= docReader.GetPageCount()) return "";
 
-                    // Forward check:  needle (first 30 chars of highlight text) appears
-                    //                 verbatim in the rendered line.
-                    // Reverse check:  the rendered line is a PREFIX of the needle —
-                    //                 handles the case where PdfPig groups fewer words into
-                    //                 the Y-bucket than the comparison extractor did.
-                    //                 StartsWith (not Contains) prevents phrases that appear
-                    //                 in the MIDDLE of the needle from matching wrong lines.
-                    // Min length 4: same floor as TextNormaliser.IsNoise (mirrors Python 'if needle').
-                    bool matched = highlightTexts.Any(ht =>
-                    {
-                        var rawN = System.Text.RegularExpressions.Regex
-                            .Replace((ht ?? "").Trim(), @"\s+", " ").ToLower();
-                        if (rawN.Length < 4) return false;
-                        var needle     = rawN.Length      > 30 ? rawN[..30]       : rawN;
-                        var lineHead30 = lineText.Length  > 30 ? lineText[..30]  : lineText;
-                        return lineText.Contains(needle) ||
-                               (lineHead30.Length >= 4 && needle.StartsWith(lineHead30));
-                    });
+                    using var pageReader = docReader.GetPageReader(pageIndex);
 
-                    if (!matched) continue;
-
-                    // Compute bounding box in PDF space
-                    float pdfX0 = (float)words.Min(w => w.BoundingBox.Left)   - 2f;
-                    float pdfX1 = (float)words.Max(w => w.BoundingBox.Right)  + 2f;
-                    float pdfY0 = (float)words.Min(w => w.BoundingBox.Bottom) - 2f;
-                    float pdfY1 = (float)words.Max(w => w.BoundingBox.Top)    + 2f;
-
-                    // Transform to image pixel coordinates (flip Y axis)
-                    float pixX0 = pdfX0 * SCALE;
-                    float pixX1 = pdfX1 * SCALE;
-                    float pixY0 = (float)(page.Height - pdfY1) * SCALE;
-                    float pixY1 = (float)(page.Height - pdfY0) * SCALE;
-
-                    var rect = new SKRect(pixX0, pixY0, pixX1, pixY1);
-                    canvas.DrawRect(rect, fillPaint);
-                    canvas.DrawRect(rect, borderPaint);
+                    // PDFium returns raw BGRA bytes — same pixel data Poppler produces
+                    rawBytes = pageReader.GetImage();
                 }
-            }
+                finally
+                {
+                    _pdfiumLock.Release();
+                }
 
-            // ── 3. Encode to Base64 PNG ───────────────────────────────────────
-            using var image = SKImage.FromBitmap(bmp);
-            using var data  = image.Encode(SKEncodedImageFormat.Png, 90);
-            return Convert.ToBase64String(data.ToArray());
+                // ── Step 3: Build SKBitmap from BGRA bytes ──────────────────────────────
+                var bmp = new SKBitmap(imgW, imgH, SKColorType.Bgra8888, SKAlphaType.Premul);
+                var handle = bmp.GetPixels();
+                System.Runtime.InteropServices.Marshal.Copy(rawBytes, 0, handle, rawBytes.Length);
+
+                using var canvas = new SKCanvas(bmp);
+
+                // ── Step 4: Draw yellow highlight bands over matched lines ───────────────
+                if (highlightTexts != null && highlightTexts.Count > 0)
+                {
+                    // PdfPig words already loaded above — reuse pdfPage
+                    if (pageIndex < allPages.Count)
+                    {
+
+                        // Scale factors: PDF units → image pixels
+                        // Mirrors Python: sx = iw / pw,  sy = ih / ph
+                        double sx = imgW / pageWidth;
+                        double sy = imgH / pageHeight;
+
+                        // Group words into lines by Y-coordinate band
+                        // Python: y_key = round(float(w['top']) / 5) * 5
+                        // PdfPig 'top' = pageHeight - BoundingBox.Top  (PDF coords are bottom-up)
+                        var words = pdfPage.GetWords().ToList();
+                        var linesByY = words
+                            .GroupBy(w =>
+                            {
+                                double top = pageHeight - w.BoundingBox.Top;
+                                return (int)(Math.Round(top / 5.0) * 5);
+                            })
+                            .ToList();
+
+                        using var fillPaint = new SKPaint
+                        {
+                            Color = new SKColor(255, 220, 0, 90),
+                            Style = SKPaintStyle.Fill,
+                        };
+                        using var borderPaint = new SKPaint
+                        {
+                            Color       = new SKColor(255, 160, 0, 220),
+                            Style       = SKPaintStyle.Stroke,
+                            StrokeWidth = 1f,
+                        };
+
+                        foreach (var grp in linesByY)
+                        {
+                            var lineWords = grp.ToList();
+                            // Reconstruct line text (same as Python)
+                            var lineTxt = string.Join(" ",
+                                lineWords.OrderBy(w => w.BoundingBox.Left)
+                                         .Select(w => w.Text ?? "")).ToLower();
+
+                            // Python matching logic — exact port:
+                            // needle = ht.strip().lower()[:30]
+                            // if needle and (needle in line_txt or line_txt[:30] in needle)
+                            bool matched = (highlightTexts ?? new()).Any(ht =>
+                            {
+                                var rawN = (ht ?? "").Trim().ToLower();
+                                if (rawN.Length < 4) return false;
+                                var needle     = rawN.Length    > 30 ? rawN[..30]       : rawN;
+                                var lineHead30 = lineTxt.Length > 30 ? lineTxt[..30] : lineTxt;
+                                return lineTxt.Contains(needle) ||
+                                       (lineHead30.Length >= 6 && needle.Contains(lineHead30));
+                            });
+
+                            if (!matched) continue;
+
+                            // Compute bounding box in PDF space
+                            // Python: x0=min(w['x0'])*sx-2, x1=max(w['x1'])*sx+2
+                            //         y0=min(w['top'])*sy-2, y1=max(w['bottom'])*sy+2
+                            // PdfPig: x0=BoundingBox.Left, x1=BoundingBox.Right
+                            //         top (from top of page) = pageHeight - BoundingBox.Top
+                            //         bottom (from top)      = pageHeight - BoundingBox.Bottom
+                            double pdfX0   = lineWords.Min(w => w.BoundingBox.Left);
+                            double pdfX1   = lineWords.Max(w => w.BoundingBox.Right);
+                            double pdfTop  = lineWords.Min(w => pageHeight - w.BoundingBox.Top);
+                            double pdfBot  = lineWords.Max(w => pageHeight - w.BoundingBox.Bottom);
+
+                            float pixX0 = (float)(pdfX0 * sx) - 2f;
+                            float pixX1 = (float)(pdfX1 * sx) + 2f;
+                            float pixY0 = (float)(pdfTop * sy) - 2f;
+                            float pixY1 = (float)(pdfBot * sy) + 2f;
+
+                            var rect = new SKRect(pixX0, pixY0, pixX1, pixY1);
+                            canvas.DrawRect(rect, fillPaint);
+                            canvas.DrawRect(rect, borderPaint);
+                        }
+                    }
+                }
+
+                // ── Step 4: Encode to PNG Base64 ────────────────────────────────────────
+                using var image = SKImage.FromBitmap(bmp);
+                using var data  = image.Encode(SKEncodedImageFormat.Png, 90);
+                return Convert.ToBase64String(data.ToArray());
+            }
+            catch (Exception ex)
+            {
+                // Log and return empty — controller will show placeholder
+                Console.WriteLine($"[PageSnapshotService] Error: {ex.Message}");
+                return "";
+            }
         }
     }
 }

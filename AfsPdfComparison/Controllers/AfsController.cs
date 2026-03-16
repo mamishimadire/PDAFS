@@ -838,7 +838,7 @@ public class AfsController : Controller
     // Uses SkiaSharp renderer exclusively (no Poppler dependency).
     // Reference: Python _pdf_page_to_b64() + _show_page_snapshot()
     [HttpGet("api/snapshot")]
-    public IActionResult ApiSnapshot([FromQuery] int pairIndex = 0, [FromQuery] int afsNum = 1)
+    public async Task<IActionResult> ApiSnapshot([FromQuery] int pairIndex = 0, [FromQuery] int afsNum = 1)
     {
         var cmp = _session.GetComparison();
         if (cmp == null)
@@ -884,7 +884,7 @@ public class AfsController : Controller
         try
         {
             byte[] pdfBytes = System.IO.File.ReadAllBytes(pdfPath);
-            string b64      = _snapshots.RenderPageToBase64(pdfBytes, pageIdx, highlightTexts);
+            string b64      = await _snapshots.RenderPageToBase64(pdfBytes, pageIdx, highlightTexts);
             return Json(new
             {
                 success  = true,

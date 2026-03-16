@@ -68,10 +68,12 @@ public class LineComparatorService
         @"(?m)^[-–—\s]*\(?\s*\d{1,4}\s*\)?[-–—\s]*$",
         RegexOptions.Compiled | RegexOptions.Multiline);
 
-    // Regex: extract numeric tokens (integers and decimals)
-    // Matches: multi-digit numbers with optional spaces/commas as thousands separators
+    // Regex: extract numeric tokens (integers and decimals).
+    // Handles South African space-thousands-separator format: "6 835" → 6835.
+    // Only allows a SINGLE space between digit groups of exactly 3 digits
+    // (i.e. real thousands separator, not arbitrary whitespace between numbers).
     private static readonly Regex _numTokenRe = new(
-        @"\b\d[\d\s,\.]*\d\b|\b\d\b", RegexOptions.Compiled);
+        @"\b\d{1,3}(?:[,\.]?\d{3})*(?:\.\d+)?\b|\b\d+ \d{3}(?:\.\d+)?\b", RegexOptions.Compiled);
 
     // ─────────────────────────────────────────────────────────────────────────
     // SECTION 3.1 · COMPARE LINES (main entry point)

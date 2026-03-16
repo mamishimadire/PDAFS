@@ -193,7 +193,9 @@
             </div>
             <div class="afs-field mb-3" style="max-width:520px">
                 <label class="afs-label">Output Folder:</label>
-                <input class="afs-input" id="export_folder" placeholder="C:\Users\...\Desktop\AFS_Comparison" />
+                <input class="afs-input" id="export_folder"
+                       value="@System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "AFS_Comparison")"
+                       placeholder="C:\Users\...\Desktop\AFS_Comparison" />
             </div>
             <div class="afs-checkbox-row mb-3">
                 <label class="afs-chk-card">

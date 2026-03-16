@@ -26,9 +26,12 @@ namespace AfsPdfComparison.Services
             @"^[\s\-_=|\.]+$",
             RegexOptions.Compiled);
 
-        // Matches numeric tokens including spaced or comma-formatted numbers
+        // Matches numeric tokens including spaced or comma-formatted numbers.
+        // Handles South African space-thousands-separator: "6 835", "66 710".
+        // Restricts space to a single space before exactly 3 digits to avoid
+        // merging adjacent numbers into one spurious token.
         private static readonly Regex NumberTokenRegex = new(
-            @"\b\d[\d\s,\.]*\d\b|\b\d\b",
+            @"\b\d{1,3}(?:[,\.]?\d{3})*(?:\.\d+)?\b|\b\d+ \d{3}(?:\.\d+)?\b",
             RegexOptions.Compiled);
 
         /// <summary>

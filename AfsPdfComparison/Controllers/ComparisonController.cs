@@ -96,8 +96,8 @@ namespace AfsPdfComparison.Controllers
                 .Select(d => d.Line2).ToList();
 
             string snap1 = "", snap2 = "";
-            try { snap1 = _snapshots.RenderPageToBase64(bytes1, 0, changedLines); } catch { }
-            try { snap2 = _snapshots.RenderPageToBase64(bytes2, 0, addedLines); }  catch { }
+            try { snap1 = await _snapshots.RenderPageToBase64(bytes1, 0, changedLines); } catch { }
+            try { snap2 = await _snapshots.RenderPageToBase64(bytes2, 0, addedLines); }  catch { }
 
             var vm = new ComparisonResultViewModel
             {

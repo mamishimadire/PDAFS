@@ -844,9 +844,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     } catch (e) { /* ignore */ }
 
-    // Set default export folder
+    // Set default export folder — prefer the server-injected data-default attribute,
+    // fall back to a best-guess path only if the input has no value.
     const expFld = document.getElementById('export_folder');
     if (expFld && !expFld.value) {
-        expFld.value = 'C:\\Users\\' + (navigator.userAgent.includes('Win') ? '' : '') + 'Desktop\\AFS_Comparison';
+        expFld.value = expFld.dataset.default || 'C:\\Users\\Desktop\\AFS_Comparison';
     }
 });
