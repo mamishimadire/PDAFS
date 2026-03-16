@@ -1,0 +1,139 @@
+@model AfsPdfComparison.Models.ComparisonResultViewModel
+@using AfsPdfComparison.Services
+@{
+    ViewData["Title"] = "Comparison Result";
+}
+
+<div class="container-fluid px-4 py-3">
+    <h4 class="mb-3" style="color:#5C2D91;font-weight:700;">
+        AFS Comparison Result
+    </h4>
+
+    <!-- Document Info -->
+    <div class="row mb-3">
+        <div class="col-6">
+            <small class="text-muted">AFS 1</small>
+            <div><strong>@Model.Report1Filename</strong>
+                &nbsp;|&nbsp; @Model.Report1PageCount pages
+                &nbsp;|&nbsp; @Model.Report1WordCount words</div>
+        </div>
+        <div class="col-6">
+            <small class="text-muted">AFS 2</small>
+            <div><strong>@Model.Report2Filename</strong>
+                &nbsp;|&nbsp; @Model.Report2PageCount pages
+                &nbsp;|&nbsp; @Model.Report2WordCount words</div>
+        </div>
+    </div>
+
+    <!-- Summary badges -->
+    <div class="d-flex gap-3 mb-4 flex-wrap">
+        <span class="badge bg-success fs-6 px-3 py-2">&#10003; @Model.Counts.Same Same</span>
+        <span class="badge bg-warning text-dark fs-6 px-3 py-2">~ @Model.Counts.Changed Changed</span>
+        <span class="badge bg-info text-dark fs-6 px-3 py-2">+ @Model.Counts.Added Added</span>
+        <span class="badge bg-danger fs-6 px-3 py-2">- @Model.Counts.Removed Removed</span>
+        <span class="badge bg-secondary fs-6 px-3 py-2">@Model.NumSimilarityPct% Numbers Match</span>
+        <span class="badge bg-light text-dark fs-6 px-3 py-2">@Model.Counts.PctSame% Lines Same</span>
+    </div>
+
+    <!-- Side-by-side page snapshots with yellow highlights -->
+    @if (!string.IsNullOrEmpty(Model.Snapshot1Base64) || !string.IsNullOrEmpty(Model.Snapshot2Base64))
+    {
+        <div class="row mb-4">
+            <div class="col-6">
+                <p class="fw-semibold text-muted small">AFS 1 — @Model.Report1Filename (page 1)</p>
+                @if (!string.IsNullOrEmpty(Model.Snapshot1Base64))
+                {
+                    <img src="data:image/png;base64,@Model.Snapshot1Base64"
+                         class="img-fluid border rounded shadow-sm" style="max-width:100%;" />
+                }
+            </div>
+            <div class="col-6">
+                <p class="fw-semibold text-muted small">AFS 2 — @Model.Report2Filename (page 1)</p>
+                @if (!string.IsNullOrEmpty(Model.Snapshot2Base64))
+                {
+                    <img src="data:image/png;base64,@Model.Snapshot2Base64"
+                         class="img-fluid border rounded shadow-sm" style="max-width:100%;" />
+                }
+            </div>
+        </div>
+    }
+
+    <!-- Changed / Added / Removed lines diff table -->
+    @{
+        var changed = Model.Diffs.Where(d => d.Status != DiffStatus.Same).ToList();
+    }
+    @if (changed.Any())
+    {
+        <h6 class="mb-2" style="color:#5C2D91;">Changed, Added &amp; Removed Lines</h6>
+        <div class="table-responsive">
+            <table class="table table-sm table-bordered">
+                <thead class="table-dark">
+                    <tr>
+                        <th style="width:3%">#</th>
+                        <th style="width:5%">Type</th>
+                        <th style="width:44%">AFS 1 Line</th>
+                        <th style="width:44%">AFS 2 Line</th>
+                        <th style="width:4%">Num&#916;</th>
+                    </tr>
+                </thead>
+                <tbody>
+                @{ int i = 1; }
+                @foreach (var d in changed)
+                {
+                    var rowClass = d.Status switch
+                    {
+                        DiffStatus.Changed => "table-warning",
+                        DiffStatus.Added   => "table-info",
+                        DiffStatus.Removed => "table-danger",
+                        _                  => ""
+                    };
+                    var badge = d.Status switch
+                    {
+                        DiffStatus.Changed => "bg-warning text-dark",
+                        DiffStatus.Added   => "bg-info text-dark",
+                        DiffStatus.Removed => "bg-danger",
+                        _                  => "bg-secondary"
+                    };
+                    <tr class="@rowClass">
+                        <td class="text-muted small">@(i++)</td>
+                        <td><span class="badge @badge small">@d.Status</span></td>
+                        <td><code class="small">@d.Line1</code></td>
+                        <td><code class="small">@d.Line2</code></td>
+                        <td><small class="text-muted">@string.Join(", ", d.NumericDiff)</small></td>
+                    </tr>
+                }
+                </tbody>
+            </table>
+        </div>
+    }
+    else
+    {
+        <div class="alert alert-success">No differences found — documents are identical.</div>
+    }
+
+    <!-- Number-only differences -->
+    @if (Model.NumOnlyInAfs1.Any() || Model.NumOnlyInAfs2.Any())
+    {
+        <div class="row mt-3">
+            @if (Model.NumOnlyInAfs1.Any())
+            {
+                <div class="col-6">
+                    <h6 class="text-danger">Numbers only in AFS 1 (@Model.NumOnlyInAfs1.Count)</h6>
+                    <p class="small text-break">@string.Join(", ", Model.NumOnlyInAfs1.Take(50))</p>
+                </div>
+            }
+            @if (Model.NumOnlyInAfs2.Any())
+            {
+                <div class="col-6">
+                    <h6 class="text-info">Numbers only in AFS 2 (@Model.NumOnlyInAfs2.Count)</h6>
+                    <p class="small text-break">@string.Join(", ", Model.NumOnlyInAfs2.Take(50))</p>
+                </div>
+            }
+        </div>
+    }
+
+    <div class="mt-3">
+        <a href="/comparison" class="btn btn-outline-secondary btn-sm">&larr; Compare another pair</a>
+        <a href="/" class="btn btn-outline-primary btn-sm ms-2">Back to main app</a>
+    </div>
+</div>

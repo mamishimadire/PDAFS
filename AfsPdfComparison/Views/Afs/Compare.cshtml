@@ -1,0 +1,457 @@
+﻿@*
+    â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+    â•‘  STEP 3 â€” COMPARE RESULTS                                                   â•‘
+    â•‘  Author: Mamishi Tonny Madire | Date: 2026-03-15 | Version: 4.3             â•‘
+    â•‘                                                                              â•‘
+    â•‘  Mirrors the Python notebook's comparison output tabs:                       â•‘
+    â•‘   â€¢ Summary KPI cards                                                        â•‘
+    â•‘   â€¢ Changed lines with word-level diff highlighting                          â•‘
+    â•‘   â€¢ Added / removed lines                                                    â•‘
+    â•‘   â€¢ Number comparison                                                        â•‘
+    â•‘   â€¢ Page alignment table                                                     â•‘
+    â•‘   â€¢ Auditor comments (AJAX save via POST /comment)                           â•‘
+    â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+*@
+@model AfsPdfComparison.Models.ComparisonViewModel
+@using AfsPdfComparison.Models
+@{
+    ViewData["Title"] = "Comparison Results";
+    ViewData["Step"]  = "4";
+
+    var cmp      = Model.Comparison;
+    var eng      = Model.Engagement;
+    var comments = Model.Comments;
+
+    // KPI counts
+    int totalChanged = cmp.ChangedLines.Count();
+    int totalAdded   = cmp.AddedLines.Count();
+    int totalRemoved = cmp.RemovedLines.Count();
+    int totalSame    = cmp.FullDiff.Count(l => l.Status == "same");
+    int totalLines   = cmp.FullDiff.Count;
+    double pctChange = totalLines > 0 ? Math.Round((totalChanged + totalAdded + totalRemoved) / (double)totalLines * 100.0, 1) : 0;
+}
+
+<!-- â”€â”€ TRIGGER BUTTON (if arriving from upload page) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+@if (TempData["CompareError"] != null)
+{
+    <div class="sng-alert sng-alert-error mb-3">âš  @TempData["CompareError"]</div>
+}
+
+<!-- â”€â”€ KPI SUMMARY CARDS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+<div class="row g-3 mb-4">
+    <div class="col-6 col-md-3">
+        <div class="sng-kpi-card">
+            <div class="sng-kpi-num text-warning">@totalChanged</div>
+            <div class="sng-kpi-label">Changed Lines</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-3">
+        <div class="sng-kpi-card">
+            <div class="sng-kpi-num text-success">@totalAdded</div>
+            <div class="sng-kpi-label">Added in AFS 2</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-3">
+        <div class="sng-kpi-card">
+            <div class="sng-kpi-num text-danger">@totalRemoved</div>
+            <div class="sng-kpi-label">Removed from AFS 1</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-3">
+        <div class="sng-kpi-card">
+            <div class="sng-kpi-num text-info">@pctChange<span style="font-size:.6em">%</span></div>
+            <div class="sng-kpi-label">Lines Affected</div>
+        </div>
+    </div>
+</div>
+
+<!-- Number comparison KPI row -->
+@if (cmp.NumCmp != null)
+{
+    <div class="row g-3 mb-4">
+        <div class="col-6 col-md-3">
+            <div class="sng-kpi-card sng-kpi-card-sm">
+                <div class="sng-kpi-num text-muted small">@cmp.NumCmp.InBoth.Count</div>
+                <div class="sng-kpi-label">Numbers in Both</div>
+            </div>
+        </div>
+        <div class="col-6 col-md-3">
+            <div class="sng-kpi-card sng-kpi-card-sm">
+                <div class="sng-kpi-num text-danger small">@cmp.NumCmp.OnlyInAfs1.Count</div>
+                <div class="sng-kpi-label">Only in AFS 1</div>
+            </div>
+        </div>
+        <div class="col-6 col-md-3">
+            <div class="sng-kpi-card sng-kpi-card-sm">
+                <div class="sng-kpi-num text-success small">@cmp.NumCmp.OnlyInAfs2.Count</div>
+                <div class="sng-kpi-label">Only in AFS 2</div>
+            </div>
+        </div>
+        <div class="col-6 col-md-3">
+            <div class="sng-kpi-card sng-kpi-card-sm">
+                <div class="sng-kpi-num text-info small">@cmp.NumCmp.SimilarityPct<span style="font-size:.6em">%</span></div>
+                <div class="sng-kpi-label">Number Similarity</div>
+            </div>
+        </div>
+    </div>
+}
+
+<!-- â”€â”€ TAB NAVIGATION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+<ul class="nav sng-tabs mb-3" id="cmpTabs" role="tablist">
+    <li class="nav-item" role="presentation">
+        <button class="sng-tab-btn active" data-bs-toggle="tab" data-bs-target="#tab-changed"  type="button">
+            Changed <span class="sng-badge-count">@totalChanged</span>
+        </button>
+    </li>
+    <li class="nav-item" role="presentation">
+        <button class="sng-tab-btn" data-bs-toggle="tab" data-bs-target="#tab-added" type="button">
+            Added <span class="sng-badge-count">@totalAdded</span>
+        </button>
+    </li>
+    <li class="nav-item" role="presentation">
+        <button class="sng-tab-btn" data-bs-toggle="tab" data-bs-target="#tab-removed" type="button">
+            Removed <span class="sng-badge-count">@totalRemoved</span>
+        </button>
+    </li>
+    <li class="nav-item" role="presentation">
+        <button class="sng-tab-btn" data-bs-toggle="tab" data-bs-target="#tab-numbers" type="button">Numbers</button>
+    </li>
+    <li class="nav-item" role="presentation">
+        <button class="sng-tab-btn" data-bs-toggle="tab" data-bs-target="#tab-pages" type="button">Page Map</button>
+    </li>
+    <li class="nav-item" role="presentation">
+        <button class="sng-tab-btn" data-bs-toggle="tab" data-bs-target="#tab-comments" type="button">Comments</button>
+    </li>
+</ul>
+
+<div class="tab-content">
+
+    <!-- â”€â”€ TAB: CHANGED LINES â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+    <div class="tab-pane fade show active" id="tab-changed" role="tabpanel">
+        <div class="sng-card">
+            <div class="sng-card-header">Changed Lines â€” word-level diff</div>
+            <div class="sng-card-body p-0" style="max-height:600px;overflow-y:auto;">
+                @if (!cmp.ChangedLines.Any())
+                {
+                    <p class="p-3 text-muted">No changed lines found.</p>
+                }
+                else
+                {
+                    <table class="sng-diff-table">
+                        <thead>
+                            <tr>
+                                <th style="width:50%">AFS 1 (Original)</th>
+                                <th style="width:50%">AFS 2 (New)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var line in cmp.ChangedLines)
+                            {
+                                <tr>
+                                    <td class="sng-diff-old">
+                                        @foreach (var tok in line.WordDiff ?? new())
+                                        {
+                                            if (tok.Tag == "removed")
+                                            {
+                                                <span class="diff-del">@tok.Word</span>
+                                            }
+                                            else if (tok.Tag == "same")
+                                            {
+                                                <span>@tok.Word</span>
+                                            }
+                                        }
+                                        @if (line.WordDiff == null || !line.WordDiff.Any())
+                                        {
+                                            @line.Line1
+                                        }
+                                    </td>
+                                    <td class="sng-diff-new">
+                                        @foreach (var tok in line.WordDiff ?? new())
+                                        {
+                                            if (tok.Tag == "added")
+                                            {
+                                                <span class="diff-ins">@tok.Word</span>
+                                            }
+                                            else if (tok.Tag == "same")
+                                            {
+                                                <span>@tok.Word</span>
+                                            }
+                                        }
+                                        @if (line.WordDiff == null || !line.WordDiff.Any())
+                                        {
+                                            @line.Line2
+                                        }
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                }
+            </div>
+        </div>
+    </div>
+
+    <!-- â”€â”€ TAB: ADDED LINES â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+    <div class="tab-pane fade" id="tab-added" role="tabpanel">
+        <div class="sng-card">
+            <div class="sng-card-header">Added Lines â€” present in AFS 2, absent in AFS 1</div>
+            <div class="sng-card-body p-0" style="max-height:600px;overflow-y:auto;">
+                @if (!cmp.AddedLines.Any())
+                {
+                    <p class="p-3 text-muted">No added lines.</p>
+                }
+                else
+                {
+                    <table class="sng-diff-table">
+                        <thead><tr><th>Added Line (AFS 2)</th></tr></thead>
+                        <tbody>
+                            @foreach (var line in cmp.AddedLines)
+                            {
+                                <tr><td class="sng-diff-new"><span class="diff-ins">@line.Line2</span></td></tr>
+                            }
+                        </tbody>
+                    </table>
+                }
+            </div>
+        </div>
+    </div>
+
+    <!-- â”€â”€ TAB: REMOVED LINES â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+    <div class="tab-pane fade" id="tab-removed" role="tabpanel">
+        <div class="sng-card">
+            <div class="sng-card-header">Removed Lines â€” present in AFS 1, absent in AFS 2</div>
+            <div class="sng-card-body p-0" style="max-height:600px;overflow-y:auto;">
+                @if (!cmp.RemovedLines.Any())
+                {
+                    <p class="p-3 text-muted">No removed lines.</p>
+                }
+                else
+                {
+                    <table class="sng-diff-table">
+                        <thead><tr><th>Removed Line (AFS 1)</th></tr></thead>
+                        <tbody>
+                            @foreach (var line in cmp.RemovedLines)
+                            {
+                                <tr><td class="sng-diff-old"><span class="diff-del">@line.Line1</span></td></tr>
+                            }
+                        </tbody>
+                    </table>
+                }
+            </div>
+        </div>
+    </div>
+
+    <!-- â”€â”€ TAB: NUMBER COMPARISON â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+    <div class="tab-pane fade" id="tab-numbers" role="tabpanel">
+        <div class="sng-card">
+            <div class="sng-card-header">Financial Number Comparison (Jaccard set similarity)</div>
+            <div class="sng-card-body">
+                @if (cmp.NumCmp == null)
+                {
+                    <p class="text-muted">No number comparison data.</p>
+                }
+                else
+                {
+                    <div class="row g-4">
+                        <div class="col-md-4">
+                            <h6 class="sng-section-title">Numbers in Both (@cmp.NumCmp.InBoth.Count)</h6>
+                            <div style="max-height:300px;overflow-y:auto;">
+                                <table class="sng-table sng-table-sm">
+                                    <thead><tr><th>Number</th></tr></thead>
+                                    <tbody>
+                                        @foreach (var n in cmp.NumCmp.InBoth.Take(200))
+                                        {
+                                            <tr><td class="font-mono">@n</td></tr>
+                                        }
+                                        @if (cmp.NumCmp.InBoth.Count > 200)
+                                        {
+                                            <tr><td class="text-muted">â€¦ @(cmp.NumCmp.InBoth.Count - 200) more</td></tr>
+                                        }
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <h6 class="sng-section-title text-danger">Only in AFS 1 (@cmp.NumCmp.OnlyInAfs1.Count)</h6>
+                            <div style="max-height:300px;overflow-y:auto;">
+                                <table class="sng-table sng-table-sm">
+                                    <thead><tr><th>Number</th></tr></thead>
+                                    <tbody>
+                                        @foreach (var n in cmp.NumCmp.OnlyInAfs1.Take(200))
+                                        {
+                                            <tr><td class="font-mono text-danger">@n</td></tr>
+                                        }
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <h6 class="sng-section-title text-success">Only in AFS 2 (@cmp.NumCmp.OnlyInAfs2.Count)</h6>
+                            <div style="max-height:300px;overflow-y:auto;">
+                                <table class="sng-table sng-table-sm">
+                                    <thead><tr><th>Number</th></tr></thead>
+                                    <tbody>
+                                        @foreach (var n in cmp.NumCmp.OnlyInAfs2.Take(200))
+                                        {
+                                            <tr><td class="font-mono text-success">@n</td></tr>
+                                        }
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                }
+            </div>
+        </div>
+    </div>
+
+    <!-- â”€â”€ TAB: PAGE ALIGNMENT MAP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+    <div class="tab-pane fade" id="tab-pages" role="tabpanel">
+        <div class="sng-card">
+            <div class="sng-card-header">Page Alignment Map</div>
+            <div class="sng-card-body p-0" style="max-height:600px;overflow-y:auto;">
+                @if (!cmp.PageDiffs.Any())
+                {
+                    <p class="p-3 text-muted">No page alignment data.</p>
+                }
+                else
+                {
+                    <table class="sng-table">
+                        <thead>
+                            <tr>
+                                <th>AFS 1 Page</th>
+                                <th>AFS 2 Page</th>
+                                <th>Alignment Score</th>
+                                <th>Same</th>
+                                <th>Changed</th>
+                                <th>Added</th>
+                                <th>Removed</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var p in cmp.PageDiffs)
+                            {
+                                <tr>
+                                    <td>@((p.PageAfs1 ?? 0) + 1)</td>
+                                    <td>@(p.PageAfs2.HasValue ? (p.PageAfs2.Value + 1).ToString() : "â€”")</td>
+                                    <td>
+                                        <div class="sng-progress-bar-wrap">
+                                            <div class="sng-progress-bar" style="width:@((int)(p.AlignSim*100))%"></div>
+                                        </div>
+                                        <span class="small">@(p.AlignSim.ToString("P0"))</span>
+                                    </td>
+                                    <td class="text-muted">@p.Same</td>
+                                    <td class="text-warning">@p.Changed</td>
+                                    <td class="text-success">@p.Added</td>
+                                    <td class="text-danger">@p.Removed</td>
+                                    <td>
+                                        @if (p.Unmatched)
+                                        {
+                                            <span class="sng-badge-warn">unmatched</span>
+                                        }
+                                        else if (p.Changed + p.Added + p.Removed == 0)
+                                        {
+                                            <span class="sng-badge-ok">identical</span>
+                                        }
+                                        else
+                                        {
+                                            <span class="sng-badge-purple">changed</span>
+                                        }
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                }
+            </div>
+        </div>
+    </div>
+
+    <!-- â”€â”€ TAB: AUDITOR COMMENTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+    <div class="tab-pane fade" id="tab-comments" role="tabpanel">
+        <div class="sng-card">
+            <div class="sng-card-header">Auditor Comments</div>
+            <div class="sng-card-body">
+                <p class="sng-hint mb-3">
+                    Add comments for the overall comparison and for individual changed-line groups.
+                    Comments are saved automatically. They appear in all exported working papers.
+                </p>
+
+                <!-- Overall comment -->
+                <div class="mb-4">
+                    <label class="sng-label">Overall Comparison Comment</label>
+                    <textarea class="sng-input sng-textarea"
+                              id="comment-overall"
+                              rows="4"
+                              data-key="overall:summary"
+                              placeholder="Summarise the key differences between the two AFS versions â€¦">@(comments.TryGetValue("overall:summary", out var ov) ? ov : "")</textarea>
+                    <button class="sng-btn-secondary mt-1 btn-save-comment" data-key="overall:summary">Save Comment</button>
+                    <span class="sng-comment-status ms-2 small" id="status-overall:summary"></span>
+                </div>
+
+                <!-- Per-page changed-group comments (up to 20) -->
+                <h6 class="sng-section-title">Per-Page Comments</h6>
+                @for (int pi = 0; pi < Math.Min(cmp.PageDiffs.Count, 20); pi++)
+                {
+                    var pg = cmp.PageDiffs[pi];
+                        string key = $"page:{pg.PageAfs1}";
+                        string existing = comments.TryGetValue(key, out var cv) ? cv : "";
+                    <div class="mb-3">
+                        <label class="sng-label">
+                            Page @((pg.PageAfs1 ?? 0) + 1) â†’ @(pg.PageAfs2.HasValue ? (pg.PageAfs2.Value+1).ToString() : "unmatched")
+                            <span class="sng-hint ms-2">(@pg.Changed changed, @pg.Added added, @pg.Removed removed)</span>
+                        </label>
+                        <textarea class="sng-input sng-textarea"
+                                  rows="2"
+                                  data-key="@key"
+                                  placeholder="Comment for this page pair â€¦">@existing</textarea>
+                        <button class="sng-btn-secondary mt-1 btn-save-comment" data-key="@key">Save</button>
+                        <span class="sng-comment-status ms-2 small" id="status-@key"></span>
+                    </div>
+                }
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<!-- â”€â”€ BOTTOM ACTION BAR â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ -->
+<div class="sng-action-bar mt-4 d-flex gap-2">
+    <a href="/export" class="sng-btn-primary">Export Working Papers â†’</a>
+    <a href="/upload" class="sng-btn-secondary">â† Back to Upload</a>
+</div>
+
+@section Scripts {
+<script>
+    // AJAX comment save â€” Reference: Python ipywidgets on_comment callback
+    const token = document.querySelector('input[name="__RequestVerificationToken"]');
+    document.querySelectorAll('.btn-save-comment').forEach(btn => {
+        btn.addEventListener('click', async function () {
+            const key     = this.dataset.key;
+            const textarea = document.querySelector(`textarea[data-key="${CSS.escape(key)}"]`);
+            const statusEl = document.getElementById(`status-${key}`);
+            const val      = textarea ? textarea.value : '';
+            try {
+                const resp = await fetch('/comment', {
+                    method:  'POST',
+                    headers: {
+                        'Content-Type':             'application/x-www-form-urlencoded',
+                        'RequestVerificationToken': token ? token.value : '',
+                    },
+                    body: `key=${encodeURIComponent(key)}&comment=${encodeURIComponent(val)}`,
+                });
+                const json = await resp.json();
+                if (statusEl) {
+                    statusEl.textContent = json.success ? 'âœ” Saved' : 'âœ˜ Error: ' + json.error;
+                    statusEl.className   = 'sng-comment-status ms-2 small ' + (json.success ? 'text-success' : 'text-danger');
+                    setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000);
+                }
+            } catch (e) {
+                if (statusEl) { statusEl.textContent = 'âœ˜ Network error'; statusEl.className = 'sng-comment-status ms-2 small text-danger'; }
+            }
+        });
+    });
+</script>
+}
+

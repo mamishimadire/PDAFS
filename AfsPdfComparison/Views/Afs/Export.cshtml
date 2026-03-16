@@ -1,0 +1,205 @@
+@*
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║  STEP 4 — EXPORT WORKING PAPERS                                             ║
+    ║  Author: Mamishi Tonny Madire | Date: 2026-03-15 | Version: 4.3             ║
+    ║                                                                              ║
+    ║  Mirrors the "Export Working Papers" accordion step in the Python notebook. ║
+    ║  Generates PDF (QuestPDF), Word (NPOI), Excel (ClosedXML), and TXT.        ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
+*@
+@model AfsPdfComparison.Models.ExportViewModel
+@{
+    ViewData["Title"] = "Export Working Papers";
+    ViewData["Step"]  = "5";
+
+    string defaultFolder = System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+        "AFS_Comparison");
+}
+
+<div class="sng-card mb-4">
+    <div class="sng-card-header">
+        <span class="sng-step-badge">Step 4</span>
+        Export Working Papers
+        <small class="ms-2 opacity-75">Generate PDF, Word, Excel and text reports</small>
+    </div>
+    <div class="sng-card-body">
+
+        @if (!Model.HasComparison)
+        {
+            <div class="sng-alert sng-alert-error mb-3">
+                ⚠ No comparison available. Please complete Steps 2 &amp; 3 first.
+                <a href="/upload" class="sng-link ms-2">Go to Upload →</a>
+            </div>
+        }
+
+        @if (Model.Errors.Any())
+        {
+            <div class="sng-alert sng-alert-error mb-3">
+                <strong>Errors:</strong>
+                <ul class="mb-0 mt-1">
+                    @foreach (var e in Model.Errors)
+                    {
+                        <li>@e</li>
+                    }
+                </ul>
+            </div>
+        }
+
+        @if (Model.SavedFiles.Any())
+        {
+            <div class="sng-alert sng-alert-success mb-3">
+                <strong>✔ Files saved:</strong>
+                <ul class="mb-0 mt-1">
+                    @foreach (var f in Model.SavedFiles)
+                    {
+                        <li class="font-mono small">@f</li>
+                    }
+                </ul>
+            </div>
+        }
+
+        <form method="post" action="/export">
+            @Html.AntiForgeryToken()
+
+            <!-- Output Folder -->
+            <div class="mb-3">
+                <label class="sng-label">Output Folder <span class="sng-required">*</span></label>
+                <input class="sng-input font-mono"
+                       name="OutputFolder"
+                       value="@(Model.OutputFolder ?? defaultFolder)"
+                       placeholder="e.g. C:\Users\YourName\Desktop\AFS_Comparison"
+                       required maxlength="500" />
+                <small class="sng-hint">
+                    Absolute path to the folder where working papers will be saved.
+                    The folder is created automatically if it does not exist.
+                </small>
+            </div>
+
+            <!-- Format checkboxes -->
+            <fieldset class="mb-4">
+                <legend class="sng-label mb-2">Export Formats</legend>
+                <div class="row g-2">
+                    <div class="col-6 col-md-3">
+                        <label class="sng-checkbox-card @(Model.ExportPdf?"checked":"")">
+                            <input type="checkbox" name="ExportPdf" value="true"
+                                   @(Model.ExportPdf ? "checked" : "") />
+                            <span class="sng-format-icon">📄</span>
+                            <span class="sng-format-name">PDF</span>
+                            <span class="sng-format-desc">QuestPDF with SNG branding</span>
+                        </label>
+                    </div>
+                    <div class="col-6 col-md-3">
+                        <label class="sng-checkbox-card @(Model.ExportWord?"checked":"")">
+                            <input type="checkbox" name="ExportWord" value="true"
+                                   @(Model.ExportWord ? "checked" : "") />
+                            <span class="sng-format-icon">📝</span>
+                            <span class="sng-format-name">Word (.docx)</span>
+                            <span class="sng-format-desc">NPOI — fully editable</span>
+                        </label>
+                    </div>
+                    <div class="col-6 col-md-3">
+                        <label class="sng-checkbox-card @(Model.ExportExcel?"checked":"")">
+                            <input type="checkbox" name="ExportExcel" value="true"
+                                   @(Model.ExportExcel ? "checked" : "") />
+                            <span class="sng-format-icon">📊</span>
+                            <span class="sng-format-name">Excel (.xlsx)</span>
+                            <span class="sng-format-desc">ClosedXML — 7 sheets</span>
+                        </label>
+                    </div>
+                    <div class="col-6 col-md-3">
+                        <label class="sng-checkbox-card @(Model.ExportText?"checked":"")">
+                            <input type="checkbox" name="ExportText" value="true"
+                                   @(Model.ExportText ? "checked" : "") />
+                            <span class="sng-format-icon">📋</span>
+                            <span class="sng-format-name">Text (.txt)</span>
+                            <span class="sng-format-desc">Plain-text working paper</span>
+                        </label>
+                    </div>
+                </div>
+            </fieldset>
+
+            <!-- Engagement summary -->
+            @if (Model.Engagement != null)
+            {
+                <div class="sng-info-box mb-4">
+                    <h6 class="sng-info-box-title">Engagement Details (from Step 1)</h6>
+                    <dl class="sng-dl">
+                        <dt>Client</dt>
+                        <dd>@(Model.Engagement.Client ?? "—")</dd>
+                        <dt>Engagement</dt>
+                        <dd>@(Model.Engagement.EngagementName ?? "—")</dd>
+                        <dt>Period</dt>
+                        <dd>
+                        @(string.IsNullOrEmpty(Model.Engagement.FinancialYearStart) ? "—" : Model.Engagement.FinancialYearStart) →
+                        @(string.IsNullOrEmpty(Model.Engagement.FinancialYearEnd) ? "—" : Model.Engagement.FinancialYearEnd)
+                        </dd>
+                        <dt>Prepared By</dt>
+                        <dd>@(Model.Engagement.PreparedBy ?? "—")</dd>
+                    </dl>
+                </div>
+            }
+
+            <div class="d-flex gap-2 mt-3">
+                <button class="sng-btn-primary" type="submit"
+                        @(!Model.HasComparison ? "disabled" : "")>
+                    ▶ Generate &amp; Save Working Papers
+                </button>
+                <a href="/compare" class="sng-btn-secondary">← Back to Compare</a>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Format explanation cards -->
+<div class="sng-card">
+    <div class="sng-card-header">Export Format Reference</div>
+    <div class="sng-card-body">
+        <div class="row g-3">
+            <div class="col-md-3">
+                <div class="sng-format-info-card">
+                    <strong>PDF</strong>
+                    <ul class="small mt-1">
+                        <li>SNG purple cover page</li>
+                        <li>7 structured sections</li>
+                        <li>Auditor comment boxes</li>
+                        <li>Library: QuestPDF</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="sng-format-info-card">
+                    <strong>Word (.docx)</strong>
+                    <ul class="small mt-1">
+                        <li>Fully editable OOXML</li>
+                        <li>Styled tables with purple headers</li>
+                        <li>Initialling / ref lines</li>
+                        <li>Library: NPOI</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="sng-format-info-card">
+                    <strong>Excel (.xlsx)</strong>
+                    <ul class="small mt-1">
+                        <li>Sheet per category</li>
+                        <li>Summary | Changed | Added</li>
+                        <li>Numbers | Alignment | Comments</li>
+                        <li>Library: ClosedXML</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="sng-format-info-card">
+                    <strong>Text (.txt)</strong>
+                    <ul class="small mt-1">
+                        <li>Plain UTF-8 text</li>
+                        <li>Pipe-delimited tables</li>
+                        <li>Easy to search / diff</li>
+                        <li>Library: StringBuilder</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>

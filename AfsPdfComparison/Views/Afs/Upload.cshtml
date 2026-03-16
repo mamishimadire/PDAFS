@@ -1,0 +1,192 @@
+@*
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║  STEP 2 — UPLOAD & EXTRACT                                                  ║
+    ║  Author: Mamishi Tonny Madire | Date: 2026-03-15 | Version: 4.3             ║
+    ║                                                                              ║
+    ║  Mirrors the "Upload PDFs" and "Extract Content" accordion steps in the     ║
+    ║  Python notebook. Supports drag-and-drop and multi-file selection.          ║
+    ║  Extract step calls PageExtractorService and shows per-file results.        ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
+*@
+@model AfsPdfComparison.Models.UploadViewModel
+@{
+    ViewData["Title"] = "Upload & Extract";
+    ViewData["Step"]  = "2";
+
+    // Parse | -delimited extract messages from TempData
+    var extractMessages = (TempData["ExtractMessages"] as string ?? "")
+                          .Split('|', StringSplitOptions.RemoveEmptyEntries);
+}
+
+<!-- ── STEP 2A · UPLOAD ──────────────────────────────────────────────────── -->
+<div class="sng-card mb-4">
+    <div class="sng-card-header">
+        <span class="sng-step-badge">Step 2A</span>
+        Upload PDFs
+        <small class="ms-2 opacity-75">Queue the two AFS PDF versions to compare</small>
+    </div>
+    <div class="sng-card-body">
+
+        @if (TempData["UploadError"] != null)
+        {
+            <div class="sng-alert sng-alert-error mb-3">⚠ @TempData["UploadError"]</div>
+        }
+        @if (TempData["UploadSuccess"] != null)
+        {
+            <div class="sng-alert sng-alert-success mb-3">✔ @TempData["UploadSuccess"]</div>
+        }
+
+        <!-- Upload form -->
+        <form method="post" action="/upload" enctype="multipart/form-data" id="uploadForm">
+            @Html.AntiForgeryToken()
+            <div class="sng-dropzone" id="dropZone">
+                <div class="sng-dropzone-icon">📄</div>
+                <div class="sng-dropzone-text">Drag &amp; drop PDF files here, or click to browse</div>
+                <input type="file" id="fileInput" name="files" accept=".pdf" multiple class="sng-file-input" />
+                <button type="button" class="sng-btn-secondary mt-2" onclick="document.getElementById('fileInput').click()">Browse Files</button>
+            </div>
+            <div class="mt-2 d-flex gap-2">
+                <button class="sng-btn-primary" type="submit" id="addBtn" disabled>Add to Queue</button>
+                <span id="selectedCount" class="sng-hint align-self-center">No files selected</span>
+            </div>
+        </form>
+
+        <!-- Queue table -->
+        @if (Model.Reports.Any())
+        {
+            <h5 class="sng-section-title mt-4">Queued Files (@Model.Reports.Count)</h5>
+            <table class="sng-table mt-2">
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Label</th>
+                        <th>Filename</th>
+                        <th>Type</th>
+                        <th>Pages</th>
+                        <th>Primary Year</th>
+                        <th>Word Count</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @for (int i = 0; i < Model.Reports.Count; i++)
+                    {
+                        var r = Model.Reports[i];
+                        <tr>
+                            <td>@(i + 1)</td>
+                            <td><span class="sng-badge-purple">@r.Label</span></td>
+                            <td class="font-mono">@r.Filename</td>
+                            <td>
+                                @if (r.DocType?.Contains("scanned") == true)
+                                {
+                                    <span class="sng-badge-warn">@r.DocType</span>
+                                }
+                                else if (!string.IsNullOrEmpty(r.DocType))
+                                {
+                                    <span class="sng-badge-ok">@r.DocType</span>
+                                }
+                                else
+                                {
+                                    <span class="text-muted">not extracted</span>
+                                }
+                            </td>
+                            <td>@(r.PageCount > 0 ? r.PageCount.ToString() : "—")</td>
+                            <td>@(r.PrimaryYear?.ToString() ?? "—")</td>
+                            <td>@(r.WordCount > 0 ? r.WordCount.ToString("N0") : "—")</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+
+            <form method="post" action="/clear" class="mt-2" onsubmit="return confirm('Clear all queued files?')">
+                @Html.AntiForgeryToken()
+                <button class="sng-btn-danger" type="submit">🗑 Clear Queue</button>
+            </form>
+        }
+        else
+        {
+            <p class="sng-hint mt-3">No files queued yet. Upload at least 2 PDF versions to compare.</p>
+        }
+    </div>
+</div>
+
+<!-- ── STEP 2B · EXTRACT ─────────────────────────────────────────────────── -->
+<div class="sng-card mb-4">
+    <div class="sng-card-header">
+        <span class="sng-step-badge">Step 2B</span>
+        Extract Content
+        <small class="ms-2 opacity-75">Parse text from uploaded PDFs</small>
+    </div>
+    <div class="sng-card-body">
+        <p class="sng-hint mb-3">
+            Extraction uses <strong>PdfPig</strong> to reconstruct lines from word bounding boxes
+            (Y-coordinate binning). Scanned PDFs will be flagged but not OCR-processed.
+            — <em>Reference: Python <code>extract_pdf()</code> + pdfplumber</em>
+        </p>
+
+        @if (extractMessages.Any())
+        {
+            <div class="mb-3">
+                @foreach (var msg in extractMessages)
+                {
+                    bool isError = msg.Contains("ERROR");
+                    <div class="sng-alert @(isError ? "sng-alert-error" : "sng-alert-success") mb-1 font-mono small">
+                        @msg
+                    </div>
+                }
+            </div>
+        }
+
+        @if (TempData["ExtractError"] != null)
+        {
+            <div class="sng-alert sng-alert-error mb-3">⚠ @TempData["ExtractError"]</div>
+        }
+
+        <form method="post" action="/extract">
+            @Html.AntiForgeryToken()
+            <button class="sng-btn-primary" type="submit"
+                    @(Model.Reports.Any() ? "" : "disabled")>
+                ▶ Extract All Queued PDFs
+            </button>
+            @if (Model.Reports.Count >= 2 && Model.Reports.All(r => r.PageCount > 0))
+            {
+                <a href="#" onclick="document.getElementById('compareForm').submit();return false;"
+                   class="sng-btn-secondary ms-2">Proceed to Compare →</a>
+            }
+        </form>
+    </div>
+</div>
+
+<!-- Hidden compare-trigger form -->
+<form id="compareForm" method="post" action="/compare" style="display:none">
+    @Html.AntiForgeryToken()
+</form>
+
+@section Scripts {
+<script>
+    // Drag-and-drop zone behaviour
+    const zone  = document.getElementById('dropZone');
+    const input = document.getElementById('fileInput');
+    const btn   = document.getElementById('addBtn');
+    const cnt   = document.getElementById('selectedCount');
+
+    function updateCount() {
+        const n = input.files.length;
+        cnt.textContent = n > 0 ? n + ' file(s) selected' : 'No files selected';
+        btn.disabled    = n === 0;
+    }
+
+    input.addEventListener('change', updateCount);
+
+    zone.addEventListener('dragover',  e => { e.preventDefault(); zone.classList.add('drag-over'); });
+    zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+    zone.addEventListener('drop', e => {
+        e.preventDefault();
+        zone.classList.remove('drag-over');
+        // Create a DataTransfer to assign dropped files to the input
+        const dt = new DataTransfer();
+        Array.from(e.dataTransfer.files).forEach(f => dt.items.add(f));
+        input.files = dt.files;
+        updateCount();
+    });
+</script>
+}

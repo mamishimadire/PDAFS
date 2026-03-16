@@ -1,0 +1,65 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>@ViewData["Title"] — AFS PDF Comparison | SNG Grant Thornton</title>
+    <link rel="stylesheet" href="~/lib/bootstrap/dist/css/bootstrap.min.css" />
+    <!-- IBM Plex Sans & IBM Plex Mono — SNG preferred typefaces -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="~/css/site.css" asp-append-version="true" />
+</head>
+<body class="sng-dark">
+
+    <!-- ╔══════════════════════════════════════════════════════════╗ -->
+    <!-- ║  TOP NAVIGATION — SNG purple bar                        ║ -->
+    <!-- ╚══════════════════════════════════════════════════════════╝ -->
+    <header class="sng-navbar">
+        <div class="container-fluid d-flex align-items-center justify-content-between py-2 px-4">
+            <!-- Brand wordmark -->
+            <a href="/" class="sng-brand d-flex align-items-center gap-2 text-decoration-none">
+                <span class="sng-logo-box">SNG</span>
+                <span class="sng-brand-text">Grant Thornton<br/><small>CAATs · AFS Comparison Analyser</small></span>
+            </a>
+            <!-- Step indicators -->
+            <nav class="d-none d-md-flex gap-1 align-items-center">
+                <a href="/"              class="sng-step-pill @(ViewData["Step"]?.ToString()=="1"?"active":"")">1 Engagement</a>
+                <span class="sng-step-sep">›</span>
+                <a href="/upload"        class="sng-step-pill @(ViewData["Step"]?.ToString()=="2"?"active":"")">2 Upload</a>
+                <span class="sng-step-sep">›</span>
+                <a href="/compare"       class="sng-step-pill @(ViewData["Step"]?.ToString()=="4"?"active":"")">3 Compare</a>
+                <span class="sng-step-sep">›</span>
+                <a href="/export"        class="sng-step-pill @(ViewData["Step"]?.ToString()=="5"?"active":"")">4 Export</a>
+            </nav>
+            <!-- Author chip -->
+            <span class="sng-author-chip d-none d-lg-inline">
+                Mamishi Tonny Madire &nbsp;|&nbsp; v4.3 &nbsp;|&nbsp; 2026-03-15
+            </span>
+        </div>
+    </header>
+
+    <!-- ╔══════════════════════════════════════════════════════════╗ -->
+    <!-- ║  MAIN CONTENT                                           ║ -->
+    <!-- ╚══════════════════════════════════════════════════════════╝ -->
+    <div class="container-fluid px-4 py-3">
+        @RenderBody()
+    </div>
+
+    <!-- ╔══════════════════════════════════════════════════════════╗ -->
+    <!-- ║  FOOTER                                                 ║ -->
+    <!-- ╚══════════════════════════════════════════════════════════╝ -->
+    <footer class="sng-footer mt-4 py-3 px-4">
+        <div class="container-fluid d-flex justify-content-between align-items-center flex-wrap gap-2">
+            <span>&copy; 2026 SNG Grant Thornton — AFS PDF Comparison Analyser v4.3</span>
+            <span>Author: Mamishi Tonny Madire | Date: 2026-03-15</span>
+        </div>
+    </footer>
+
+    <script src="~/lib/jquery/dist/jquery.min.js"></script>
+    <script src="~/lib/bootstrap/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="~/js/site.js" asp-append-version="true"></script>
+    @await RenderSectionAsync("Scripts", required: false)
+</body>
+</html>

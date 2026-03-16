@@ -1,0 +1,225 @@
+﻿@*
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║  STEP 1 — ENGAGEMENT DETAILS                                                ║
+    ║  Author: Mamishi Tonny Madire | Date: 2026-03-15 | Version: 4.3             ║
+    ║                                                                              ║
+    ║  Mirrors the "Engagement Details" accordion step in the Python notebook.    ║
+    ║  All fields map 1-to-1 to the EngagementDetails model.                      ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
+*@
+@* Single-page accordion — all 5 steps. Redirects to this page only. *@
+@{
+    ViewData["Title"] = "AFS PDF Comparison Analyzer v4.3";
+    ViewData["Step"]  = "1";
+}
+@* ── hidden antiforgery token for AJAX calls ── *@
+<form id="__afs-af-form">@Html.AntiForgeryToken()</form>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     HEADER BANNER  (mirrors Python header widget)
+     ════════════════════════════════════════════════════════════ -->
+<div class="afs-header mb-3">
+    <div class="afs-header-brand">SNG Grant Thornton — CAATs Platform</div>
+    <div class="afs-header-title">
+        AFS PDF Comparison Analyzer
+        <span class="afs-header-ver">v4.3</span>
+        <span class="afs-header-chips">&#128279; Smart Page Alignment · Zero False Positives · Working Paper Export</span>
+    </div>
+    <div class="afs-header-sub">
+        Line · Number · Smart-Aligned Page Snapshots · Auditor Comments · PDF + Word Export &nbsp;|&nbsp;
+        &#10003; SAME &nbsp; ~ CHANGED &nbsp; + ADDED &nbsp; &#8722; REMOVED
+    </div>
+    <div style="margin-top:8px">
+        <button id="themeTog" class="afs-theme-btn" onclick="toggleLightMode()">&#9728;&#65039; Light Mode</button>
+    </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     ACCORDION WRAPPER
+     ════════════════════════════════════════════════════════════ -->
+<div class="afs-accordion" id="afsAccordion">
+
+    <!-- ╔═══════════════ STEP 1 — ENGAGEMENT DETAILS ══════════════╗ -->
+    <div class="afs-acc-item" id="acc-step1">
+        <button class="afs-acc-header" onclick="toggleAcc('step1')">
+            <span class="afs-step-num">1</span>
+            <span class="afs-step-label">Step 1 — Engagement Details</span>
+            <span class="afs-acc-arrow" id="arrow-step1">&#9660;</span>
+        </button>
+        <div class="afs-acc-body" id="body-step1" style="display:block">
+            <div class="afs-info afs-info-purple mb-3">
+                Enter engagement metadata — included in the exported Working Paper.
+            </div>
+            <form id="engForm" onsubmit="return false">
+                <div class="afs-field-grid">
+                    <div class="afs-field">
+                        <label class="afs-label">Parent Name:</label>
+                        <input class="afs-input" id="eng_parent" name="parent" placeholder="e.g. Holding Company Ltd" />
+                    </div>
+                    <div class="afs-field">
+                        <label class="afs-label">Client Name:</label>
+                        <input class="afs-input" id="eng_client" name="client" placeholder="e.g. ABC Pty Ltd" />
+                    </div>
+                    <div class="afs-field">
+                        <label class="afs-label">Engagement Name:</label>
+                        <input class="afs-input" id="eng_engname" name="engagementName" placeholder="e.g. Annual Audit FY2024" />
+                    </div>
+                    <div class="afs-field">
+                        <label class="afs-label">Engagement Number:</label>
+                        <input class="afs-input" id="eng_engnum" name="engagementNumber" placeholder="e.g. 2024-AUD-001" />
+                    </div>
+                    <div class="afs-field">
+                        <label class="afs-label">Financial Year Start:</label>
+                        <input class="afs-input" id="eng_fystart" name="financialYearStart" placeholder="e.g. 2024-01-01" />
+                    </div>
+                    <div class="afs-field">
+                        <label class="afs-label">Financial Year End:</label>
+                        <input class="afs-input" id="eng_fyend" name="financialYearEnd" placeholder="e.g. 2024-12-31" />
+                    </div>
+                    <div class="afs-field">
+                        <label class="afs-label">Prepared By:</label>
+                        <input class="afs-input" id="eng_auditor" name="preparedBy" placeholder="Auditor's name" />
+                    </div>
+                    <div class="afs-field">
+                        <label class="afs-label">Director:</label>
+                        <input class="afs-input" id="eng_director" name="director" placeholder="Engagement director" />
+                    </div>
+                    <div class="afs-field">
+                        <label class="afs-label">Manager:</label>
+                        <input class="afs-input" id="eng_manager" name="manager" placeholder="Engagement manager" />
+                    </div>
+                </div>
+                <div class="afs-field mt-2">
+                    <label class="afs-label">Objective:</label>
+                    <textarea class="afs-input afs-textarea" id="eng_objective" name="objective" rows="4">To independently compare two versions of the Annual Financial Statements (AFS) through automated computer-assisted audit techniques (CAATs), identifying all textual, numerical, and structural differences on a line-by-line and number-by-number basis, in order to support audit evidence gathering and financial statement accuracy assessments in accordance with ISA 500 (Audit Evidence).</textarea>
+                </div>
+                <div class="afs-btn-row mt-3">
+                    <button class="afs-btn afs-btn-success" onclick="saveEngagement()">Save Details</button>
+                    <span id="eng-status" class="afs-status"></span>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- ╔═══════════════ STEP 2 — UPLOAD AFS PDFs ══════════════════╗ -->
+    <div class="afs-acc-item" id="acc-step2">
+        <button class="afs-acc-header" onclick="toggleAcc('step2')">
+            <span class="afs-step-num">2</span>
+            <span class="afs-step-label">Step 2 — Upload AFS PDFs</span>
+            <span class="afs-acc-arrow" id="arrow-step2">&#9660;</span>
+        </button>
+        <div class="afs-acc-body" id="body-step2" style="display:block">
+            <div class="afs-info afs-info-green mb-3">
+                Upload 2 or more AFS PDFs. The first file is treated as the <b>baseline</b>.
+                PDFs with different page counts are handled via <b>smart content alignment</b>.
+            </div>
+            <div class="afs-btn-row mb-3">
+                <label class="afs-btn afs-btn-primary" style="cursor:pointer">
+                    &#128196; Select PDFs
+                    <input type="file" id="pdfInput" accept=".pdf" multiple style="display:none" onchange="addToQueue()" />
+                </label>
+                <button class="afs-btn afs-btn-danger" onclick="clearQueue()">Clear All</button>
+                <span id="upload-status" class="afs-status"></span>
+            </div>
+            <div id="queue-table-wrap">
+                <div style="color:#64748B;font-size:12px;font-family:'IBM Plex Mono',monospace;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Files in queue</div>
+                <div id="queue-table-body">
+                    <div style="color:#4B5563;font-size:12px">No PDFs queued yet.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ╔═══════════════ STEP 3 — EXTRACT CONTENT ══════════════════╗ -->
+    <div class="afs-acc-item" id="acc-step3">
+        <button class="afs-acc-header" onclick="toggleAcc('step3')">
+            <span class="afs-step-num">3</span>
+            <span class="afs-step-label">Step 3 — Extract Content</span>
+            <span class="afs-acc-arrow" id="arrow-step3">&#9660;</span>
+        </button>
+        <div class="afs-acc-body" id="body-step3" style="display:none">
+            <div class="afs-info afs-info-violet mb-3">
+                Reads each PDF page-by-page. PDFs stay in memory so page snapshots work in Step 4.
+            </div>
+            <div class="afs-btn-row mb-3">
+                <button class="afs-btn afs-btn-primary" onclick="extractPdfs()">&#9654; Extract All PDFs</button>
+                <span id="extract-status" class="afs-status"></span>
+            </div>
+            <div id="extract-results"></div>
+        </div>
+    </div>
+
+    <!-- ╔═══════════════ STEP 4 — COMPARE ══════════════════════════╗ -->
+    <div class="afs-acc-item" id="acc-step4">
+        <button class="afs-acc-header" onclick="toggleAcc('step4')">
+            <span class="afs-step-num">4</span>
+            <span class="afs-step-label">Step 4 — Compare · Smart-Aligned Snapshot · Comment</span>
+            <span class="afs-acc-arrow" id="arrow-step4">&#9660;</span>
+        </button>
+        <div class="afs-acc-body" id="body-step4" style="display:none">
+            <div class="afs-info afs-info-amber mb-3">
+                Compares AFS 1 vs AFS 2 using <b>smart content-based page alignment</b>.
+                Different page counts are handled automatically.
+                v4.3: SNG purple branding · engagement table cover · Excel nump fix.
+            </div>
+            <div class="afs-btn-row mb-3">
+                <button class="afs-btn afs-btn-warning" onclick="runComparison()">&#9654; Run Comparison</button>
+                <span id="compare-status" class="afs-status"></span>
+            </div>
+            <!-- progress bar -->
+            <div id="compare-progress" style="display:none" class="afs-progress-wrap">
+                <div class="afs-progress-bar" id="compare-prog-bar"></div>
+                <div class="afs-progress-label" id="compare-prog-label">Running...</div>
+            </div>
+            <!-- results rendered here by JS -->
+            <div id="compare-results"></div>
+        </div>
+    </div>
+
+    <!-- ╔═══════════════ STEP 5 — SAVE WORKING PAPERS ══════════════╗ -->
+    <div class="afs-acc-item" id="acc-step5">
+        <button class="afs-acc-header" onclick="toggleAcc('step5')">
+            <span class="afs-step-num">5</span>
+            <span class="afs-step-label">Step 5 — Save Working Papers (PDF + Word + Excel + TXT)</span>
+            <span class="afs-acc-arrow" id="arrow-step5">&#9660;</span>
+        </button>
+        <div class="afs-acc-body" id="body-step5" style="display:none">
+            <div class="afs-info afs-info-green mb-3">
+                <b>v4.3 Export Options:</b><br>
+                &#128196; <b>PDF Working Paper</b> — Professional A4 with cover page, TOC, snapshots, changed/added/removed lines, number comparison, and auditor comments.<br>
+                &#128196; <b>Word Working Paper</b> — Same structure, fully editable .docx.<br>
+                &#128196; <b>Excel Workbook</b> — Structured data with page alignment sheet.<br>
+                &#128196; <b>Text Report</b> — Plain-text audit trail.
+            </div>
+            <div class="afs-field mb-3" style="max-width:520px">
+                <label class="afs-label">Output Folder:</label>
+                <input class="afs-input" id="export_folder" placeholder="C:\Users\...\Desktop\AFS_Comparison" />
+            </div>
+            <div class="afs-checkbox-row mb-3">
+                <label class="afs-chk-card">
+                    <input type="checkbox" id="chk_pdf"   checked /> &#128196; PDF Working Paper
+                </label>
+                <label class="afs-chk-card">
+                    <input type="checkbox" id="chk_word"  checked /> &#128196; Word (.docx)
+                </label>
+                <label class="afs-chk-card">
+                    <input type="checkbox" id="chk_excel" checked /> &#128200; Excel (.xlsx)
+                </label>
+                <label class="afs-chk-card">
+                    <input type="checkbox" id="chk_text"  checked /> &#128203; Text Report
+                </label>
+            </div>
+            <div class="afs-btn-row mb-3">
+                <button class="afs-btn afs-btn-success" onclick="saveWorkingPapers()">&#128190; Save All Working Papers</button>
+                <span id="export-status" class="afs-status"></span>
+            </div>
+            <div id="export-results"></div>
+        </div>
+    </div>
+
+</div><!-- end accordion -->
+
+@section Scripts {
+<script src="~/js/afs-app.js" asp-append-version="true"></script>
+}
+@* end of single-page view *@

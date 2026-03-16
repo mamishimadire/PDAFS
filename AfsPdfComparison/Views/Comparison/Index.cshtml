@@ -1,0 +1,34 @@
+@{
+    ViewData["Title"] = "Quick Compare";
+}
+
+<div class="container py-4" style="max-width:600px;">
+    <h4 style="color:#5C2D91;font-weight:700;">Quick PDF Comparison</h4>
+    <p class="text-muted">Upload two AFS PDF files to compare them directly.</p>
+
+    @if (!ViewData.ModelState.IsValid)
+    {
+        <div class="alert alert-danger">
+            @foreach (var err in ViewData.ModelState.Values.SelectMany(v => v.Errors))
+            {
+                <div>@err.ErrorMessage</div>
+            }
+        </div>
+    }
+
+    <form asp-action="Compare" enctype="multipart/form-data" method="post">
+        @Html.AntiForgeryToken()
+        <div class="mb-3">
+            <label class="form-label fw-semibold">AFS 1 (original)</label>
+            <input type="file" name="afs1" accept=".pdf" class="form-control" required />
+        </div>
+        <div class="mb-3">
+            <label class="form-label fw-semibold">AFS 2 (updated)</label>
+            <input type="file" name="afs2" accept=".pdf" class="form-control" required />
+        </div>
+        <button type="submit" class="btn btn-primary" style="background:#5C2D91;border-color:#5C2D91;">
+            Compare PDFs
+        </button>
+        <a href="/" class="btn btn-link ms-2">Back to main app</a>
+    </form>
+</div>
