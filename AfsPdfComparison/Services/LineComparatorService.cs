@@ -411,7 +411,12 @@ public class LineComparatorService
     /// </summary>
     private static string DetermineStatus(string l1, string l2, double rawScore)
     {
-        // Gate 1: Canonical string equality
+        // Gate 0: Case- and whitespace-insensitive equality.
+        // Lines that differ ONLY in capitalisation or spacing are NEVER flagged as
+        // changes — this is an absolute requirement. E.g. "TOTAL ASSETS" == "Total Assets".
+        if (Normalise(l1) == Normalise(l2))        return "same";
+
+        // Gate 1: Canonical string equality (also strips punctuation)
         if (Canonical(l1) == Canonical(l2))        return "same";
 
         // Gate 2: Similarity score above exact threshold
@@ -422,7 +427,7 @@ public class LineComparatorService
         var n2 = ExtractNumbers(l2);
         if (n1.SetEquals(n2) && rawScore >= 0.80)  return "same";
 
-        // Gate 4: Normalised text equality
+        // Gate 4: Normalised text equality (kept for safety; identical to Gate 0)
         if (Normalise(l1) == Normalise(l2))        return "same";
 
         // Gate 5: Word-overlap line-wrap artefact gate
@@ -588,16 +593,24 @@ public class LineComparatorService
     //      SequenceMatcher's output order (removed words first, added words second).
     //   3. Merge consecutive same-type atomic ops into spans.
     //   4. Merge adjacent delete+insert → replace.
+    //
+    // Word equality: case-insensitive, whitespace-trimmed — per requirement that
+    // capitalisation and spacing differences are never flagged as word changes.
     private static List<(string Tag, int I1, int I2, int J1, int J2)> GetOpcodes(
         string[] a, string[] b)
     {
+        // Case-insensitive, whitespace-trimmed word equality.
+        // "TOTAL" == "Total" == "total"; "  word  " == "word".
+        static bool Eq(string x, string y) =>
+            string.Equals(x.Trim(), y.Trim(), StringComparison.OrdinalIgnoreCase);
+
         int m = a.Length, n = b.Length;
 
         // ── 1. Build LCS DP table ─────────────────────────────────────────
         var dp = new int[m + 1, n + 1];
         for (int i = m - 1; i >= 0; i--)
             for (int j = n - 1; j >= 0; j--)
-                dp[i, j] = a[i] == b[j]
+                dp[i, j] = Eq(a[i], b[j])
                     ? dp[i + 1, j + 1] + 1
                     : Math.Max(dp[i + 1, j], dp[i, j + 1]);
 
@@ -606,7 +619,7 @@ public class LineComparatorService
         int ai = 0, bi = 0;
         while (ai < m || bi < n)
         {
-            if (ai < m && bi < n && a[ai] == b[bi])
+            if (ai < m && bi < n && Eq(a[ai], b[bi]))
             {
                 raw.Add(("equal",  ai, ai + 1, bi, bi + 1));
                 ai++; bi++;

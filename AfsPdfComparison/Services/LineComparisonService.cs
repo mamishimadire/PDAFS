@@ -147,7 +147,13 @@ namespace AfsPdfComparison.Services
         /// </summary>
         private static DiffStatus DetermineStatus(string l1, string l2, double rawScore)
         {
-            // Gate 1: Canonical string equality
+            // Gate 0: Case- and whitespace-insensitive equality.
+            // Lines that differ ONLY in capitalisation or spacing are NEVER flagged as
+            // changes — this is an absolute requirement. E.g. "TOTAL ASSETS" == "Total Assets".
+            if (TextNormaliser.Normalise(l1) == TextNormaliser.Normalise(l2))
+                return DiffStatus.Same;
+
+            // Gate 1: Canonical string equality (also strips punctuation)
             if (TextNormaliser.Canonicalise(l1) == TextNormaliser.Canonicalise(l2))
                 return DiffStatus.Same;
 
@@ -161,7 +167,7 @@ namespace AfsPdfComparison.Services
             if (n1.SetEquals(n2) && rawScore >= 0.80)
                 return DiffStatus.Same;
 
-            // Gate 4: Normalised text equality
+            // Gate 4: Normalised text equality (kept for safety; identical to Gate 0)
             if (TextNormaliser.Normalise(l1) == TextNormaliser.Normalise(l2))
                 return DiffStatus.Same;
 
