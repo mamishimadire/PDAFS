@@ -49,6 +49,25 @@ namespace AfsPdfComparison.Services
             string.IsNullOrEmpty(s) ? s :
                 _snapInvisRe.Replace(s.Normalize(NormalizationForm.FormKD), "");
 
+        // SnapNorm: mirrors LineComparatorService.Normalise() so that the rendered
+        // line text and the spec text (which came from extraction → diff pipeline)
+        // are compared with identical normalisation.
+        // Steps: NFKD → strip invisible → lowercase → collapse whitespace →
+        //        strip page-stamp lines → strip currency spacing → decimal spacing.
+        private static readonly Regex _snapPageStamp =
+            new(@"^[-–—\s]*\(?\s*\d{1,4}\s*\)?[-–—\s]*$", RegexOptions.Compiled);
+        private static string SnapNorm(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            string t = SnapStrip(s.ToLowerInvariant());
+            t = Regex.Replace(t, @"\s+", " ").Trim();
+            t = _snapPageStamp.IsMatch(t) ? "" : t;
+            t = Regex.Replace(t, @"\br\s+(?=\d)", "r");
+            t = Regex.Replace(t, @"(?<=\d)\s*\.\s*(?=\d)", ".");
+            t = Regex.Replace(t, @"(?<=\d)\s*,\s*(?=\d)", ",");
+            return t;
+        }
+
         // PDFium (DocLib.Instance) is a process-wide singleton and is NOT thread-safe.
         // Serialize all calls so parallel snapshot requests don't corrupt each other.
         private static readonly SemaphoreSlim _pdfiumLock = new SemaphoreSlim(1, 1);
@@ -153,50 +172,61 @@ namespace AfsPdfComparison.Services
                                          .Select(w => SnapStrip(w.Text ?? "").Trim())
                                          .Where(w => w.Length > 0)).ToLower();
 
+                            // Normalise the rendered line text the same way the
+                            // extraction pipeline normalises it, so spec and line
+                            // are compared on equal footing.
+                            var lineNorm = SnapNorm(lineTxt);
+
                             HighlightSpec? matchedSpec = null;
                             foreach (var spec in specs)
                             {
-                                var rawN = (spec.LineText ?? "").Trim().ToLower();
-                                if (rawN.Length < 4) continue;
+                                var specNorm = SnapNorm((spec.LineText ?? "").Trim());
+                                if (specNorm.Length < 4) continue;
 
-                                var lineWordSet = lineTxt.Split(' ', StringSplitOptions.RemoveEmptyEntries)
-                                                         .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                                var needleWords = rawN.Split(' ', StringSplitOptions.RemoveEmptyEntries)
-                                                      .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                                // ── Strict match strategy ────────────────────
+                                // Only highlight this rendered line when the spec
+                                // text is demonstrably the SAME line — not just a
+                                // word that happens to appear inside a longer sentence.
+                                //
+                                // Rule 1: exact normalised equality (handles case /
+                                //         spacing / invisible-char differences).
+                                if (lineNorm == specNorm) { matchedSpec = spec; break; }
 
-                                if (lineWordSet.Count > 0 && needleWords.Count > 0)
+                                // Rule 2: prefix match for long lines that wrap
+                                // differently across PDFs (spec is the shorter version).
+                                // Both must be at least 30 chars to avoid false hits.
+                                if (specNorm.Length >= 30 && lineNorm.Length >= 30)
                                 {
-                                    int    maxLen  = Math.Max(lineWordSet.Count, needleWords.Count);
-                                    int    minLen  = Math.Min(lineWordSet.Count, needleWords.Count);
-                                    double overlap = (double)lineWordSet.Intersect(needleWords).Count() / maxLen;
-                                    double ratio   = (double)minLen / maxLen;
-                                    if (overlap >= 0.85 && ratio >= 0.55 && ratio < 0.75) continue;
+                                    string shorter = specNorm.Length <= lineNorm.Length ? specNorm : lineNorm;
+                                    string longer  = specNorm.Length <= lineNorm.Length ? lineNorm : specNorm;
+                                    // Length ratio must be ≥ 0.60 — spec must cover at
+                                    // least 60 % of the line to be a genuine prefix match,
+                                    // not just a short fragment of a long paragraph.
+                                    double ratio = (double)shorter.Length / longer.Length;
+                                    if (ratio >= 0.60 && longer.StartsWith(shorter, StringComparison.Ordinal))
+                                    { matchedSpec = spec; break; }
                                 }
 
-                                var needle     = rawN.Length    > 40 ? rawN[..40]    : rawN;
-                                var lineHead40 = lineTxt.Length > 40 ? lineTxt[..40] : lineTxt;
-
-                                if (lineTxt.Contains(needle) ||
-                                    (lineHead40.Length >= 6 && needle.Contains(lineHead40)))
+                                // Rule 3: high ordered-token overlap for long lines
+                                // (handles minor wording differences in the same sentence).
+                                // Only fires when BOTH spec and line have ≥ 6 words,
+                                // preventing short headings / single words from matching.
+                                var lineTokens = lineNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                                var specTokens = specNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                                if (lineTokens.Length >= 6 && specTokens.Length >= 6)
                                 {
-                                    matchedSpec = spec; break;
-                                }
-
-                                if (lineTxt.Length >= 12 && rawN.Contains(lineTxt))
-                                {
-                                    matchedSpec = spec; break;
-                                }
-
-                                if (lineWordSet.Count >= 4 && needleWords.Count > 0)
-                                {
-                                    int    lineWc   = lineWordSet.Count;
-                                    int    maxLen   = Math.Max(lineWc, needleWords.Count);
-                                    double overlap  = (double)lineWordSet.Intersect(needleWords).Count() / lineWc;
-                                    double lenRatio = (double)lineWc / maxLen;
-                                    if (overlap >= 0.80 && lenRatio >= 0.30)
-                                    {
-                                        matchedSpec = spec; break;
-                                    }
+                                    var lineSet = lineTokens.ToHashSet(StringComparer.Ordinal);
+                                    var specSet = specTokens.ToHashSet(StringComparer.Ordinal);
+                                    int common  = lineSet.Intersect(specSet).Count();
+                                    int maxWc   = Math.Max(lineSet.Count, specSet.Count);
+                                    int minWc   = Math.Min(lineSet.Count, specSet.Count);
+                                    double wordOverlap = (double)common / maxWc;
+                                    double wordRatio   = (double)minWc  / maxWc;
+                                    // Both overlap AND length-ratio must clear high bars
+                                    // to ensure this is the SAME sentence, not a paragraph
+                                    // that happens to share many common English words.
+                                    if (wordOverlap >= 0.88 && wordRatio >= 0.65)
+                                    { matchedSpec = spec; break; }
                                 }
                             }
 

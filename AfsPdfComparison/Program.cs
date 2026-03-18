@@ -29,10 +29,11 @@ builder.Services.AddControllersWithViews();
 builder.Services.AddDistributedMemoryCache();
 builder.Services.AddSession(options =>
 {
-    options.IdleTimeout         = TimeSpan.FromHours(2);
+    options.IdleTimeout         = TimeSpan.FromMinutes(30); // security: expire after 30 min idle
     options.Cookie.HttpOnly     = true;
     options.Cookie.IsEssential  = true;
     options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+    options.Cookie.SameSite     = SameSiteMode.Strict;     // security: block cross-site access
 });
 
 // SECTION 3 · HTTP CONTEXT ACCESSOR
@@ -83,8 +84,13 @@ app.UseRouting();
 app.UseSession();       // must come after UseRouting, before MapControllerRoute
 app.UseAuthorization();
 
-// SECTION 7 · UPLOADS DIRECTORY — create wwwroot/uploads at startup
-Directory.CreateDirectory(Path.Combine(app.Environment.WebRootPath, "uploads"));
+// SECTION 7 · UPLOADS DIRECTORY — create wwwroot/uploads and WIPE IT at every startup
+// Security: ensures no uploaded PDF files from a previous session remain on disk.
+// Every run starts completely fresh with no stored user data.
+var uploadsDir = Path.Combine(app.Environment.WebRootPath, "uploads");
+Directory.CreateDirectory(uploadsDir);
+foreach (var f in Directory.GetFiles(uploadsDir))
+    try { File.Delete(f); } catch { /* ignore locked files */ }
 
 // SECTION 8 · ROUTING
 app.MapControllerRoute(

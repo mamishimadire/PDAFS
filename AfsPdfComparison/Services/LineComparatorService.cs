@@ -66,7 +66,7 @@ namespace AfsPdfComparison.Services;
 public class LineComparatorService
 {
     // ── Similarity thresholds ────────────────────────────────────────────────
-    private const double SimExact   = 0.94;
+    private const double SimExact   = 0.96;  // raised from 0.94 — reduces false "changed" on near-identical paragraphs
     private const double SimRelated = 0.55;
 
     // Gate 5 thresholds (word-overlap line-wrap artefact gate)
@@ -310,13 +310,58 @@ public class LineComparatorService
             if (string.Equals(prev, curr, StringComparison.OrdinalIgnoreCase))
                 continue;
 
+            // Hyperlink sub-word dedup (adjacent pass):
+            // PdfPig extracts a hyperlinked word as BOTH part of the containing
+            // sentence (merged above) AND as an extra standalone annotation block.
+            // Rule: if a short line (≤ 3 words) already appears verbatim as a
+            // phrase inside the most recent merged line, discard it.
+            // Space-padding both strings ensures whole-word matching without regex.
+            if (curr.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length <= 3)
+            {
+                string nm = Normalise(curr);
+                string np = Normalise(prev);
+                if (!string.IsNullOrEmpty(nm) && (" " + np + " ").Contains(" " + nm + " "))
+                    continue;
+            }
+
             if (!prevEnds && currCont && prev.Length >= 15)
                 merged[^1] = prev + " " + curr;
             else
                 merged.Add(curr);
         }
 
-        return merged;
+        // Second-pass hyperlink artefact dedup (order-independent).
+        // Some PDFs store hyperlink glyph data at a slightly different Y-coordinate
+        // than the surrounding text, causing the Y-band grouper to emit the
+        // hyperlinked word (e.g. "users") as a SEPARATE line that appears
+        // BEFORE the containing sentence in the sorted order.  The adjacent-pass
+        // above only fires when the orphan immediately follows the sentence, so
+        // it misses the reversed order.  This second pass scans ALL lines:
+        // any ≤3-word line that is a whole-word substring of ANY other line in
+        // the same page is an orphan annotation duplicate and is removed.
+        var deduped = new List<string>(merged.Count);
+        for (int k = 0; k < merged.Count; k++)
+        {
+            string line = merged[k];
+            int wc = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
+            if (wc > 0 && wc <= 3)
+            {
+                string nm = Normalise(line);
+                bool orphan = false;
+                for (int j = 0; j < merged.Count; j++)
+                {
+                    if (j == k) continue;
+                    if ((" " + Normalise(merged[j]) + " ").Contains(" " + nm + " "))
+                    {
+                        orphan = true;
+                        break;
+                    }
+                }
+                if (orphan) continue;
+            }
+            deduped.Add(line);
+        }
+        return deduped;
     }
 
     // Build inverted index: bigram/first-token → set of line indices
@@ -599,10 +644,23 @@ public class LineComparatorService
     private static List<(string Tag, int I1, int I2, int J1, int J2)> GetOpcodes(
         string[] a, string[] b)
     {
-        // Case-insensitive, whitespace-trimmed word equality.
-        // "TOTAL" == "Total" == "total"; "  word  " == "word".
-        static bool Eq(string x, string y) =>
-            string.Equals(x.Trim(), y.Trim(), StringComparison.OrdinalIgnoreCase);
+        // Normalise a single word token for comparison.
+        // Mirrors the user's NormalizeText() principle: normalise for comparison,
+        // display the original.  Applied inside GetOpcodes only — the original tokens
+        // are still returned in WordDiffToken so the UI shows unmodified text.
+        //   "TOTAL"   == "Total"    (case)
+        //   "R 700"   == "R700"     (currency prefix spacing)
+        //   "70 .08"  == "70.08"    (decimal spacing)
+        //   "1 , 000" == "1,000"    (comma spacing in numbers)
+        static string Nw(string w)
+        {
+            string t = w.Trim().ToLowerInvariant();
+            t = Regex.Replace(t, @"r\s+(?=\d)",            "r");  // R 70 → r70
+            t = Regex.Replace(t, @"(?<=\d)\s*\.\s*(?=\d)", ".");  // 70 . 08 → 70.08
+            t = Regex.Replace(t, @"(?<=\d)\s*,\s*(?=\d)",  ",");  // 1 , 000 → 1,000
+            return t;
+        }
+        static bool Eq(string x, string y) => Nw(x) == Nw(y);
 
         int m = a.Length, n = b.Length;
 

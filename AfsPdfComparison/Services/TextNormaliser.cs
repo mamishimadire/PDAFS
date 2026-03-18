@@ -74,6 +74,14 @@ namespace AfsPdfComparison.Services
             // exports). \uFFF0-\uFFFD covers the entire Unicode Specials block.
             t = Regex.Replace(t, @"[\p{C}\u00AD\u200B-\u200F\uFEFF\uFFF0-\uFFFD]", "");
             t = Regex.Replace(t, @"\s+", " ").Trim();
+            // Normalise South African rand prefix spacing: "R 700" / "r 700" → "r700".
+            // Applied after lowercasing, so only 'r' needs to be matched.
+            t = Regex.Replace(t, @"\br\s+(?=\d)", "r");
+            // Normalise decimal spacing inside numbers: "70 . 08" / "70. 08" → "70.08".
+            // Scoped to digit–dot–digit so sentence-terminal dots are unaffected.
+            t = Regex.Replace(t, @"(?<=\d)\s*\.\s*(?=\d)", ".");
+            // Normalise comma spacing inside numbers: "1 , 000" → "1,000".
+            t = Regex.Replace(t, @"(?<=\d)\s*,\s*(?=\d)", ",");
             t = Regex.Replace(t, @"^[-–—\s]*\d{1,4}[-–—\s]*$", "").Trim();
             return t;
         }

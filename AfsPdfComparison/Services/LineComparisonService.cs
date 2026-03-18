@@ -77,12 +77,51 @@ namespace AfsPdfComparison.Services
                 if (string.Equals(prev, curr, StringComparison.OrdinalIgnoreCase))
                     continue;
 
+                // Hyperlink sub-word dedup (adjacent pass, mirrors LineComparatorService):
+                // if a short line (≤ 3 words) already appears verbatim as a phrase
+                // inside the most recently merged line, it is a hyperlink annotation
+                // duplicate extracted by PdfPig → discard it.
+                if (curr.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length <= 3)
+                {
+                    string nm = TextNormaliser.Normalise(curr);
+                    string np = TextNormaliser.Normalise(prev);
+                    if (!string.IsNullOrEmpty(nm) && (" " + np + " ").Contains(" " + nm + " "))
+                        continue;
+                }
+
                 if (!prevEnds && currCont && prev.Length >= 15)
                     merged[^1] = prev + " " + curr;
                 else
                     merged.Add(curr);
             }
-            return merged;
+
+            // Second-pass hyperlink artefact dedup (order-independent).
+            // Catches the case where the orphan hyperlink word appears at a
+            // slightly different Y-band than the sentence, causing it to be
+            // emitted BEFORE the containing sentence in extraction order.
+            var deduped = new List<string>(merged.Count);
+            for (int k = 0; k < merged.Count; k++)
+            {
+                string line = merged[k];
+                int wc = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
+                if (wc > 0 && wc <= 3)
+                {
+                    string nm = TextNormaliser.Normalise(line);
+                    bool orphan = false;
+                    for (int j = 0; j < merged.Count; j++)
+                    {
+                        if (j == k) continue;
+                        if ((" " + TextNormaliser.Normalise(merged[j]) + " ").Contains(" " + nm + " "))
+                        {
+                            orphan = true;
+                            break;
+                        }
+                    }
+                    if (orphan) continue;
+                }
+                deduped.Add(line);
+            }
+            return deduped;
         }
 
         // Build inverted index: first-token and bigrams → set of line indices
