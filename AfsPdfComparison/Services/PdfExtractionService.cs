@@ -14,6 +14,7 @@
 // ║   by ComparisonController and PageSnapshotService.                          ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
+using System.Text;
 using UglyToad.PdfPig;
 
 namespace AfsPdfComparison.Services
@@ -30,6 +31,17 @@ namespace AfsPdfComparison.Services
 
     public class PdfExtractionService
     {
+        // Strip invisible Unicode chars (same set as TextNormaliser / PageExtractorService).
+        // \uFFF0-\uFFFD covers the Unicode Specials block including \uFFFD (REPLACEMENT
+        // CHARACTER, category So, NOT \p{C}), which PdfPig emits for undecodable glyphs.
+        private static readonly System.Text.RegularExpressions.Regex _invisRe =
+            new(@"[\p{C}\u00AD\u200B-\u200F\uFEFF\uFFF0-\uFFFD]",
+                System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        private static string StripInvisible(string s) =>
+            string.IsNullOrEmpty(s) ? s
+            : _invisRe.Replace(s.Normalize(NormalizationForm.FormKD), "");
+
         /// <summary>
         /// Extracts text from a PDF supplied as a byte array.
         /// Filters noise lines, computes word count, and extracts unique numbers.
@@ -46,12 +58,14 @@ namespace AfsPdfComparison.Services
 
                 // Group words into lines by Y-coordinate band (round to nearest 5 pt)
                 // PDF Y is bottom-up; "distance from page top" = pageH - BoundingBox.Top
+                // v4.3.2: StripInvisible applied to each word at source.
                 var lineTexts = page.GetWords()
                     .GroupBy(w => (int)(Math.Round((pageH - w.BoundingBox.Top) / 5.0) * 5))
                     .OrderBy(g => g.Key) // ascending = top-of-page first
                     .Select(g => string.Join(" ",
                         g.OrderBy(w => w.BoundingBox.Left)
-                         .Select(w => w.Text ?? "")))
+                         .Select(w => StripInvisible(w.Text ?? "").Trim())
+                         .Where(t => t.Length > 0)))
                     .Where(l => !TextNormaliser.IsNoise(l))
                     .ToList();
 

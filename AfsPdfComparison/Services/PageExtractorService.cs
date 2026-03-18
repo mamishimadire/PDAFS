@@ -113,6 +113,24 @@ public class PageExtractorService
     // This mirrors the Python pdfplumber lines_by_y grouping used in the
     // snapshot highlight routine.
     // ─────────────────────────────────────────────────────────────────────────
+    // ── v4.3.2 invisible-char stripping ──────────────────────────────────────
+    // PdfPig occasionally embeds Unicode control/format characters (zero-width
+    // spaces, object-replacement chars, BOM, …) inside word Text from hyperlinked
+    // or annotated glyphs.  Strip them here — at the source — so that the raw
+    // PdfReport.Pages text is already clean before any comparison logic runs.
+    // \uFFFD (REPLACEMENT CHARACTER, category So, NOT \p{C}) is added explicitly:
+    // PdfPig emits it when it cannot decode a glyph from a non-standard encoding.
+    // \uFFF0-\uFFFD covers the full Unicode Specials block (includes \uFFFC).
+    private static readonly System.Text.RegularExpressions.Regex _invisRe =
+        new(@"[\p{C}\u00AD\u200B-\u200F\uFEFF\uFFF0-\uFFFD]",
+            System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private static string StripInvisible(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return s;
+        return _invisRe.Replace(s.Normalize(NormalizationForm.FormKD), "");
+    }
+
     private static string ExtractPageText(Page page)
     {
         try
@@ -128,17 +146,59 @@ public class PageExtractorService
                 .GroupBy(w => (int)(Math.Round((pageH - w.BoundingBox.Top) / 5.0) * 5))
                 .OrderBy(g => g.Key);   // ascending = top-of-page first in distance-from-top coords
 
-            var sb = new StringBuilder();
-            foreach (var line in lineGroups)
+            // ── Step 1: strip invisible chars from each word ───────────────
+            var rawLines = new List<string>();
+            foreach (var lineGroup in lineGroups)
             {
-                // Sort words within a line left-to-right by X coordinate.
-                // Guard against PdfPig returning null Text (pdfplumber never does this).
-                var words = line.OrderBy(w => w.BoundingBox.Left)
-                                .Select(w => w.Text ?? "");
+                var words = lineGroup
+                    .OrderBy(w => w.BoundingBox.Left)
+                    .Select(w => StripInvisible(w.Text ?? "").Trim())
+                    .Where(w => w.Length > 0);
+                string line = string.Join(" ", words).Trim();
+                if (line.Length > 0)
+                    rawLines.Add(line);
+            }
+
+            // ── Step 2: paragraph reconstruction ──────────────────────────
+            // Merge continuation lines to normalise column-width differences.
+            // Rules (applied at SOURCE so both PDFs get identical reconstruction):
+            //   • Only merge when the current line starts with a LOWERCASE letter
+            //     (genuine mid-sentence wrap).  Capital-letter lines are always
+            //     new sentences/headings and must NOT be merged.
+            //   • Previous line must be at least 15 chars (not just a label).
+            //   • Previous line must not end with a sentence-terminal char (.!?;:).
+            //   • Consecutive identical lines (hyperlink duplication) are dropped.
+            var mergedLines = new List<string>(rawLines.Count);
+            foreach (string line in rawLines)
+            {
+                if (mergedLines.Count > 0 &&
+                    string.Equals(mergedLines[^1], line, StringComparison.OrdinalIgnoreCase))
+                    continue;   // deduplicate hyperlink artefacts
+
+                bool merged = false;
+                if (mergedLines.Count > 0)
+                {
+                    string prev   = mergedLines[^1];
+                    char   last   = prev.Length > 0 ? prev[^1] : '\0';
+                    bool prevEnds = last is '.' or '!' or '?' or ';' or ':';
+                    bool currCont = line.Length > 0 && char.IsLower(line[0]);
+
+                    if (!prevEnds && currCont && prev.Length >= 15)
+                    {
+                        mergedLines[^1] = prev + " " + line;
+                        merged = true;
+                    }
+                }
+                if (!merged)
+                    mergedLines.Add(line);
+            }
+
+            var sb = new StringBuilder();
+            foreach (string line in mergedLines)
                 // Use "\n" not AppendLine — AppendLine emits "\r\n" on Windows which
                 // leaves stray "\r" characters after SplitLines splits on "\n".
-                sb.Append(string.Join(" ", words) + "\n");
-            }
+                sb.Append(line + "\n");
+
             return sb.ToString();
         }
         catch

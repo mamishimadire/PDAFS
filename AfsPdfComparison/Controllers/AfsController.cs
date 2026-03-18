@@ -48,27 +48,30 @@ namespace AfsPdfComparison.Controllers;
 [Route("")]
 public class AfsController : Controller
 {
-    private readonly PageExtractorService _extractor;
-    private readonly ComparisonService    _comparer;
-    private readonly ExportService        _exporter;
-    private readonly SessionStateService  _session;
-    private readonly IWebHostEnvironment  _env;
-    private readonly PageSnapshotService  _snapshots;
+    private readonly PageExtractorService      _extractor;
+    private readonly ComparisonService          _comparer;
+    private readonly ExportService              _exporter;
+    private readonly SessionStateService        _session;
+    private readonly IWebHostEnvironment        _env;
+    private readonly PageSnapshotService        _snapshots;
+    private readonly WorkingPaperExportService  _wpExporter;
 
     public AfsController(
-        PageExtractorService extractor,
-        ComparisonService    comparer,
-        ExportService        exporter,
-        SessionStateService  session,
-        IWebHostEnvironment  env,
-        PageSnapshotService  snapshots)
+        PageExtractorService      extractor,
+        ComparisonService         comparer,
+        ExportService              exporter,
+        SessionStateService        session,
+        IWebHostEnvironment        env,
+        PageSnapshotService        snapshots,
+        WorkingPaperExportService  wpExporter)
     {
-        _extractor = extractor;
-        _comparer  = comparer;
-        _exporter  = exporter;
-        _session   = session;
-        _env       = env;
-        _snapshots = snapshots;
+        _extractor  = extractor;
+        _comparer   = comparer;
+        _exporter   = exporter;
+        _session    = session;
+        _env        = env;
+        _snapshots  = snapshots;
+        _wpExporter = wpExporter;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -343,7 +346,7 @@ public class AfsController : Controller
     /// </summary>
     [HttpPost("export")]
     [ValidateAntiForgeryToken]
-    public IActionResult RunExport(ExportViewModel vm)
+    public async Task<IActionResult> RunExport(ExportViewModel vm)
     {
         var cmp = _session.GetComparison();
         if (cmp == null)
@@ -390,19 +393,23 @@ public class AfsController : Controller
             string p = Path.Combine(folder, $"{client}_Working_Paper_{ts}.pdf");
             try
             {
-                _exporter.BuildPdf(cmp, eng, comments, p);
+                var pdfSnapshots = await PreRenderSnapshotsAsync(cmp);
+                _exporter.BuildPdf(cmp, eng, comments, p, pdfSnapshots);
                 vm.SavedFiles.Add("PDF Working Paper: " + p);
             }
             catch (Exception ex) { vm.Errors.Add("PDF error: " + ex.Message); }
         }
 
-        // ── Word ───────────────────────────────────────────────────────────
+        // ── Word (Professional Working Paper via WorkingPaperExportService) ─────
         if (vm.ExportWord)
         {
             string p = Path.Combine(folder, $"{client}_Working_Paper_{ts}.docx");
             try
             {
-                _exporter.BuildWord(cmp, eng, comments, p);
+                byte[]? pdf1Bytes = null, pdf2Bytes = null;
+                try { if (System.IO.File.Exists(cmp.Report1.PdfPath)) pdf1Bytes = await System.IO.File.ReadAllBytesAsync(cmp.Report1.PdfPath); } catch { }
+                try { if (System.IO.File.Exists(cmp.Report2.PdfPath)) pdf2Bytes = await System.IO.File.ReadAllBytesAsync(cmp.Report2.PdfPath); } catch { }
+                await _wpExporter.Build(cmp, eng, comments, pdf1Bytes, pdf2Bytes, p);
                 vm.SavedFiles.Add("Word Working Paper: " + p);
             }
             catch (Exception ex) { vm.Errors.Add("Word error: " + ex.Message); }
@@ -727,7 +734,7 @@ public class AfsController : Controller
     // ── API: Export ──────────────────────────────────────────────────────────
     [HttpPost("api/export")]
     [ValidateAntiForgeryToken]
-    public IActionResult ApiExport(
+    public async Task<IActionResult> ApiExport(
         [FromForm] string outputFolder,
         [FromForm] bool   exportPdf,
         [FromForm] bool   exportWord,
@@ -766,13 +773,25 @@ public class AfsController : Controller
         if (exportPdf)
         {
             string p = Path.Combine(folder, $"{client}_Working_Paper_{ts}.pdf");
-            try   { _exporter.BuildPdf(cmp, eng, comments, p); saved.Add("PDF: " + p); }
+            try
+            {
+                var pdfSnapshots = await PreRenderSnapshotsAsync(cmp);
+                _exporter.BuildPdf(cmp, eng, comments, p, pdfSnapshots);
+                saved.Add("PDF: " + p);
+            }
             catch (Exception ex) { errors.Add("PDF: " + ex.Message); }
         }
         if (exportWord)
         {
             string p = Path.Combine(folder, $"{client}_Working_Paper_{ts}.docx");
-            try   { _exporter.BuildWord(cmp, eng, comments, p); saved.Add("Word: " + p); }
+            try
+            {
+                byte[]? pdf1Bytes = null, pdf2Bytes = null;
+                try { if (System.IO.File.Exists(cmp.Report1.PdfPath)) pdf1Bytes = await System.IO.File.ReadAllBytesAsync(cmp.Report1.PdfPath); } catch { }
+                try { if (System.IO.File.Exists(cmp.Report2.PdfPath)) pdf2Bytes = await System.IO.File.ReadAllBytesAsync(cmp.Report2.PdfPath); } catch { }
+                await _wpExporter.Build(cmp, eng, comments, pdf1Bytes, pdf2Bytes, p);
+                saved.Add("Word: " + p);
+            }
             catch (Exception ex) { errors.Add("Word: " + ex.Message); }
         }
         if (exportExcel)
@@ -851,17 +870,23 @@ public class AfsController : Controller
 
         string? pdfPath;
         int     pageIdx;
-        List<string> highlightTexts;
+        List<HighlightSpec> highlightSpecs;
 
         if (afsNum == 1)
         {
             pdfPath = cmp.Report1.PdfPath;
             // PageAfs1 is 1-based; RenderPageToBase64 takes 0-based index
             pageIdx = (pageDiff.PageAfs1 ?? 1) - 1;
-            highlightTexts = pageDiff.Diffs
+            highlightSpecs = pageDiff.Diffs
                 .Where(d => d.Status == "changed" || d.Status == "removed")
-                .Select(d => d.Line1 ?? "")
-                .Where(l => l.Length >= 4)
+                .Select(d => new HighlightSpec
+                {
+                    LineText     = d.Line1 ?? "",
+                    ChangedWords = d.Status == "changed"
+                        ? d.WordDiff.Where(t => t.Tag == "removed").Select(t => t.Word).ToList()
+                        : new List<string>()
+                })
+                .Where(s => s.LineText.Length >= 4)
                 .Take(50)
                 .ToList();
         }
@@ -870,10 +895,16 @@ public class AfsController : Controller
             pdfPath = cmp.Report2.PdfPath;
             // PageAfs2 is 1-based; RenderPageToBase64 takes 0-based index
             pageIdx = (pageDiff.PageAfs2 ?? 1) - 1;
-            highlightTexts = pageDiff.Diffs
+            highlightSpecs = pageDiff.Diffs
                 .Where(d => d.Status == "changed" || d.Status == "added")
-                .Select(d => d.Line2 ?? "")
-                .Where(l => l.Length >= 4)
+                .Select(d => new HighlightSpec
+                {
+                    LineText     = d.Line2 ?? "",
+                    ChangedWords = d.Status == "changed"
+                        ? d.WordDiff.Where(t => t.Tag == "added").Select(t => t.Word).ToList()
+                        : new List<string>()
+                })
+                .Where(s => s.LineText.Length >= 4)
                 .Take(50)
                 .ToList();
         }
@@ -884,7 +915,7 @@ public class AfsController : Controller
         try
         {
             byte[] pdfBytes = System.IO.File.ReadAllBytes(pdfPath);
-            string b64      = await _snapshots.RenderPageToBase64(pdfBytes, pageIdx, highlightTexts);
+            string b64      = await _snapshots.RenderPageToBase64(pdfBytes, pageIdx, highlightSpecs);
             return Json(new
             {
                 success  = true,
@@ -1097,5 +1128,43 @@ public class AfsController : Controller
             // Fallback: return plain PNG if anything goes wrong
             return Convert.ToBase64String(rawPng);
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // UTILITY · Pre-render all page snapshot pairs for PDF export
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Renders every paired page from both PDFs into Base64 PNG strings
+    /// (with yellow highlights) so that the synchronous QuestPDF builder can
+    /// embed them without needing to await inside the content pipeline.
+    /// Returns one tuple per paired PageDiff, in order.
+    /// </summary>
+    private async Task<List<(string? Left, string? Right)>> PreRenderSnapshotsAsync(
+        ComparisonResult cmp)
+    {
+        byte[]? pdf1 = null, pdf2 = null;
+        try { if (System.IO.File.Exists(cmp.Report1.PdfPath)) pdf1 = await System.IO.File.ReadAllBytesAsync(cmp.Report1.PdfPath); } catch { }
+        try { if (System.IO.File.Exists(cmp.Report2.PdfPath)) pdf2 = await System.IO.File.ReadAllBytesAsync(cmp.Report2.PdfPath); } catch { }
+
+        var result = new List<(string? Left, string? Right)>();
+        foreach (var pd in cmp.PageDiffs.Where(pd => pd.PageAfs2.HasValue))
+        {
+            int p1i = pd.PageAfs1!.Value - 1;
+            int p2i = pd.PageAfs2!.Value - 1;
+            var hl1 = pd.Diffs
+                .Where(d => (d.Status == "changed" || d.Status == "removed")
+                         && !string.IsNullOrWhiteSpace(d.Line1))
+                .Select(d => d.Line1).ToList();
+            var hl2 = pd.Diffs
+                .Where(d => (d.Status == "changed" || d.Status == "added")
+                         && !string.IsNullOrWhiteSpace(d.Line2))
+                .Select(d => d.Line2).ToList();
+            string? left = null, right = null;
+            try { if (pdf1 != null) left  = await _snapshots.RenderPageToBase64(pdf1, p1i, hl1); } catch { }
+            try { if (pdf2 != null) right = await _snapshots.RenderPageToBase64(pdf2, p2i, hl2); } catch { }
+            result.Add((left, right));
+        }
+        return result;
     }
 }

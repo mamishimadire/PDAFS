@@ -27,6 +27,7 @@
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 using System.Globalization;
+using System.Text;
 using System.Text.RegularExpressions;
 using AfsPdfComparison.Models;
 
@@ -277,12 +278,46 @@ public class LineComparatorService
     // SECTION 3-INTERNAL · HELPERS
     // ─────────────────────────────────────────────────────────────────────────
 
-    // Split text into non-noise lines (mirrors Python _split_lines)
-    private static List<string> SplitLines(string text) =>
-        (text ?? "").Split('\n')
-                    .Select(l => l.Trim())
-                    .Where(l => !PageAlignmentService.IsNoise(l))
-                    .ToList();
+    // Split text into non-noise lines.
+    // Paragraph reconstruction: only merge a line whose first char is lowercase
+    // onto the preceding line — these are genuine mid-sentence wraps (e.g. the
+    // word "the" at the end of a column causes the next word to spill onto a new
+    // line starting with a lowercase letter).  Lines beginning with a capital
+    // letter are always new sentences, headings, or structural items and must
+    // NOT be merged — merging them produced false "same" verdicts by joining
+    // e.g. "Onerous contracts" with the following provision paragraph.
+    // Consecutive identical lines (caused by hyperlink duplication in PdfPig)
+    // are deduplicated.
+    private static List<string> SplitLines(string text)
+    {
+        var raw = (text ?? "").Split('\n')
+                              .Select(l => l.Trim())
+                              .Where(l => !PageAlignmentService.IsNoise(l))
+                              .ToList();
+
+        if (raw.Count == 0) return raw;
+
+        var merged = new List<string>(raw.Count) { raw[0] };
+        for (int i = 1; i < raw.Count; i++)
+        {
+            string prev   = merged[^1];
+            string curr   = raw[i];
+            char   last   = prev[^1];
+            bool prevEnds = last is '.' or '!' or '?' or ';' or ':';
+            bool currCont = curr.Length > 0 && char.IsLower(curr[0]);
+
+            // Dedup: skip exact consecutive duplicate (hyperlink artefact)
+            if (string.Equals(prev, curr, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (!prevEnds && currCont && prev.Length >= 15)
+                merged[^1] = prev + " " + curr;
+            else
+                merged.Add(curr);
+        }
+
+        return merged;
+    }
 
     // Build inverted index: bigram/first-token → set of line indices
     // Enables fast candidate retrieval without an O(n²) full scan.
@@ -398,15 +433,50 @@ public class LineComparatorService
             Normalise(l2).Split(' ', StringSplitOptions.RemoveEmptyEntries),
             StringComparer.OrdinalIgnoreCase);
 
-        if (w1.Count > 0 && w2.Count > 0)
+        // Gate 5 is directional: only fires when l2 (AFS2) has at least as many
+        // words as l1 (AFS1).  Rationale: line-wrap artefacts occur when AFS1
+        // wraps a sentence EARLIER than AFS2 (AFS2's column is wider), so l2 is
+        // LONGER.  If l2 is SHORTER, the missing words in AFS2 represent real
+        // content removals (e.g. a number like "11 639" present in AFS1 but
+        // absent in AFS2) and must NOT be silenced — they are genuine changes.
+        //
+        // NUMBER GUARD: if the lines contain any numeric tokens and those sets
+        // differ even by one digit (e.g. R217 vs R218), this is a genuine content
+        // change — Gate 5 must NOT suppress it regardless of word-overlap.
+        //
+        // SHORT-LINE GUARD: a 1–3 word line (e.g. single hyperlink word "users")
+        // must not be silenced by matching against a long paragraph that happens
+        // to contain that word.
+        bool numbersMatch = n1.Count == 0 && n2.Count == 0 || n1.SetEquals(n2);
+        if (w1.Count > 0 && w2.Count > 0 && w2.Count >= w1.Count
+            && numbersMatch
+            && w1.Count >= 4)   // short-line guard: skip for 1–3 word lines
         {
             int    intersection = w1.Intersect(w2).Count();
-            int    maxLen       = Math.Max(w1.Count, w2.Count);
-            int    minLen       = Math.Min(w1.Count, w2.Count);
-            double overlap      = (double)intersection / maxLen;
-            double lenRatio     = (double)minLen / maxLen;
+            int    minLen       = w1.Count;   // l1 is shorter or equal
+            int    maxLen       = w2.Count;   // l2 is longer or equal
+            double overlap  = (double)intersection / minLen;
+            double lenRatio = (double)minLen / maxLen;
 
             if (overlap >= WordOverlapThreshold && lenRatio >= LengthRatioThreshold)
+                return "same";
+        }
+
+        // Gate 6: Paragraph-wrap prefix gate.
+        // When one PDF's column is wider, its extracted line contains the entire
+        // text of the narrower PDF's line PLUS the next wrapped continuation.
+        // If the shorter normalised line (≥ 40 chars) is a LEADING SUBSTRING of
+        // the longer one AND the shorter line does NOT end in a sentence-terminal
+        // character (proving it is a mid-sentence fragment, not a truncated
+        // sentence), treat this pair as identical — same text, different wrap.
+        string gn1 = Normalise(l1), gn2 = Normalise(l2);
+        if (gn1.Length >= 40 && gn2.Length >= 40)
+        {
+            string shorter = gn1.Length <= gn2.Length ? gn1 : gn2;
+            string longer  = gn1.Length <= gn2.Length ? gn2 : gn1;
+            char   shortEnd = shorter[^1];
+            bool   endsStop = shortEnd is '.' or '!' or '?';
+            if (!endsStop && longer.StartsWith(shorter, StringComparison.Ordinal))
                 return "same";
         }
 
@@ -415,10 +485,23 @@ public class LineComparatorService
 
     // Normalise: lowercase, collapse whitespace, strip pure page-number lines.
     // internal static — also used by Gate 4 / Gate 5 in DetermineStatus.
+    // v4.3.2 FIX: NFKD decomposition + \p{C} strip eliminates invisible Unicode
+    // control chars (zero-width spaces, object-replacement chars, etc.) that
+    // PdfPig embeds around hyperlinked words, causing false "changed" verdicts.
     // Reference: Python _normalise()
     internal static string Normalise(string s)
     {
-        string t = Regex.Replace((s ?? "").Trim().ToLowerInvariant(), @"\s+", " ");
+        // 1. NFKD decomposition: normalises typographic variants (ligatures,
+        //    fancy quotes, etc.) to their base forms.
+        string t = (s ?? "").Normalize(NormalizationForm.FormKD).Trim().ToLowerInvariant();
+        // 2. Strip invisible Unicode control chars including zero-width spaces,
+        //    soft-hyphens, object-replacement chars that PdfPig injects around
+        //    hyperlinked words.  \uFFFD (REPLACEMENT CHARACTER, category So) is
+        //    also stripped here — it is NOT in \p{C} but PdfPig emits it when it
+        //    cannot decode a glyph from a non-standard font encoding.
+        //    \uFFF0-\uFFFD covers the full Unicode Specials block.
+        t = Regex.Replace(t, @"[\p{C}\u00AD\u200B-\u200F\uFEFF\uFFF0-\uFFFD]", "");
+        t = Regex.Replace(t, @"\s+", " ").Trim();
         t = Regex.Replace(t, @"^[-–—\s]*\d{1,4}[-–—\s]*$", "").Trim();
         return t;
     }

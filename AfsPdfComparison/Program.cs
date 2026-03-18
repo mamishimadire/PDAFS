@@ -61,6 +61,7 @@ builder.Services.AddScoped<SessionStateService>();
 builder.Services.AddScoped<PdfExtractionService>();
 builder.Services.AddScoped<LineComparisonService>();
 builder.Services.AddScoped<PageSnapshotService>();
+builder.Services.AddScoped<WorkingPaperExportService>();
 
 // SECTION 5 · QUESTPDF LICENSE
 // Community licence is free for open/internal tools. Must be set before any API call.

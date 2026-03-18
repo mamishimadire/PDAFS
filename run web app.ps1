@@ -26,7 +26,7 @@ if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-# ── Check the project folder exiPowerShell -ExecutionPolicy Bypass -File "C:\Users\Mamishi.Madire\Desktop\pdf comparison\run web app.ps1"sts ──────────────────────────────────────────
+# ── Check the project folder exists ──────────────────────────────────────────
 if (-not (Test-Path $projectDir)) {
     Write-Host "ERROR: Project folder not found at:" -ForegroundColor Red
     Write-Host "  $projectDir" -ForegroundColor Yellow

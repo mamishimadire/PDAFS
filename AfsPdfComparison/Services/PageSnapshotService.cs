@@ -17,6 +17,9 @@
 // ║   6. Result encoded as PNG Base64                                            ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
+using System.Text;
+using System.Text.RegularExpressions;
+using AfsPdfComparison.Models;
 using Docnet.Core;
 using Docnet.Core.Models;
 using SkiaSharp;
@@ -29,25 +32,56 @@ namespace AfsPdfComparison.Services
         // Match Python notebook DPI exactly
         private const int DPI = 130;
 
+        // Strip invisible/control chars from PDF word text before highlight matching.
+        // Must mirror PageExtractorService.StripInvisible() so the needle (from diff
+        // output, already stripped at extraction) matches the lineTxt rebuilt here.
+        private static readonly Regex _snapInvisRe =
+            new(@"[\p{C}\u00AD\u200B-\u200F\uFEFF\uFFF0-\uFFFD]",
+                RegexOptions.Compiled);
+
+        // Must mirror PageExtractorService.StripInvisible exactly:
+        // NFKD-decompose first so Unicode variants of the same glyph map to
+        // the same code-points, then strip invisible/control chars.  Without
+        // the NFKD step the lineTxt and the needle (produced by extraction)
+        // can have different byte representations of the same visual character,
+        // causing Contains() comparisons to silently fail.
+        private static string SnapStrip(string s) =>
+            string.IsNullOrEmpty(s) ? s :
+                _snapInvisRe.Replace(s.Normalize(NormalizationForm.FormKD), "");
+
         // PDFium (DocLib.Instance) is a process-wide singleton and is NOT thread-safe.
         // Serialize all calls so parallel snapshot requests don't corrupt each other.
         private static readonly SemaphoreSlim _pdfiumLock = new SemaphoreSlim(1, 1);
 
         /// <summary>
+        /// Backward-compatible overload: converts a plain list of line texts to
+        /// <see cref="HighlightSpec"/> objects (with empty ChangedWords so entire lines are
+        /// highlighted) and calls the main overload. Keeps WorkingPaperExportService and
+        /// ComparisonController working without any changes.
+        /// </summary>
+        public Task<string> RenderPageToBase64(byte[] pdfBytes, int pageIndex,
+            List<string>? highlightTexts = null)
+        {
+            var specs = highlightTexts == null ? null :
+                highlightTexts.Select(t => new HighlightSpec { LineText = t ?? "" }).ToList();
+            return RenderPageToBase64(pdfBytes, pageIndex, specs);
+        }
+
+        /// <summary>
         /// Renders page <paramref name="pageIndex"/> (0-based) from PDF bytes to a
-        /// pixel-accurate Base64 PNG, with yellow highlight bands over changed lines.
+        /// pixel-accurate Base64 PNG with yellow highlight bands over changed lines.
+        /// When a <see cref="HighlightSpec"/> has <c>ChangedWords</c> set, only those
+        /// individual words are highlighted instead of the full line band.
         /// Mirrors Python v4.3 _pdf_page_to_b64(pdf_path, page_num, dpi=130, highlight_texts=...).
         /// </summary>
         public async Task<string> RenderPageToBase64(byte[] pdfBytes, int pageIndex,
-            List<string>? highlightTexts = null)
+            List<HighlightSpec>? specs = null)
         {
             if (pdfBytes == null || pdfBytes.Length == 0) return "";
 
             try
             {
                 // ── Step 1: Get PDF page dimensions via PdfPig (gives us PDF unit size) ──
-                // PdfPig page dimensions are in PDF points (1 pt = 1/72 inch).
-                // We convert to pixels at DPI to get the exact output size for PDFium.
                 using var pdfDoc = PdfDocument.Open(pdfBytes);
                 var allPages = pdfDoc.GetPages().ToList();
                 if (pageIndex >= allPages.Count) return "";
@@ -56,25 +90,18 @@ namespace AfsPdfComparison.Services
                 double pageWidth  = pdfPage.Width  > 0 ? pdfPage.Width  : 612;
                 double pageHeight = pdfPage.Height > 0 ? pdfPage.Height : 792;
 
-                // Pixel dimensions at target DPI — DPI/72 converts PDF points → pixels
                 int imgW = (int)Math.Round(pageWidth  * DPI / 72.0);
                 int imgH = (int)Math.Round(pageHeight * DPI / 72.0);
 
-                // ── Step 2: Rasterise PDF page using PDFium (pixel-perfect, like Poppler) ──
-                // DocLib.Instance is a process-wide singleton — never dispose it.
-                // Acquire the semaphore to serialise concurrent requests.
+                // ── Step 2: Rasterise PDF page using PDFium ──────────────────────────────
                 await _pdfiumLock.WaitAsync();
                 byte[] rawBytes;
                 try
                 {
                     var lib = DocLib.Instance;
                     using var docReader = lib.GetDocReader(pdfBytes, new PageDimensions(imgW, imgH));
-
                     if (pageIndex >= docReader.GetPageCount()) return "";
-
                     using var pageReader = docReader.GetPageReader(pageIndex);
-
-                    // PDFium returns raw BGRA bytes — same pixel data Poppler produces
                     rawBytes = pageReader.GetImage();
                 }
                 finally
@@ -89,21 +116,14 @@ namespace AfsPdfComparison.Services
 
                 using var canvas = new SKCanvas(bmp);
 
-                // ── Step 4: Draw yellow highlight bands over matched lines ───────────────
-                if (highlightTexts != null && highlightTexts.Count > 0)
+                // ── Step 4: Draw highlight bands / word boxes over matched lines ──────────
+                if (specs != null && specs.Count > 0)
                 {
-                    // PdfPig words already loaded above — reuse pdfPage
                     if (pageIndex < allPages.Count)
                     {
-
-                        // Scale factors: PDF units → image pixels
-                        // Mirrors Python: sx = iw / pw,  sy = ih / ph
                         double sx = imgW / pageWidth;
                         double sy = imgH / pageHeight;
 
-                        // Group words into lines by Y-coordinate band
-                        // Python: y_key = round(float(w['top']) / 5) * 5
-                        // PdfPig 'top' = pageHeight - BoundingBox.Top  (PDF coords are bottom-up)
                         var words = pdfPage.GetWords().ToList();
                         var linesByY = words
                             .GroupBy(w =>
@@ -128,57 +148,115 @@ namespace AfsPdfComparison.Services
                         foreach (var grp in linesByY)
                         {
                             var lineWords = grp.ToList();
-                            // Reconstruct line text (same as Python)
                             var lineTxt = string.Join(" ",
                                 lineWords.OrderBy(w => w.BoundingBox.Left)
-                                         .Select(w => w.Text ?? "")).ToLower();
+                                         .Select(w => SnapStrip(w.Text ?? "").Trim())
+                                         .Where(w => w.Length > 0)).ToLower();
 
-                            // Python matching logic — exact port:
-                            // needle = ht.strip().lower()[:30]
-                            // if needle and (needle in line_txt or line_txt[:30] in needle)
-                            bool matched = (highlightTexts ?? new()).Any(ht =>
+                            HighlightSpec? matchedSpec = null;
+                            foreach (var spec in specs)
                             {
-                                var rawN = (ht ?? "").Trim().ToLower();
-                                if (rawN.Length < 4) return false;
-                                var needle     = rawN.Length    > 30 ? rawN[..30]       : rawN;
-                                var lineHead30 = lineTxt.Length > 30 ? lineTxt[..30] : lineTxt;
-                                return lineTxt.Contains(needle) ||
-                                       (lineHead30.Length >= 6 && needle.Contains(lineHead30));
-                            });
+                                var rawN = (spec.LineText ?? "").Trim().ToLower();
+                                if (rawN.Length < 4) continue;
 
-                            if (!matched) continue;
+                                var lineWordSet = lineTxt.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                                                         .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                                var needleWords = rawN.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                                                      .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-                            // Compute bounding box in PDF space
-                            // Python: x0=min(w['x0'])*sx-2, x1=max(w['x1'])*sx+2
-                            //         y0=min(w['top'])*sy-2, y1=max(w['bottom'])*sy+2
-                            // PdfPig: x0=BoundingBox.Left, x1=BoundingBox.Right
-                            //         top (from top of page) = pageHeight - BoundingBox.Top
-                            //         bottom (from top)      = pageHeight - BoundingBox.Bottom
-                            double pdfX0   = lineWords.Min(w => w.BoundingBox.Left);
-                            double pdfX1   = lineWords.Max(w => w.BoundingBox.Right);
-                            double pdfTop  = lineWords.Min(w => pageHeight - w.BoundingBox.Top);
-                            double pdfBot  = lineWords.Max(w => pageHeight - w.BoundingBox.Bottom);
+                                if (lineWordSet.Count > 0 && needleWords.Count > 0)
+                                {
+                                    int    maxLen  = Math.Max(lineWordSet.Count, needleWords.Count);
+                                    int    minLen  = Math.Min(lineWordSet.Count, needleWords.Count);
+                                    double overlap = (double)lineWordSet.Intersect(needleWords).Count() / maxLen;
+                                    double ratio   = (double)minLen / maxLen;
+                                    if (overlap >= 0.85 && ratio >= 0.55 && ratio < 0.75) continue;
+                                }
 
-                            float pixX0 = (float)(pdfX0 * sx) - 2f;
-                            float pixX1 = (float)(pdfX1 * sx) + 2f;
-                            float pixY0 = (float)(pdfTop * sy) - 2f;
-                            float pixY1 = (float)(pdfBot * sy) + 2f;
+                                var needle     = rawN.Length    > 40 ? rawN[..40]    : rawN;
+                                var lineHead40 = lineTxt.Length > 40 ? lineTxt[..40] : lineTxt;
 
-                            var rect = new SKRect(pixX0, pixY0, pixX1, pixY1);
-                            canvas.DrawRect(rect, fillPaint);
-                            canvas.DrawRect(rect, borderPaint);
+                                if (lineTxt.Contains(needle) ||
+                                    (lineHead40.Length >= 6 && needle.Contains(lineHead40)))
+                                {
+                                    matchedSpec = spec; break;
+                                }
+
+                                if (lineTxt.Length >= 12 && rawN.Contains(lineTxt))
+                                {
+                                    matchedSpec = spec; break;
+                                }
+
+                                if (lineWordSet.Count >= 4 && needleWords.Count > 0)
+                                {
+                                    int    lineWc   = lineWordSet.Count;
+                                    int    maxLen   = Math.Max(lineWc, needleWords.Count);
+                                    double overlap  = (double)lineWordSet.Intersect(needleWords).Count() / lineWc;
+                                    double lenRatio = (double)lineWc / maxLen;
+                                    if (overlap >= 0.80 && lenRatio >= 0.30)
+                                    {
+                                        matchedSpec = spec; break;
+                                    }
+                                }
+                            }
+
+                            if (matchedSpec == null) continue;
+
+                            if (matchedSpec.ChangedWords.Count == 0)
+                            {
+                                // Whole-line band highlight (added / removed lines)
+                                double pdfX0   = lineWords.Min(w => w.BoundingBox.Left);
+                                double pdfX1   = lineWords.Max(w => w.BoundingBox.Right);
+                                double pdfTop  = lineWords.Min(w => pageHeight - w.BoundingBox.Top);
+                                double pdfBot  = lineWords.Max(w => pageHeight - w.BoundingBox.Bottom);
+
+                                float pixX0 = (float)(pdfX0 * sx) - 2f;
+                                float pixX1 = (float)(pdfX1 * sx) + 2f;
+                                float pixY0 = (float)(pdfTop * sy) - 2f;
+                                float pixY1 = (float)(pdfBot * sy) + 2f;
+
+                                var rect = new SKRect(pixX0, pixY0, pixX1, pixY1);
+                                canvas.DrawRect(rect, fillPaint);
+                                canvas.DrawRect(rect, borderPaint);
+                            }
+                            else
+                            {
+                                // Per-word highlight: only the specific changed tokens
+                                var changedSet = matchedSpec.ChangedWords
+                                    .Select(w => SnapStrip(w ?? "").Trim().ToLower())
+                                    .Where(w => w.Length >= 1)
+                                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                                foreach (var word in lineWords)
+                                {
+                                    var wt = SnapStrip(word.Text ?? "").Trim().ToLower();
+                                    if (wt.Length < 1 || !changedSet.Contains(wt)) continue;
+
+                                    double wx0  = word.BoundingBox.Left;
+                                    double wx1  = word.BoundingBox.Right;
+                                    double wTop = pageHeight - word.BoundingBox.Top;
+                                    double wBot = pageHeight - word.BoundingBox.Bottom;
+
+                                    var wr = new SKRect(
+                                        (float)(wx0  * sx) - 2f,
+                                        (float)(wTop * sy) - 2f,
+                                        (float)(wx1  * sx) + 2f,
+                                        (float)(wBot * sy) + 2f);
+                                    canvas.DrawRect(wr, fillPaint);
+                                    canvas.DrawRect(wr, borderPaint);
+                                }
+                            }
                         }
                     }
                 }
 
-                // ── Step 4: Encode to PNG Base64 ────────────────────────────────────────
+                // ── Step 5: Encode to PNG Base64 ────────────────────────────────────────
                 using var image = SKImage.FromBitmap(bmp);
                 using var data  = image.Encode(SKEncodedImageFormat.Png, 90);
                 return Convert.ToBase64String(data.ToArray());
             }
             catch (Exception ex)
             {
-                // Log and return empty — controller will show placeholder
                 Console.WriteLine($"[PageSnapshotService] Error: {ex.Message}");
                 return "";
             }

@@ -54,11 +54,36 @@ namespace AfsPdfComparison.Services
 
         private readonly NormalizedLevenshtein _lev = new();
 
-        private List<string> SplitLines(string text) =>
-            (text ?? "").Split('\n')
+        private List<string> SplitLines(string text)
+        {
+            var raw = (text ?? "").Split('\n')
                 .Select(l => l.Trim())
                 .Where(l => !TextNormaliser.IsNoise(l))
                 .ToList();
+
+            if (raw.Count == 0) return raw;
+
+            // Merge only lowercase-start continuations; deduplicate consecutive
+            // identical lines (hyperlink duplication artefact).
+            var merged = new List<string>(raw.Count) { raw[0] };
+            for (int i = 1; i < raw.Count; i++)
+            {
+                string prev   = merged[^1];
+                string curr   = raw[i];
+                char   last   = prev[^1];
+                bool prevEnds = last is '.' or '!' or '?' or ';' or ':';
+                bool currCont = curr.Length > 0 && char.IsLower(curr[0]);
+
+                if (string.Equals(prev, curr, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (!prevEnds && currCont && prev.Length >= 15)
+                    merged[^1] = prev + " " + curr;
+                else
+                    merged.Add(curr);
+            }
+            return merged;
+        }
 
         // Build inverted index: first-token and bigrams → set of line indices
         private Dictionary<string, HashSet<int>> BuildIndex(List<string> lines)
@@ -148,15 +173,37 @@ namespace AfsPdfComparison.Services
                 TextNormaliser.Normalise(l2).Split(' ', StringSplitOptions.RemoveEmptyEntries),
                 StringComparer.OrdinalIgnoreCase);
 
-            if (w1.Count > 0 && w2.Count > 0)
+            // Gate 5 is directional: only fires when l2 (AFS2) has at least as
+            // many words as l1 (AFS1) — i.e. AFS1 wraps earlier (AFS2 wider column).
+            // If l2 is shorter, the missing words are real content removals.
+            // NUMBER GUARD: if any numeric token differs between l1 and l2 (e.g.
+            // R217 vs R218) Gate 5 must NOT suppress the change.
+            // SHORT-LINE GUARD: 1–3 word lines must not be swallowed.
+            // n1/n2 already computed by Gate 3 above — reuse them.
+            bool numOk = (n1.Count == 0 && n2.Count == 0) || n1.SetEquals(n2);
+            if (w1.Count > 0 && w2.Count > 0 && w2.Count >= w1.Count
+                && numOk
+                && w1.Count >= 4)
             {
                 int    intersection = w1.Intersect(w2).Count();
-                int    maxLen       = Math.Max(w1.Count, w2.Count);
-                int    minLen       = Math.Min(w1.Count, w2.Count);
-                double overlap      = (double)intersection / maxLen;
+                int    minLen       = w1.Count;   // l1 is shorter or equal
+                int    maxLen       = w2.Count;   // l2 is longer or equal
+                double overlap      = (double)intersection / minLen;
                 double lenRatio     = (double)minLen / maxLen;
 
                 if (overlap >= WORD_OVERLAP_THRESHOLD && lenRatio >= LENGTH_RATIO_THRESHOLD)
+                    return DiffStatus.Same;
+            }
+
+            // Gate 6: Paragraph-wrap prefix gate (same logic as LineComparatorService).
+            string gn1 = TextNormaliser.Normalise(l1), gn2 = TextNormaliser.Normalise(l2);
+            if (gn1.Length >= 40 && gn2.Length >= 40)
+            {
+                string shorter  = gn1.Length <= gn2.Length ? gn1 : gn2;
+                string longer   = gn1.Length <= gn2.Length ? gn2 : gn1;
+                char   shortEnd = shorter[^1];
+                bool   endsStop = shortEnd is '.' or '!' or '?';
+                if (!endsStop && longer.StartsWith(shorter, StringComparison.Ordinal))
                     return DiffStatus.Same;
             }
 

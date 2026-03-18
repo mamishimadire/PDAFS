@@ -13,6 +13,7 @@
 // ║   • Python notebook v4.3.2 — _normalise() function                          ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace AfsPdfComparison.Services
@@ -52,15 +53,27 @@ namespace AfsPdfComparison.Services
 
         /// <summary>
         /// Lightweight normalisation: lowercase, collapse whitespace, strip
-        /// pure page-number lines.
+        /// pure page-number lines, and remove invisible Unicode characters.
         /// Used by Gate 4 in DetermineStatus() — catches lines that are
         /// identical after basic normalisation but survive Canonicalise().
         /// Mirrors Python _normalise() function.
+        /// v4.3.2+: NFKD decomposition + \p{C} strip fix the 'users' hyperlink
+        /// issue where PdfPig embeds zero-width / object-replacement chars
+        /// around hyperlinked words, causing false 'changed' flags.
         /// </summary>
         public static string Normalise(string s)
         {
             if (string.IsNullOrWhiteSpace(s)) return "";
-            string t = Regex.Replace(s.Trim().ToLowerInvariant(), @"\s+", " ");
+            // Decompose Unicode (ligatures, accented chars, etc.) then lowercase
+            string t = s.Normalize(NormalizationForm.FormKD).Trim().ToLowerInvariant();
+            // Strip invisible/control chars — zero-width space, soft-hyphen,
+            // object-replacement char (\uFFFC), REPLACEMENT CHARACTER (\uFFFD, So
+            // category — NOT \p{C}), BOM, and all \p{C} control-category chars.
+            // PdfPig emits \uFFFD when it cannot decode a PDF glyph from a
+            // non-standard encoding (common with hyperlinked words in Word→PDF
+            // exports). \uFFF0-\uFFFD covers the entire Unicode Specials block.
+            t = Regex.Replace(t, @"[\p{C}\u00AD\u200B-\u200F\uFEFF\uFFF0-\uFFFD]", "");
+            t = Regex.Replace(t, @"\s+", " ").Trim();
             t = Regex.Replace(t, @"^[-–—\s]*\d{1,4}[-–—\s]*$", "").Trim();
             return t;
         }
@@ -69,11 +82,17 @@ namespace AfsPdfComparison.Services
         /// Aggressive canonical form: strips whitespace/punctuation/number-format
         /// differences so "R 1 234 567" and "R1,234,567" compare as equal.
         /// Used by Gate 1 in DetermineStatus().
+        /// v4.3.2+: NFKD + \p{C} strip added to handle invisible Unicode characters
+        /// embedded by PdfPig around hyperlinked text (e.g. underlined 'users').
         /// </summary>
         public static string Canonicalise(string s)
         {
             if (string.IsNullOrWhiteSpace(s)) return "";
-            var t = s.Trim().ToLowerInvariant();
+            // Decompose Unicode (handles fancy quotes, ligatures, accented chars)
+            var t = s.Normalize(NormalizationForm.FormKD).Trim().ToLowerInvariant();
+            // Strip invisible/control chars before any other processing.
+            // Includes \uFFF0-\uFFFD (Specials block, covers \uFFFD replacement char).
+            t = Regex.Replace(t, @"[\p{C}\u00AD\u200B-\u200F\uFEFF\uFFF0-\uFFFD]", "");
             // Collapse all whitespace (including non-breaking space) to single space
             t = Regex.Replace(t, @"[\s\u00a0]+", " ");
             // Remove whitespace between digits: "102 575" → "102575"

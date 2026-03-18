@@ -23,7 +23,10 @@
 
 using System.Text;
 using AfsPdfComparison.Models;
-using ClosedXML.Excel;
+using Colors = QuestPDF.Helpers.Colors;
+using DocumentFormat.OpenXml;
+using DocumentFormat.OpenXml.Packaging;
+using DocumentFormat.OpenXml.Spreadsheet;
 using QuestPDF.Fluent;
 using QuestPDF.Helpers;
 using QuestPDF.Infrastructure;
@@ -85,7 +88,8 @@ public class ExportService
         ComparisonResult cmp,
         EngagementDetails eng,
         Dictionary<string, string> comments,
-        string path)
+        string path,
+        IReadOnlyList<(string? Left, string? Right)>? snapshots = null)
     {
         QuestPDF.Settings.License = LicenseType.Community;
         string ts = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
@@ -153,22 +157,26 @@ public class ExportService
                     // SECTION 1 · Documents Compared
                     PdfDocumentsSection(col, cmp);
 
-                    // SECTION 2 · Comparison Summary
+                    // SECTION 2 · Page-by-Page Snapshot Review
+                    if (snapshots != null && snapshots.Count > 0)
+                        PdfSnapshotSection(col, cmp, comments, snapshots);
+
+                    // SECTION 3 · Comparison Summary
                     PdfSummarySection(col, cmp);
 
-                    // SECTION 3 · Changed Lines
+                    // SECTION 4 · Changed Lines
                     PdfChangedSection(col, cmp, comments);
 
-                    // SECTION 4 · Added Lines
+                    // SECTION 5 · Added Lines
                     PdfAddedSection(col, cmp);
 
-                    // SECTION 5 · Removed Lines
+                    // SECTION 6 · Removed Lines
                     PdfRemovedSection(col, cmp);
 
-                    // SECTION 6 · Number Comparison
+                    // SECTION 7 · Number Comparison
                     PdfNumberSection(col, cmp);
 
-                    // SECTION 7 · Consolidated Auditor Comments
+                    // SECTION 8 · Consolidated Auditor Comments
                     PdfCommentsSection(col, comments);
                 });
             });
@@ -222,7 +230,7 @@ public class ExportService
             c.Item().Table(t =>
             {
                 t.ColumnsDefinition(cd => cd.RelativeColumn());
-                PdfTblHdrRow(t, "Audit Objective", Purple);
+                PdfTblHdrRow(t, "Audit Objective", Purple, 1);
                 t.Cell().Background("#F1F5F9").Padding(6)
                     .Text(eng.Objective).FontSize(9);
             });
@@ -262,6 +270,83 @@ public class ExportService
                 Row(cmp.Report1);
                 Row(cmp.Report2);
             });
+            c.Item().PageBreak();
+        });
+    }
+
+    // ── Snapshot section ──────────────────────────────────────────────────────
+    private static void PdfSnapshotSection(
+        ColumnDescriptor col,
+        ComparisonResult cmp,
+        Dictionary<string, string> comments,
+        IReadOnlyList<(string? Left, string? Right)> snapshots)
+    {
+        var paired = cmp.PageDiffs.Where(pd => pd.PageAfs2.HasValue).ToList();
+        col.Item().Column(c =>
+        {
+            PdfSectionHeading(c, "2  Page-by-Page Snapshot Review");
+            c.Item().PaddingBottom(6).Text(
+                "Each page pair shows AFS 1 and AFS 2 side by side with yellow highlights " +
+                "on changed lines. Pages are matched by content similarity, not page number.")
+             .FontSize(8).FontColor("#6B7280").Italic();
+
+            for (int k = 0; k < paired.Count; k++)
+            {
+                var    pd       = paired[k];
+                int    issues   = pd.Changed + pd.Added + pd.Removed;
+                string pairKey  = "page:" + k;
+                string pairLbl  = $"AFS1 p{pd.PageAfs1} \u2194 AFS2 p{pd.PageAfs2}";
+                string issuesTxt = issues == 0 ? "NO CHANGES" : $"{issues} CHANGE(S)";
+                string statsText =
+                    $"Pair {k + 1}   {pairLbl}   |  Align: {pd.AlignSim:F3}" +
+                    $"   |  {pd.PctSame}% same" +
+                    $"   \u2713{pd.Same}  ~{pd.Changed}  +{pd.Added}  -{pd.Removed}" +
+                    $"   \u2190 {issuesTxt}";
+
+                c.Item().PaddingTop(8).Background(Navy).Padding(4)
+                 .Text(statsText).FontSize(7).Bold().FontColor(Colors.White);
+
+                var (b64L, b64R) = k < snapshots.Count ? snapshots[k] : (null, null);
+
+                // Side-by-side snapshot row
+                c.Item().Row(r =>
+                {
+                    void Side(string? b64, string caption, string bgColor)
+                    {
+                        r.RelativeItem().Column(col2 =>
+                        {
+                            col2.Item().Background(bgColor).Padding(4)
+                                .Text(caption).FontSize(7).Bold().FontColor(Dark);
+                            if (!string.IsNullOrEmpty(b64))
+                            {
+                                try
+                                {
+                                    byte[] imgBytes = Convert.FromBase64String(b64);
+                                    col2.Item().Image(imgBytes, ImageScaling.FitWidth);
+                                }
+                                catch
+                                {
+                                    col2.Item().Background("#FEF2F2").Padding(8)
+                                        .Text("[Image render error]").FontSize(8).FontColor(Red);
+                                }
+                            }
+                            else
+                            {
+                                col2.Item().Background("#F3F4F6").Padding(16)
+                                    .Text("[Image unavailable]").FontSize(8).FontColor("#9CA3AF").Italic();
+                            }
+                        });
+                    }
+
+                    Side(b64L, $"AFS 1 \u2014 page {pd.PageAfs1}", "#DBEAFE");
+                    r.ConstantItem(3);
+                    Side(b64R, $"AFS 2 \u2014 page {pd.PageAfs2}", "#EDE9FE");
+                });
+
+                // Auditor comment box
+                string existing = comments.TryGetValue(pairKey, out var cv) ? cv.Trim() : "";
+                PdfCommentBox(c, pairKey, pairLbl, existing);
+            }
             c.Item().PageBreak();
         });
     }
@@ -481,9 +566,9 @@ public class ExportService
         col.Item().PaddingBottom(4);
     }
 
-    private static void PdfTblHdrRow(TableDescriptor t, string text, string bgColor)
+    private static void PdfTblHdrRow(TableDescriptor t, string text, string bgColor, uint colSpan = 2)
     {
-        t.Cell().ColumnSpan(10).Background(bgColor).Padding(5)
+        t.Cell().ColumnSpan(colSpan).Background(bgColor).Padding(5)
          .Text(text).FontSize(9).Bold().FontColor(Colors.White);
     }
 
@@ -793,119 +878,211 @@ public class ExportService
         Dictionary<string, string> comments,
         string path)
     {
-        using var wb = new XLWorkbook();
+        if (File.Exists(path)) File.Delete(path);
 
-        // ── Summary sheet ──────────────────────────────────────────────────
-        var ws = wb.AddWorksheet("Summary");
-        string[] sumHeaders = { "same", "changed", "added", "removed", "num_similarity_pct" };
-        for (int j = 0; j < sumHeaders.Length; j++) ws.Cell(1, j+1).Value = sumHeaders[j];
-        ws.Cell(2, 1).Value = cmp.Counts.GetValueOrDefault("same");
-        ws.Cell(2, 2).Value = cmp.Counts.GetValueOrDefault("changed");
-        ws.Cell(2, 3).Value = cmp.Counts.GetValueOrDefault("added");
-        ws.Cell(2, 4).Value = cmp.Counts.GetValueOrDefault("removed");
-        ws.Cell(2, 5).Value = cmp.NumCmp.SimilarityPct;
-        StyleHeader(ws, 1, sumHeaders.Length);
+        using var doc = SpreadsheetDocument.Create(path, SpreadsheetDocumentType.Workbook);
+        var wbp = doc.AddWorkbookPart();
+        wbp.Workbook = new Workbook();
 
-        // ── Changed Lines sheet ────────────────────────────────────────────
+        var ssp = wbp.AddNewPart<WorkbookStylesPart>();
+        ssp.Stylesheet = XlStylesheet();
+        ssp.Stylesheet.Save();
+
+        var sheetsEl = wbp.Workbook.AppendChild(new Sheets());
+        uint sid = 1;
+
+        // ── Summary ────────────────────────────────────────────────────────
+        XlAddSheet(wbp, sheetsEl, ref sid, "Summary",
+            new[] { "same", "changed", "added", "removed", "num_similarity_pct" },
+            new List<string[]>
+            {
+                new[]
+                {
+                    cmp.Counts.GetValueOrDefault("same").ToString(),
+                    cmp.Counts.GetValueOrDefault("changed").ToString(),
+                    cmp.Counts.GetValueOrDefault("added").ToString(),
+                    cmp.Counts.GetValueOrDefault("removed").ToString(),
+                    cmp.NumCmp.SimilarityPct.ToString("F4")
+                }
+            });
+
+        // ── Changed Lines ──────────────────────────────────────────────────
         if (cmp.ChangedLines.Any())
         {
-            var ws2 = wb.AddWorksheet("Changed_Lines");
-            string[] ch = { "AFS_1_line", "AFS_2_line", "similarity", "number_changes", "auditor_comment" };
-            for (int j = 0; j < ch.Length; j++) ws2.Cell(1, j+1).Value = ch[j];
             var changed = cmp.ChangedLines.ToList();
-            for (int i = 0; i < changed.Count; i++)
-            {
-                ws2.Cell(i+2, 1).Value = changed[i].Line1;
-                ws2.Cell(i+2, 2).Value = changed[i].Line2;
-                ws2.Cell(i+2, 3).Value = changed[i].Similarity;
-                ws2.Cell(i+2, 4).Value = string.Join(", ", changed[i].NumDiff);
-                ws2.Cell(i+2, 5).Value = comments.GetValueOrDefault("changed:" + (i+1), "");
-            }
-            StyleHeader(ws2, 1, ch.Length);
+            XlAddSheet(wbp, sheetsEl, ref sid, "Changed_Lines",
+                new[] { "AFS_1_line", "AFS_2_line", "similarity", "number_changes", "auditor_comment" },
+                changed.Select((l, i) => new[]
+                {
+                    l.Line1 ?? "",
+                    l.Line2 ?? "",
+                    l.Similarity.ToString("F4"),
+                    string.Join(", ", l.NumDiff),
+                    comments.GetValueOrDefault("changed:" + (i + 1), "")
+                }).ToList());
         }
 
-        // ── Added Lines sheet ──────────────────────────────────────────────
+        // ── Added Lines ────────────────────────────────────────────────────
         if (cmp.AddedLines.Any())
         {
-            var ws3 = wb.AddWorksheet("Added_Lines");
-            ws3.Cell(1, 1).Value = "line";
-            var added = cmp.AddedLines.ToList();
-            for (int i = 0; i < added.Count; i++) ws3.Cell(i+2, 1).Value = added[i].Line2;
-            StyleHeader(ws3, 1, 1);
+            XlAddSheet(wbp, sheetsEl, ref sid, "Added_Lines",
+                new[] { "line" },
+                cmp.AddedLines.Select(l => new[] { l.Line2 ?? "" }).ToList());
         }
 
-        // ── Removed Lines sheet ────────────────────────────────────────────
+        // ── Removed Lines ──────────────────────────────────────────────────
         if (cmp.RemovedLines.Any())
         {
-            var ws4 = wb.AddWorksheet("Removed_Lines");
-            ws4.Cell(1, 1).Value = "line";
-            var removed = cmp.RemovedLines.ToList();
-            for (int i = 0; i < removed.Count; i++) ws4.Cell(i+2, 1).Value = removed[i].Line1;
-            StyleHeader(ws4, 1, 1);
+            XlAddSheet(wbp, sheetsEl, ref sid, "Removed_Lines",
+                new[] { "line" },
+                cmp.RemovedLines.Select(l => new[] { l.Line1 ?? "" }).ToList());
         }
 
-        // ── Number Comparison sheet ────────────────────────────────────────
-        var ws5 = wb.AddWorksheet("Number_Comparison");
-        ws5.Cell(1, 1).Value = "only_in_AFS1";
-        ws5.Cell(1, 2).Value = "only_in_AFS2";
-        ws5.Cell(1, 3).Value = "in_both";
-        int maxRows = Math.Max(cmp.NumCmp.OnlyInAfs1.Count,
-                     Math.Max(cmp.NumCmp.OnlyInAfs2.Count, cmp.NumCmp.InBoth.Count));
-        for (int i = 0; i < maxRows; i++)
+        // ── Number Comparison ──────────────────────────────────────────────
         {
-            if (i < cmp.NumCmp.OnlyInAfs1.Count) ws5.Cell(i+2, 1).Value = cmp.NumCmp.OnlyInAfs1[i];
-            if (i < cmp.NumCmp.OnlyInAfs2.Count) ws5.Cell(i+2, 2).Value = cmp.NumCmp.OnlyInAfs2[i];
-            if (i < cmp.NumCmp.InBoth.Count)     ws5.Cell(i+2, 3).Value = cmp.NumCmp.InBoth[i];
+            int maxR = Math.Max(cmp.NumCmp.OnlyInAfs1.Count,
+                       Math.Max(cmp.NumCmp.OnlyInAfs2.Count, cmp.NumCmp.InBoth.Count));
+            XlAddSheet(wbp, sheetsEl, ref sid, "Number_Comparison",
+                new[] { "only_in_AFS1", "only_in_AFS2", "in_both" },
+                Enumerable.Range(0, maxR).Select(i => new[]
+                {
+                    i < cmp.NumCmp.OnlyInAfs1.Count ? cmp.NumCmp.OnlyInAfs1[i] : "",
+                    i < cmp.NumCmp.OnlyInAfs2.Count ? cmp.NumCmp.OnlyInAfs2[i] : "",
+                    i < cmp.NumCmp.InBoth.Count     ? cmp.NumCmp.InBoth[i]     : ""
+                }).ToList());
         }
-        StyleHeader(ws5, 1, 3);
 
-        // ── Page Alignment sheet ───────────────────────────────────────────
-        var ws6 = wb.AddWorksheet("Page_Alignment");
-        string[] pgHdrs = { "pair", "afs1_page", "afs2_page", "align_similarity",
-                            "pct_same", "same", "changed", "added", "removed", "auditor_comment" };
-        for (int j = 0; j < pgHdrs.Length; j++) ws6.Cell(1, j+1).Value = pgHdrs[j];
-        for (int i = 0; i < cmp.PageDiffs.Count; i++)
-        {
-            var pd = cmp.PageDiffs[i];
-            ws6.Cell(i+2, 1).Value  = pd.PairIndex + 1;
-            ws6.Cell(i+2, 2).Value  = pd.PageAfs1?.ToString() ?? "";
-            ws6.Cell(i+2, 3).Value  = pd.PageAfs2?.ToString() ?? "";
-            ws6.Cell(i+2, 4).Value  = pd.AlignSim;
-            ws6.Cell(i+2, 5).Value  = pd.PctSame;
-            ws6.Cell(i+2, 6).Value  = pd.Same;
-            ws6.Cell(i+2, 7).Value  = pd.Changed;
-            ws6.Cell(i+2, 8).Value  = pd.Added;
-            ws6.Cell(i+2, 9).Value  = pd.Removed;
-            ws6.Cell(i+2, 10).Value = comments.GetValueOrDefault("page:" + i, "");
-        }
-        StyleHeader(ws6, 1, pgHdrs.Length);
+        // ── Page Alignment ─────────────────────────────────────────────────
+        XlAddSheet(wbp, sheetsEl, ref sid, "Page_Alignment",
+            new[] { "pair", "afs1_page", "afs2_page", "align_similarity",
+                    "pct_same", "same", "changed", "added", "removed", "auditor_comment" },
+            cmp.PageDiffs.Select((pd, i) => new[]
+            {
+                (pd.PairIndex + 1).ToString(),
+                pd.PageAfs1?.ToString() ?? "",
+                pd.PageAfs2?.ToString() ?? "",
+                pd.AlignSim.ToString("F4"),
+                pd.PctSame.ToString("F4"),
+                pd.Same.ToString(),
+                pd.Changed.ToString(),
+                pd.Added.ToString(),
+                pd.Removed.ToString(),
+                comments.GetValueOrDefault("page:" + i, "")
+            }).ToList());
 
-        // ── Auditor Comments sheet ─────────────────────────────────────────
+        // ── Auditor Comments ───────────────────────────────────────────────
         var savedCmts = comments.Where(kv => !string.IsNullOrWhiteSpace(kv.Value)).ToList();
         if (savedCmts.Any())
         {
-            var ws7 = wb.AddWorksheet("Auditor_Comments");
-            ws7.Cell(1, 1).Value = "key"; ws7.Cell(1, 2).Value = "comment";
-            for (int i = 0; i < savedCmts.Count; i++)
-            {
-                ws7.Cell(i+2, 1).Value = savedCmts[i].Key;
-                ws7.Cell(i+2, 2).Value = savedCmts[i].Value;
-            }
-            StyleHeader(ws7, 1, 2);
+            XlAddSheet(wbp, sheetsEl, ref sid, "Auditor_Comments",
+                new[] { "key", "comment" },
+                savedCmts.Select(kv => new[] { kv.Key, kv.Value }).ToList());
         }
 
-        wb.SaveAs(path);
+        wbp.Workbook.Save();
     }
 
-    // Apply SNG purple header styling to the first row of a worksheet.
-    private static void StyleHeader(IXLWorksheet ws, int row, int colCount)
+    private static void XlAddSheet(
+        WorkbookPart wbp,
+        Sheets sheets,
+        ref uint sheetId,
+        string name,
+        string[] headers,
+        IList<string[]> rows)
     {
-        var range = ws.Range(row, 1, row, colCount);
-        range.Style.Fill.BackgroundColor   = XLColor.FromHtml("#5C2D91");
-        range.Style.Font.FontColor         = XLColor.White;
-        range.Style.Font.Bold              = true;
-        range.Style.Alignment.WrapText     = true;
-        ws.Columns().AdjustToContents();
+        var wsp = wbp.AddNewPart<WorksheetPart>();
+        var sd  = new SheetData();
+        var ws  = new Worksheet();
+        ws.Append(sd);
+        wsp.Worksheet = ws;
+
+        // Header row with purple background (style index 1)
+        var hdrRow = new Row { RowIndex = 1U };
+        for (int c = 0; c < headers.Length; c++)
+            hdrRow.Append(XlCell(XlColRef(c, 1U), headers[c], 1U));
+        sd.Append(hdrRow);
+
+        // Data rows
+        for (int r = 0; r < rows.Count; r++)
+        {
+            uint ri = (uint)(r + 2);
+            var dataRow = new Row { RowIndex = ri };
+            for (int c = 0; c < rows[r].Length; c++)
+                dataRow.Append(XlCell(XlColRef(c, ri), rows[r][c] ?? ""));
+            sd.Append(dataRow);
+        }
+
+        sheets.Append(new Sheet
+        {
+            Id      = wbp.GetIdOfPart(wsp),
+            SheetId = sheetId,
+            Name    = name
+        });
+        sheetId++;
+    }
+
+    private static Cell XlCell(string cellRef, string value, uint styleIdx = 0U) =>
+        new Cell
+        {
+            CellReference = cellRef,
+            DataType      = CellValues.String,
+            CellValue     = new CellValue(value),
+            StyleIndex    = styleIdx
+        };
+
+    private static string XlColRef(int colIdx, uint row)
+    {
+        string col = "";
+        int n = colIdx;
+        do { col = (char)('A' + n % 26) + col; n = n / 26 - 1; } while (n >= 0);
+        return col + row;
+    }
+
+    private static Stylesheet XlStylesheet()
+    {
+        var ss = new Stylesheet();
+
+        // Fonts: 0 = default, 1 = white bold (for header row)
+        var fonts = new DocumentFormat.OpenXml.Spreadsheet.Fonts { Count = 2U };
+        fonts.Append(new Font());
+        var hdrFont = new Font();
+        hdrFont.Append(new Bold());
+        hdrFont.Append(new DocumentFormat.OpenXml.Spreadsheet.Color { Rgb = "FFFFFFFF" });
+        fonts.Append(hdrFont);
+        ss.Append(fonts);
+
+        // Fills: 0 = none (required), 1 = gray125 (required), 2 = SNG purple
+        var fills = new Fills { Count = 3U };
+        fills.Append(new Fill(new PatternFill { PatternType = PatternValues.None }));
+        fills.Append(new Fill(new PatternFill { PatternType = PatternValues.Gray125 }));
+        var purpleFill = new PatternFill { PatternType = PatternValues.Solid };
+        purpleFill.Append(new ForegroundColor { Rgb = "FF5C2D91" });
+        purpleFill.Append(new BackgroundColor { Indexed = 64U });
+        fills.Append(new Fill(purpleFill));
+        ss.Append(fills);
+
+        var borders = new DocumentFormat.OpenXml.Spreadsheet.Borders { Count = 1U };
+        borders.Append(new Border());
+        ss.Append(borders);
+
+        var csf = new CellStyleFormats { Count = 1U };
+        csf.Append(new CellFormat());
+        ss.Append(csf);
+
+        // CellFormats: 0 = default, 1 = header (purple fill + white bold font)
+        var cf = new CellFormats { Count = 2U };
+        cf.Append(new CellFormat { FontId = 0U, FillId = 0U, BorderId = 0U });
+        cf.Append(new CellFormat
+        {
+            FontId    = 1U,
+            FillId    = 2U,
+            BorderId  = 0U,
+            ApplyFont = true,
+            ApplyFill = true
+        });
+        ss.Append(cf);
+
+        return ss;
     }
 
     // ─────────────────────────────────────────────────────────────────────────

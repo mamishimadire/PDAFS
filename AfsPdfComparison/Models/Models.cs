@@ -40,6 +40,15 @@ public class AlignmentEntry
     public double Sim { get; set; }
 }
 
+/// <summary>Specifies a line to locate in a PDF snapshot and which words to highlight.</summary>
+public class HighlightSpec
+{
+    /// <summary>Full line text used to locate the physical PDF Y-band.</summary>
+    public string LineText { get; set; } = string.Empty;
+    /// <summary>Specific changed words to highlight. Empty list = highlight entire line band.</summary>
+    public List<string> ChangedWords { get; set; } = new();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 1 · ENGAGEMENT DETAILS
 // Stores all metadata entered in Step 1 of the wizard.  Persisted in the
