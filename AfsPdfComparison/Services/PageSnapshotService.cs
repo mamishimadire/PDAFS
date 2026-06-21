@@ -24,13 +24,22 @@ using Docnet.Core;
 using Docnet.Core.Models;
 using SkiaSharp;
 using UglyToad.PdfPig;
+using UglyToad.PdfPig.Content;
 
 namespace AfsPdfComparison.Services
 {
     public class PageSnapshotService
     {
-        // Match Python notebook DPI exactly
-        private const int DPI = 130;
+        private sealed class RenderLine
+        {
+            public List<Word> Words { get; } = new();
+            public string Text { get; set; } = "";
+            public string NormalizedText => SnapNorm(Text);
+        }
+
+        // Render at a higher DPI so the in-app snapshot stays legible even when
+        // displayed beside another page in the browser.
+        private const int DPI = 220;
 
         // Strip invisible/control chars from PDF word text before highlight matching.
         // Must mirror PageExtractorService.StripInvisible() so the needle (from diff
@@ -66,6 +75,190 @@ namespace AfsPdfComparison.Services
             t = Regex.Replace(t, @"(?<=\d)\s*\.\s*(?=\d)", ".");
             t = Regex.Replace(t, @"(?<=\d)\s*,\s*(?=\d)", ",");
             return t;
+        }
+
+        private static bool HasNumericChangedWords(HighlightSpec spec) =>
+            spec.ChangedWords.Any(w => Regex.IsMatch(w ?? "", @"\d"));
+
+        private static bool ShouldMatchSnapshotSpec(string lineNorm, HighlightSpec spec)
+        {
+            var specNorm = SnapNorm((spec.LineText ?? "").Trim());
+            if (specNorm.Length < 4)
+                return false;
+
+            if (lineNorm == specNorm)
+            {
+                if (spec.ChangedWords.Count > 0)
+                {
+                    var lineTokenSet = new HashSet<string>(
+                        lineNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries),
+                        StringComparer.OrdinalIgnoreCase);
+                    var changedNorms = spec.ChangedWords
+                        .Select(w => SnapNorm(w ?? ""))
+                        .Where(w => w.Length > 0)
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                    bool allAlreadyInLine = changedNorms.All(cw => lineTokenSet.Contains(cw));
+                    if (allAlreadyInLine)
+                        return false;
+                }
+                else
+                {
+                    return false;
+                }
+            }
+
+            if (specNorm.Length >= 30 && lineNorm.Length >= 30)
+            {
+                string shorter = specNorm.Length <= lineNorm.Length ? specNorm : lineNorm;
+                string longer = specNorm.Length <= lineNorm.Length ? lineNorm : specNorm;
+                double ratio = (double)shorter.Length / longer.Length;
+                if (ratio >= 0.60 && longer.StartsWith(shorter, StringComparison.Ordinal))
+                    return HasNumericChangedWords(spec) || spec.ChangedWords.Count == 0;
+            }
+
+            var lineTokens = lineNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            var specTokens = specNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (lineTokens.Length >= 8 && specTokens.Length >= 8)
+            {
+                var lineSet = lineTokens.ToHashSet(StringComparer.Ordinal);
+                var specSet = specTokens.ToHashSet(StringComparer.Ordinal);
+                int common = lineSet.Intersect(specSet).Count();
+                int maxWc = Math.Max(lineSet.Count, specSet.Count);
+                int minWc = Math.Min(lineSet.Count, specSet.Count);
+                double wordOverlap = (double)common / maxWc;
+                double wordRatio = (double)minWc / maxWc;
+
+                return wordOverlap >= 0.92 &&
+                       wordRatio >= 0.75 &&
+                       (HasNumericChangedWords(spec) || spec.ChangedWords.Count == 0);
+            }
+
+            return lineNorm == specNorm && spec.ChangedWords.Count > 0;
+        }
+
+        private static HashSet<string> BuildChangedTokenSet(IEnumerable<string> changedWords)
+        {
+            var changedSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var cw in changedWords)
+            {
+                if (string.IsNullOrWhiteSpace(cw))
+                    continue;
+
+                string stripped = SnapStrip(cw).Trim().ToLowerInvariant();
+                if (stripped.Length == 0)
+                    continue;
+
+                changedSet.Add(stripped);
+
+                string clean = Regex.Replace(stripped, @"[^\p{L}\p{N}]", "");
+                if (clean.Length > 0)
+                    changedSet.Add(clean);
+
+                string numClean = Regex.Replace(stripped, @"\s+", "");
+                if (numClean.Length > 0)
+                    changedSet.Add(numClean);
+            }
+
+            return changedSet;
+        }
+
+        private static bool SnapshotWordMatchesChangedSet(string wordText, HashSet<string> changedSet)
+        {
+            string wRaw = SnapStrip(wordText ?? "").Trim().ToLowerInvariant();
+            string wClean = Regex.Replace(wRaw, @"[^\p{L}\p{N}]", "");
+            string wNum = Regex.Replace(wRaw, @"\s+", "");
+
+            return (wRaw.Length >= 1 && changedSet.Contains(wRaw)) ||
+                   (wClean.Length >= 1 && changedSet.Contains(wClean)) ||
+                   (wNum.Length >= 1 && changedSet.Contains(wNum));
+        }
+
+        private static string BuildLineText(IEnumerable<Word> words) =>
+            string.Join(" ",
+                words.Select(w => SnapStrip(w.Text ?? "").Trim())
+                     .Where(w => w.Length > 0));
+
+        private static int WordCount(string text) =>
+            (text ?? "").Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
+
+        private static bool ContainsWholeLine(string haystack, string needle) =>
+            !string.IsNullOrWhiteSpace(needle) &&
+            (" " + haystack + " ").Contains(" " + needle + " ", StringComparison.Ordinal);
+
+        private static List<RenderLine> BuildRenderableLines(UglyToad.PdfPig.Content.Page pdfPage, double pageHeight)
+        {
+            var raw = pdfPage.GetWords()
+                .GroupBy(w =>
+                {
+                    double top = pageHeight - w.BoundingBox.Top;
+                    return (int)(Math.Round(top / 5.0) * 5);
+                })
+                .OrderBy(g => g.Key)
+                .Select(g =>
+                {
+                    var words = g.OrderBy(w => w.BoundingBox.Left).ToList();
+                    var line = new RenderLine { Text = BuildLineText(words) };
+                    line.Words.AddRange(words);
+                    return line;
+                })
+                .Where(l => !string.IsNullOrWhiteSpace(l.Text))
+                .ToList();
+
+            if (raw.Count == 0) return raw;
+
+            var merged = new List<RenderLine> { raw[0] };
+            for (int i = 1; i < raw.Count; i++)
+            {
+                var prev = merged[^1];
+                var curr = raw[i];
+
+                if (string.Equals(prev.NormalizedText, curr.NormalizedText, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (WordCount(curr.Text) <= 3 &&
+                    ContainsWholeLine(prev.NormalizedText, curr.NormalizedText))
+                    continue;
+
+                char last = prev.Text[^1];
+                bool prevEnds = last is '.' or '!' or '?' or ';' or ':';
+                bool currCont = curr.Text.Length > 0 && char.IsLower(curr.Text[0]);
+
+                if (!prevEnds && currCont && prev.Text.Length >= 15)
+                {
+                    prev.Text += " " + curr.Text;
+                    prev.Words.AddRange(curr.Words);
+                }
+                else
+                {
+                    merged.Add(curr);
+                }
+            }
+
+            var deduped = new List<RenderLine>(merged.Count);
+            for (int i = 0; i < merged.Count; i++)
+            {
+                var line = merged[i];
+                if (WordCount(line.Text) <= 3)
+                {
+                    string needle = line.NormalizedText;
+                    bool orphan = false;
+                    for (int j = 0; j < merged.Count; j++)
+                    {
+                        if (i == j) continue;
+                        if (ContainsWholeLine(merged[j].NormalizedText, needle))
+                        {
+                            orphan = true;
+                            break;
+                        }
+                    }
+                    if (orphan) continue;
+                }
+
+                deduped.Add(line);
+            }
+
+            return deduped;
         }
 
         // PDFium (DocLib.Instance) is a process-wide singleton and is NOT thread-safe.
@@ -142,40 +335,25 @@ namespace AfsPdfComparison.Services
                     {
                         double sx = imgW / pageWidth;
                         double sy = imgH / pageHeight;
+                        var renderLines = BuildRenderableLines(pdfPage, pageHeight);
 
-                        var words = pdfPage.GetWords().ToList();
-                        var linesByY = words
-                            .GroupBy(w =>
-                            {
-                                double top = pageHeight - w.BoundingBox.Top;
-                                return (int)(Math.Round(top / 5.0) * 5);
-                            })
-                            .ToList();
+                        // Normal (yellow) — deterministic diff, no AI flag
+                        using var fillPaintNormal    = new SKPaint { Color = new SKColor(255, 220, 0, 90),  Style = SKPaintStyle.Fill };
+                        using var lineFillNormal     = new SKPaint { Color = new SKColor(255, 220, 0, 42),  Style = SKPaintStyle.Fill };
+                        using var borderPaintNormal  = new SKPaint { Color = new SKColor(255, 160, 0, 220), Style = SKPaintStyle.Stroke, StrokeWidth = 1f };
+                        // Medium (orange) — AI page-focus flag
+                        using var fillPaintMedium    = new SKPaint { Color = new SKColor(255, 140, 0, 105), Style = SKPaintStyle.Fill };
+                        using var lineFillMedium     = new SKPaint { Color = new SKColor(255, 140, 0, 48),  Style = SKPaintStyle.Fill };
+                        using var borderPaintMedium  = new SKPaint { Color = new SKColor(230, 100, 0, 230), Style = SKPaintStyle.Stroke, StrokeWidth = 1.5f };
+                        // High (red) — AI material finding
+                        using var fillPaintHigh      = new SKPaint { Color = new SKColor(220, 30, 60, 115),  Style = SKPaintStyle.Fill };
+                        using var lineFillHigh       = new SKPaint { Color = new SKColor(220, 30, 60, 50),   Style = SKPaintStyle.Fill };
+                        using var borderPaintHigh    = new SKPaint { Color = new SKColor(200, 16, 46, 240),  Style = SKPaintStyle.Stroke, StrokeWidth = 2f };
 
-                        using var fillPaint = new SKPaint
+                        foreach (var renderLine in renderLines)
                         {
-                            Color = new SKColor(255, 220, 0, 90),
-                            Style = SKPaintStyle.Fill,
-                        };
-                        using var borderPaint = new SKPaint
-                        {
-                            Color       = new SKColor(255, 160, 0, 220),
-                            Style       = SKPaintStyle.Stroke,
-                            StrokeWidth = 1f,
-                        };
-
-                        foreach (var grp in linesByY)
-                        {
-                            var lineWords = grp.ToList();
-                            var lineTxt = string.Join(" ",
-                                lineWords.OrderBy(w => w.BoundingBox.Left)
-                                         .Select(w => SnapStrip(w.Text ?? "").Trim())
-                                         .Where(w => w.Length > 0)).ToLower();
-
-                            // Normalise the rendered line text the same way the
-                            // extraction pipeline normalises it, so spec and line
-                            // are compared on equal footing.
-                            var lineNorm = SnapNorm(lineTxt);
+                            var lineWords = renderLine.Words;
+                            var lineNorm = renderLine.NormalizedText;
 
                             HighlightSpec? matchedSpec = null;
                             foreach (var spec in specs)
@@ -190,7 +368,27 @@ namespace AfsPdfComparison.Services
                                 //
                                 // Rule 1: exact normalised equality (handles case /
                                 //         spacing / invisible-char differences).
-                                if (lineNorm == specNorm) { matchedSpec = spec; break; }
+                                if (lineNorm == specNorm)
+                                {
+                                    if (spec.ChangedWords.Count > 0)
+                                    {
+                                        var lineTokenSet = new HashSet<string>(
+                                            lineNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries),
+                                            StringComparer.OrdinalIgnoreCase);
+                                        var changedNorms = spec.ChangedWords
+                                            .Select(w => SnapNorm(w ?? ""))
+                                            .Where(w => w.Length > 0)
+                                            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                                        bool allAlreadyInLine = changedNorms.All(cw => lineTokenSet.Contains(cw));
+                                        if (allAlreadyInLine)
+                                            continue;
+                                    }
+                                    else
+                                    {
+                                        continue;
+                                    }
+                                }
 
                                 // Rule 2: prefix match for long lines that wrap
                                 // differently across PDFs (spec is the shorter version).
@@ -204,7 +402,17 @@ namespace AfsPdfComparison.Services
                                     // not just a short fragment of a long paragraph.
                                     double ratio = (double)shorter.Length / longer.Length;
                                     if (ratio >= 0.60 && longer.StartsWith(shorter, StringComparison.Ordinal))
-                                    { matchedSpec = spec; break; }
+                                    {
+                                        bool hasNumericChange = spec.ChangedWords
+                                            .Any(w => System.Text.RegularExpressions.Regex.IsMatch(w ?? "", @"\d"));
+                                        if (hasNumericChange || spec.ChangedWords.Count == 0)
+                                        {
+                                            matchedSpec = spec;
+                                            break;
+                                        }
+
+                                        continue;
+                                    }
                                 }
 
                                 // Rule 3: high ordered-token overlap for long lines
@@ -213,7 +421,7 @@ namespace AfsPdfComparison.Services
                                 // preventing short headings / single words from matching.
                                 var lineTokens = lineNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
                                 var specTokens = specNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                                if (lineTokens.Length >= 6 && specTokens.Length >= 6)
+                                if (lineTokens.Length >= 8 && specTokens.Length >= 8)
                                 {
                                     var lineSet = lineTokens.ToHashSet(StringComparer.Ordinal);
                                     var specSet = specTokens.ToHashSet(StringComparer.Ordinal);
@@ -225,12 +433,34 @@ namespace AfsPdfComparison.Services
                                     // Both overlap AND length-ratio must clear high bars
                                     // to ensure this is the SAME sentence, not a paragraph
                                     // that happens to share many common English words.
-                                    if (wordOverlap >= 0.88 && wordRatio >= 0.65)
-                                    { matchedSpec = spec; break; }
+                                    bool hasNumericChange = spec.ChangedWords
+                                        .Any(w => System.Text.RegularExpressions.Regex.IsMatch(w ?? "", @"\d"));
+                                    if (wordOverlap >= 0.92 && wordRatio >= 0.75 &&
+                                        (hasNumericChange || spec.ChangedWords.Count == 0))
+                                    {
+                                        matchedSpec = spec;
+                                        break;
+                                    }
+                                }
+                                else if (lineNorm == specNorm)
+                                {
+                                    if (spec.ChangedWords.Count > 0)
+                                    {
+                                        matchedSpec = spec;
+                                        break;
+                                    }
                                 }
                             }
 
                             if (matchedSpec == null) continue;
+
+                            // Choose paint set based on AI severity
+                            var (fillPaint, lineFillPaint, borderPaint) = matchedSpec.Severity switch
+                            {
+                                AiHighlightSeverity.High   => (fillPaintHigh,   lineFillHigh,   borderPaintHigh),
+                                AiHighlightSeverity.Medium => (fillPaintMedium, lineFillMedium, borderPaintMedium),
+                                _                          => (fillPaintNormal, lineFillNormal, borderPaintNormal),
+                            };
 
                             if (matchedSpec.ChangedWords.Count == 0)
                             {
@@ -251,16 +481,56 @@ namespace AfsPdfComparison.Services
                             }
                             else
                             {
-                                // Per-word highlight: only the specific changed tokens
-                                var changedSet = matchedSpec.ChangedWords
-                                    .Select(w => SnapStrip(w ?? "").Trim().ToLower())
-                                    .Where(w => w.Length >= 1)
-                                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                                // For changed lines, keep a faint whole-line band so the
+                                // user can see the affected row even when the changed
+                                // token is just a short number or note marker.
+                                double pdfX0   = lineWords.Min(w => w.BoundingBox.Left);
+                                double pdfX1   = lineWords.Max(w => w.BoundingBox.Right);
+                                double pdfTop  = lineWords.Min(w => pageHeight - w.BoundingBox.Top);
+                                double pdfBot  = lineWords.Max(w => pageHeight - w.BoundingBox.Bottom);
 
+                                float pixX0 = (float)(pdfX0 * sx) - 2f;
+                                float pixX1 = (float)(pdfX1 * sx) + 2f;
+                                float pixY0 = (float)(pdfTop * sy) - 2f;
+                                float pixY1 = (float)(pdfBot * sy) + 2f;
+
+                                var lineRect = new SKRect(pixX0, pixY0, pixX1, pixY1);
+                                canvas.DrawRect(lineRect, lineFillPaint);
+
+                                // Per-word highlight: emphasize the specific changed tokens
+                                var changedSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                                foreach (var cw in matchedSpec.ChangedWords)
+                                {
+                                    if (string.IsNullOrWhiteSpace(cw)) continue;
+                                    string stripped = SnapStrip(cw).Trim().ToLower();
+                                    if (stripped.Length == 0) continue;
+
+                                    changedSet.Add(stripped);
+
+                                    string clean = System.Text.RegularExpressions.Regex
+                                        .Replace(stripped, @"[^\p{L}\p{N}]", "");
+                                    if (clean.Length > 0) changedSet.Add(clean);
+
+                                    string numClean = System.Text.RegularExpressions.Regex
+                                        .Replace(stripped, @"\s+", "");
+                                    if (numClean.Length > 0) changedSet.Add(numClean);
+                                }
+
+                                bool anyWordHit = false;
                                 foreach (var word in lineWords)
                                 {
-                                    var wt = SnapStrip(word.Text ?? "").Trim().ToLower();
-                                    if (wt.Length < 1 || !changedSet.Contains(wt)) continue;
+                                    string wRaw = SnapStrip(word.Text ?? "").Trim().ToLower();
+                                    string wClean = System.Text.RegularExpressions.Regex
+                                        .Replace(wRaw, @"[^\p{L}\p{N}]", "");
+                                    string wNum = System.Text.RegularExpressions.Regex
+                                        .Replace(wRaw, @"\s+", "");
+
+                                    bool hit = (wRaw.Length >= 1 && changedSet.Contains(wRaw)) ||
+                                               (wClean.Length >= 1 && changedSet.Contains(wClean)) ||
+                                               (wNum.Length >= 1 && changedSet.Contains(wNum));
+
+                                    if (!hit) continue;
+                                    anyWordHit = true;
 
                                     double wx0  = word.BoundingBox.Left;
                                     double wx1  = word.BoundingBox.Right;
@@ -275,6 +545,9 @@ namespace AfsPdfComparison.Services
                                     canvas.DrawRect(wr, fillPaint);
                                     canvas.DrawRect(wr, borderPaint);
                                 }
+
+                                if (!anyWordHit)
+                                    canvas.DrawRect(lineRect, borderPaint);
                             }
                         }
                     }

@@ -281,7 +281,11 @@ public class ExportService
         Dictionary<string, string> comments,
         IReadOnlyList<(string? Left, string? Right)> snapshots)
     {
-        var paired = cmp.PageDiffs.Where(pd => pd.PageAfs2.HasValue).ToList();
+        var paired = cmp.PageDiffs.Where(pd =>
+            pd.PageAfs1.HasValue &&
+            pd.PageAfs2.HasValue &&
+            !pd.Unmatched &&
+            !pd.SecondaryMatch).ToList();
         col.Item().Column(c =>
         {
             PdfSectionHeading(c, "2  Page-by-Page Snapshot Review");

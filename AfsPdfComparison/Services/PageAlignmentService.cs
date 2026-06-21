@@ -1,226 +1,503 @@
-// ╔══════════════════════════════════════════════════════════════════════════════╗
-// ║  AFS PDF COMPARISON ANALYZER  — C# ASP.NET Core Web Application             ║
-// ║  SNG Grant Thornton | CAATs Platform                                         ║
-// ║                                                                              ║
-// ║  Author  : Mamishi Tonny Madire                                              ║
-// ║  Date    : 2026-03-15                                                        ║
-// ║  Version : 4.3                                                               ║
-// ║                                                                              ║
-// ║  SERVICE — PageAlignmentService                                              ║
-// ║  Matches pages from two PDFs by content similarity, not page number.        ║
-// ║                                                                              ║
-// ║  References:                                                                 ║
-// ║   • Jaccard similarity: |A ∩ B| / |A ∪ B| — word-set overlap              ║
-// ║   • Ratcliff/Obershelp similarity: used for anchor-text structural match    ║
-// ║     (C# equivalent of Python difflib.SequenceMatcher.ratio())               ║
-// ║   • Python equivalent: build_page_alignment() in the notebook               ║
-// ╚══════════════════════════════════════════════════════════════════════════════╝
-
 using System.Text.RegularExpressions;
 using AfsPdfComparison.Models;
 
 namespace AfsPdfComparison.Services;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 2 · SMART PAGE ALIGNMENT SERVICE
-//
-// Problem: Two versions of an AFS may have different page counts because pages
-// were inserted, removed, or split.  Naïve page-number matching (page 1 ↔ page 1)
-// produces false changes.
-//
-// Solution: Build a "content fingerprint" per page — the first 3 non-noise lines
-// (anchor) plus the set of words longer than 3 characters.  Then score every
-// (i, j) pair within a sliding window using a weighted average of:
-//   • Structural similarity: Ratcliff/Obershelp on the anchor strings
-//   • Vocabulary similarity: Jaccard on the word sets
-//
-// Dynamic programming / greedy assignment ensures each AFS 2 page is used at
-// most once.  Pages in AFS 1 with no good match (score < 0.30) are reported as
-// unmatched so the auditor can see them explicitly.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// <summary>
-/// Matches pages in AFS 1 to pages in AFS 2 by content similarity.
-/// Registered as a singleton in DI.
-/// </summary>
 public class PageAlignmentService
 {
-    // Noise filters — same as Python _is_noise()
-    private static readonly Regex _noiseShort   = new(@"^.{0,3}$",           RegexOptions.Compiled);
-    private static readonly Regex _noiseDashes  = new(@"^[\s\-_=|\.]+$",     RegexOptions.Compiled);
-    private static readonly Regex _noisePageNum = new(
+    private const int StubWordThreshold = 20;
+
+    private sealed class PageFingerprintData
+    {
+        public string Anchor { get; set; } = string.Empty;
+        public List<string> Chunks { get; } = new();
+        public List<string> Headings { get; } = new();
+        public HashSet<string> Words { get; } = new(StringComparer.Ordinal);
+        public HashSet<string> SectionTags { get; } = new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static readonly Regex NoiseDashes = new(@"^[\s\-_=|\.]+$", RegexOptions.Compiled);
+    private static readonly Regex NoisePageNum = new(
         @"^(?:[-–—\s]*\(?\s*\d{1,4}\s*\)?[-–—\s]*|page\s+\d{1,4}(?:\s+of\s+\d{1,4})?)$",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex WordToken = new(@"[a-zA-Z]{4,}", RegexOptions.Compiled);
+    private static readonly Regex WhiteSpace = new(@"\s+", RegexOptions.Compiled);
+    private static readonly Regex SectionHeading = new(
+        @"^(?:note\s+)?\d+(?:\.\d+)*\.?\s+[a-z]",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex AdditionalPageRe = new(
+        @"^additional\s+page\s+\d+$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
-    // Minimum similarity threshold to accept a match (mirrors Python best_s = 0.30)
-    private const double _minSim  = 0.30;
+    private const double MinSim = 0.30;
 
-    // Sliding window: only compare pages within ±8 positions of each other
-    // to keep complexity O(n × window) rather than O(n²).
-    private const int _window = 8;
-
-    /// <summary>
-    /// Builds a page alignment map between two PdfReports.
-    /// </summary>
-    /// <returns>
-    /// List of tuples (i1, i2, sim) where i1 is a 0-based AFS 1 page index,
-    /// i2 is the matched 0-based AFS 2 page index (−1 if unmatched), and
-    /// sim is the similarity score 0–1.
-    /// </returns>
-    public List<AlignmentEntry> BuildAlignment(
-        List<string> pages1, List<string> pages2)
+    public List<AlignmentEntry> BuildAlignment(List<string> pages1, List<string> pages2)
     {
-        // ── 2.1  Build fingerprints for every page ─────────────────────────
-        var fps1 = pages1.Select(PageFingerprint).ToList();
-        var fps2 = pages2.Select(PageFingerprint).ToList();
-        int n1 = fps1.Count, n2 = fps2.Count;
+        var (content1, idx1) = CollapseStubs(pages1);
+        var (content2, idx2) = CollapseStubs(pages2);
 
-        // ── 2.2  Compute similarity matrix (sparse, within window) ─────────
-        //   sim[i][j] stored only when |i-j| ≤ window to save memory.
-        var sim = new double[n1, n2];
-        for (int i = 0; i < n1; i++)
+        var rawAlignment = AlignContentPages(content1, content2);
+
+        var remapped = rawAlignment.Select(a => new AlignmentEntry
         {
-            int jStart = Math.Max(0, i - _window);
-            int jEnd   = Math.Min(n2, i + _window + 1);
-            for (int j = jStart; j < jEnd; j++)
-                sim[i, j] = PageSim(fps1[i], fps2[j]);
-        }
+            I1 = a.I1 >= 0 && a.I1 < idx1.Count ? idx1[a.I1] : -1,
+            I2 = a.I2 >= 0 && a.I2 < idx2.Count ? idx2[a.I2] : -1,
+            Sim = a.Sim,
+        }).ToList();
 
-        // ── 2.3  Greedy best-match assignment ──────────────────────────────
-        // For each AFS 1 page (in order) find the highest-scoring unmatched
-        // AFS 2 page within the window.
-        var used2   = new HashSet<int>();
-        var result  = new List<AlignmentEntry>(n1);
-
-        for (int i = 0; i < n1; i++)
+        var byI1 = remapped.Where(a => a.I1 >= 0).ToDictionary(a => a.I1);
+        var result = new List<AlignmentEntry>(pages1.Count);
+        for (int i = 0; i < pages1.Count; i++)
         {
-            int    bestJ = -1;
-            double bestS = _minSim;
-            int jStart   = Math.Max(0, i - _window);
-            int jEnd     = Math.Min(n2, i + _window + 1);
-
-            for (int j = jStart; j < jEnd; j++)
-            {
-                if (!used2.Contains(j) && sim[i, j] > bestS)
-                {
-                    bestS = sim[i, j];
-                    bestJ = j;
-                }
-            }
-
-            if (bestJ >= 0)
-                used2.Add(bestJ);
-
-            result.Add(new AlignmentEntry { I1 = i, I2 = bestJ, Sim = bestJ >= 0 ? Math.Round(bestS, 3) : 0.0 });
+            result.Add(byI1.TryGetValue(i, out var e)
+                ? e
+                : new AlignmentEntry { I1 = i, I2 = -1, Sim = 0.0 });
         }
 
         return result;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // SECTION 2-INTERNAL · PAGE FINGERPRINT
-    //
-    // A fingerprint consists of two parts:
-    //   anchor  — first 3 meaningful lines joined and lowercased, capped at 120 chars
-    //   words   — HashSet of words longer than 3 characters from the page
-    //
-    // The anchor captures the structural header of the page (e.g. note heading).
-    // The word set captures vocabulary distribution.
-    // ─────────────────────────────────────────────────────────────────────────
-    private static (string Anchor, HashSet<string> Words) PageFingerprint(string text)
+    private static (List<string> Pages, List<int> OriginalIndices) CollapseStubs(List<string> pages)
     {
-        var cleanLines = text.Split('\n')
-            .Select(l => l.Trim())
-            .Where(l => !IsNoise(l) && l.Length > 8)
-            .Take(3)
-            .ToList();
+        var filtered = new List<string>();
+        var indices = new List<int>();
+        for (int i = 0; i < pages.Count; i++)
+        {
+            if (CountMeaningfulWords(pages[i]) >= StubWordThreshold)
+            {
+                filtered.Add(pages[i]);
+                indices.Add(i);
+            }
+        }
 
-        string anchor = string.Join(" ", cleanLines).ToLowerInvariant();
-        if (anchor.Length > 120) anchor = anchor[..120];
-
-        var words = Regex.Matches(text.ToLowerInvariant(), @"[a-zA-Z]{4,}")
-            .Select(m => m.Value)
-            .ToHashSet();
-
-        return (anchor, words);
+        return (filtered, indices);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // SECTION 2-INTERNAL · PAGE SIMILARITY
-    //
-    // Weighted combination:
-    //   0.50 × structural similarity (Ratcliff/Obershelp on anchor strings)
-    //   0.50 × Jaccard similarity (word-set intersection / union)
-    //
-    // Reference: Python _page_sim() in the notebook.
-    // ─────────────────────────────────────────────────────────────────────────
-    private static double PageSim(
-        (string Anchor, HashSet<string> Words) fp1,
-        (string Anchor, HashSet<string> Words) fp2)
+    private static int CountMeaningfulWords(string text)
     {
-        double structural = SequenceSimilarity(fp1.Anchor, fp2.Anchor);
-        double jaccard    = fp1.Words.Count + fp2.Words.Count == 0
-                            ? 0.0
-                            : (double)fp1.Words.Intersect(fp2.Words).Count()
-                              / fp1.Words.Union(fp2.Words).Count();
+        if (string.IsNullOrWhiteSpace(text))
+            return 0;
 
-        return 0.5 * structural + 0.5 * jaccard;
+        return text
+            .Split(new[] { ' ', '\n', '\r', '\t' }, StringSplitOptions.RemoveEmptyEntries)
+            .Count(w => w.Length >= 3 && w.Any(char.IsLetter));
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // SECTION 2-INTERNAL · RATCLIFF/OBERSHELP STRING SIMILARITY
-    //
-    // C# implementation of the algorithm behind Python's difflib.SequenceMatcher.
-    // Finds the longest common substring recursively.
-    // Time complexity: O(n²) for short strings (anchors ≤ 120 chars).
-    // Reference: Ratcliff, J.W. & Metzener, D.E. (1988) "Pattern Matching: The
-    //            Gestalt Approach", Dr Dobb's Journal, July 1988.
-    // ─────────────────────────────────────────────────────────────────────────
+    private List<AlignmentEntry> AlignContentPages(List<string> p1, List<string> p2)
+    {
+        var fps1 = p1.Select(PageFingerprint).ToList();
+        var fps2 = p2.Select(PageFingerprint).ToList();
+        int n1 = fps1.Count;
+        int n2 = fps2.Count;
+
+        var sim = new double[n1, n2];
+        // Each row is independent — compute in parallel across available cores.
+        System.Threading.Tasks.Parallel.For(0, n1, i =>
+        {
+            for (int j = 0; j < n2; j++)
+                sim[i, j] = PageSim(fps1[i], fps2[j]);
+        });
+
+        var dp = new double[n1 + 1, n2 + 1];
+        var move = new byte[n1 + 1, n2 + 1];
+
+        for (int i = 1; i <= n1; i++)
+        {
+            for (int j = 1; j <= n2; j++)
+            {
+                double best = dp[i - 1, j];
+                byte bestMove = 0;
+
+                if (dp[i, j - 1] > best)
+                {
+                    best = dp[i, j - 1];
+                    bestMove = 1;
+                }
+
+                double s = sim[i - 1, j - 1];
+                if (s >= MinSim)
+                {
+                    double diag = dp[i - 1, j - 1] + s;
+                    if (diag > best)
+                    {
+                        best = diag;
+                        bestMove = 2;
+                    }
+                }
+
+                dp[i, j] = best;
+                move[i, j] = bestMove;
+            }
+        }
+
+        var matched = new Dictionary<int, AlignmentEntry>();
+        int ti = n1;
+        int tj = n2;
+        while (ti > 0 && tj > 0)
+        {
+            switch (move[ti, tj])
+            {
+                case 2:
+                    matched[ti - 1] = new AlignmentEntry
+                    {
+                        I1 = ti - 1,
+                        I2 = tj - 1,
+                        Sim = Math.Round(sim[ti - 1, tj - 1], 3),
+                    };
+                    ti--;
+                    tj--;
+                    break;
+                case 1:
+                    tj--;
+                    break;
+                default:
+                    ti--;
+                    break;
+            }
+        }
+
+        var result = new List<AlignmentEntry>(n1);
+        for (int i = 0; i < n1; i++)
+        {
+            result.Add(matched.TryGetValue(i, out var e)
+                ? e
+                : new AlignmentEntry { I1 = i, I2 = -1, Sim = 0.0 });
+        }
+
+        return result;
+    }
+
+    private static PageFingerprintData PageFingerprint(string text)
+    {
+        var lines = ExtractMeaningfulLines(text);
+        var fp = new PageFingerprintData();
+        fp.Anchor = JoinChunk(lines.Take(5));
+        foreach (var chunk in BuildChunks(lines))
+        {
+            fp.Chunks.Add(chunk);
+        }
+
+        foreach (var heading in lines.Where(IsSectionHeading).Take(12))
+        {
+            fp.Headings.Add(heading);
+        }
+
+        foreach (var word in WordToken.Matches(string.Join(" ", lines)).Select(m => m.Value))
+        {
+            fp.Words.Add(word);
+        }
+
+        foreach (var heading in fp.Headings)
+        {
+            var tag = BuildHeadingSignature(heading);
+            if (tag.Length > 0)
+            {
+                fp.SectionTags.Add(tag);
+            }
+        }
+
+        var layoutTag = BuildLayoutTag(lines);
+        if (layoutTag.Length > 0)
+        {
+            fp.SectionTags.Add(layoutTag);
+        }
+
+        return fp;
+    }
+
+    private static List<string> ExtractMeaningfulLines(string text)
+    {
+        var lines = new List<string>();
+        foreach (var raw in (text ?? string.Empty).Split('\n'))
+        {
+            string line = NormalizeLine(raw);
+            if (line.Length < 5 || IsNoise(line))
+            {
+                continue;
+            }
+
+            if (lines.Count > 0 && lines[^1] == line)
+            {
+                continue;
+            }
+
+            lines.Add(line);
+        }
+
+        return lines;
+    }
+
+    private static string NormalizeLine(string line) =>
+        WhiteSpace.Replace((line ?? string.Empty).Trim().ToLowerInvariant(), " ").Trim();
+
+    private static IEnumerable<string> BuildChunks(List<string> lines)
+    {
+        if (lines.Count == 0)
+        {
+            yield break;
+        }
+
+        var starts = new SortedSet<int> { 0 };
+        for (int i = 0; i < lines.Count; i++)
+        {
+            if (i % 4 == 0)
+            {
+                starts.Add(i);
+            }
+
+            if (IsSectionHeading(lines[i]))
+            {
+                starts.Add(i);
+            }
+        }
+
+        var emitted = new HashSet<string>(StringComparer.Ordinal);
+        foreach (int start in starts)
+        {
+            string chunk = JoinChunk(lines.Skip(start).Take(4));
+            if (chunk.Length >= 20 && emitted.Add(chunk))
+            {
+                yield return chunk;
+            }
+        }
+    }
+
+    private static string JoinChunk(IEnumerable<string> lines)
+    {
+        string chunk = string.Join(" ", lines).Trim();
+        return chunk.Length > 260 ? chunk[..260] : chunk;
+    }
+
+    private static bool IsSectionHeading(string line)
+    {
+        if (!SectionHeading.IsMatch(line))
+        {
+            return false;
+        }
+
+        int wordCount = line.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
+        return wordCount is >= 2 and <= 14 && line.Length <= 140;
+    }
+
+    private static string BuildHeadingSignature(string line)
+    {
+        string norm = NormalizeLine(line);
+        if (norm.Length == 0)
+        {
+            return string.Empty;
+        }
+
+        norm = Regex.Replace(norm, @"^(?:note\s+)?\d+(?:\.\d+)*\.?\s*", "");
+        var tokens = Regex.Matches(norm, @"[a-z]{3,}").Select(m => m.Value).Take(6).ToList();
+        return tokens.Count == 0 ? string.Empty : "heading:" + string.Join("-", tokens);
+    }
+
+    private static string BuildLayoutTag(List<string> lines)
+    {
+        if (lines.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        int numericHeavy = lines.Count(l => Regex.Matches(l, @"\d").Count >= 4);
+        int noteHeadings = lines.Count(IsSectionHeading);
+        int narrativeLong = lines.Count(l => l.Length >= 90 && !Regex.IsMatch(l, @"\d"));
+
+        if (numericHeavy >= Math.Max(3, lines.Count / 4))
+        {
+            return "layout:table-heavy";
+        }
+
+        if (narrativeLong >= Math.Max(3, lines.Count / 4))
+        {
+            return "layout:narrative-heavy";
+        }
+
+        if (noteHeadings >= 2)
+        {
+            return "layout:note-structured";
+        }
+
+        return "layout:mixed";
+    }
+
+    private static double PageSim(PageFingerprintData fp1, PageFingerprintData fp2)
+    {
+        double startSim = SequenceSimilarity(fp1.Anchor, fp2.Anchor);
+        double chunkSim = BestSimilarity(fp1.Chunks, fp2.Chunks);
+        double headingSim = BestSimilarity(fp1.Headings, fp2.Headings);
+        double tagSim = TagSimilarity(fp1.SectionTags, fp2.SectionTags);
+
+        int intersection = fp1.Words.Intersect(fp2.Words).Count();
+        int union = fp1.Words.Union(fp2.Words).Count();
+        int minCount = Math.Min(fp1.Words.Count, fp2.Words.Count);
+        double containment = minCount == 0 ? 0.0 : (double)intersection / minCount;
+        double jaccard = union == 0 ? 0.0 : (double)intersection / union;
+
+        double score =
+            0.15 * startSim +
+            0.40 * chunkSim +
+            0.15 * headingSim +
+            0.10 * tagSim +
+            0.12 * containment +
+            0.08 * jaccard;
+
+        if (chunkSim >= 0.88 && containment >= 0.45)
+        {
+            score += 0.08;
+        }
+
+        if (headingSim >= 0.90 && containment >= 0.40)
+        {
+            score += 0.05;
+        }
+
+        if (tagSim >= 0.99 && fp1.SectionTags.Count > 0)
+        {
+            score += 0.08;
+        }
+
+        return Math.Min(1.0, score);
+    }
+
+    private static double TagSimilarity(HashSet<string> left, HashSet<string> right)
+    {
+        if (left.Count == 0 || right.Count == 0)
+        {
+            return 0.0;
+        }
+
+        int intersection = left.Intersect(right).Count();
+        int union = left.Union(right).Count();
+        return union == 0 ? 0.0 : (double)intersection / union;
+    }
+
+    private static double BestSimilarity(List<string> left, List<string> right)
+    {
+        if (left.Count == 0 || right.Count == 0)
+        {
+            return 0.0;
+        }
+
+        double best = 0.0;
+        foreach (var a in left)
+        {
+            foreach (var b in right)
+            {
+                double score = SequenceSimilarity(a, b);
+                if (score > best)
+                {
+                    best = score;
+                    if (best >= 0.995)
+                    {
+                        return best;
+                    }
+                }
+            }
+        }
+
+        return best;
+    }
+
     public static double SequenceSimilarity(string a, string b)
     {
-        if (string.IsNullOrEmpty(a) && string.IsNullOrEmpty(b)) return 1.0;
-        if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return 0.0;
+        if (string.IsNullOrEmpty(a) && string.IsNullOrEmpty(b))
+        {
+            return 1.0;
+        }
+
+        if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b))
+        {
+            return 0.0;
+        }
+
         int matches = CountMatches(a, 0, a.Length, b, 0, b.Length);
         return 2.0 * matches / (a.Length + b.Length);
     }
 
     private static int CountMatches(string a, int a0, int a1, string b, int b0, int b1)
     {
-        int best = 0, bestI = a0, bestJ = b0;
+        int best = 0;
+        int bestI = a0;
+        int bestJ = b0;
         for (int i = a0; i < a1; i++)
         {
             for (int j = b0; j < b1; j++)
             {
                 int k = 0;
                 while (i + k < a1 && j + k < b1 && a[i + k] == b[j + k])
+                {
                     k++;
-                if (k > best) { best = k; bestI = i; bestJ = j; }
+                }
+
+                if (k > best)
+                {
+                    best = k;
+                    bestI = i;
+                    bestJ = j;
+                }
             }
         }
-        if (best == 0) return 0;
+
+        if (best == 0)
+        {
+            return 0;
+        }
+
         int total = best;
         if (bestI > a0 && bestJ > b0)
+        {
             total += CountMatches(a, a0, bestI, b, b0, bestJ);
+        }
+
         if (bestI + best < a1 && bestJ + best < b1)
+        {
             total += CountMatches(a, bestI + best, a1, b, bestJ + best, b1);
+        }
+
         return total;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // SECTION 2-INTERNAL · NOISE DETECTION
-    //
-    // Lines considered "noise" are suppressed before fingerprinting and before
-    // line comparison to avoid false positives.
-    // Noise categories (mirrors Python _is_noise()):
-    //   • Lines shorter than 4 characters
-    //   • Lines consisting only of whitespace, dashes, underscores, pipes, dots
-    //   • Lines that are purely a page-number stamp such as "- 40 -" or "Page 3 of 10"
-    // ─────────────────────────────────────────────────────────────────────────
+    // Common function/stop words — a line made entirely of these is an extraction artefact.
+    private static readonly HashSet<string> _functionWords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "a", "an", "the", "and", "or", "but", "nor", "so", "yet",
+        "in", "on", "at", "to", "for", "of", "as", "by", "up", "if",
+        "is", "it", "its", "be", "do", "no", "not", "was", "are"
+    };
+
     public static bool IsNoise(string line)
     {
-        if (string.IsNullOrWhiteSpace(line) || line.Length < 4) return true;
-        if (_noiseDashes.IsMatch(line))  return true;
-        if (_noisePageNum.IsMatch(line)) return true;
+        if (string.IsNullOrWhiteSpace(line) || line.Length < 4)
+            return true;
+
+        if (NoiseDashes.IsMatch(line))
+            return true;
+
+        if (NoisePageNum.IsMatch(line))
+            return true;
+
+        if (AdditionalPageRe.IsMatch(line.Trim()))
+            return true;
+
+        if (Regex.IsMatch(line, @"^\d{4}(?:\s+\d{4})+$"))
+            return true;
+
+        if (Regex.IsMatch(line, @"^(?:r'?0{3,}|r'000)(?:\s+(?:r'?0{3,}|r'000))+$", RegexOptions.IgnoreCase))
+            return true;
+
+        // Line whose canonical form (stripped of all punctuation and whitespace) is
+        // shorter than 3 characters is not comparable content.
+        var tokens = line.Trim().Split(new char[]{' ', '\t', ' '}, StringSplitOptions.RemoveEmptyEntries);
+        string canonical = Regex.Replace(string.Join("", tokens), @"[^\w]", "").ToLowerInvariant();
+        if (canonical.Length < 3)
+            return true;
+
+        // Lines composed entirely of common function/stop words carry no auditable
+        // content (e.g. "or as a or", "and the or") and are extraction artefacts.
+        if (tokens.Length <= 6 && tokens.All(t => _functionWords.Contains(t.Trim('.',',',';',':'))))
+            return true;
+
         return false;
     }
 }

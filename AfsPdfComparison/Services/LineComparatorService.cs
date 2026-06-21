@@ -1,4 +1,4 @@
-// ╔══════════════════════════════════════════════════════════════════════════════╗
+﻿// ╔══════════════════════════════════════════════════════════════════════════════╗
 // ║  AFS PDF COMPARISON ANALYZER  — C# ASP.NET Core Web Application             ║
 // ║  SNG Grant Thornton | CAATs Platform                                         ║
 // ║                                                                              ║
@@ -68,10 +68,18 @@ public class LineComparatorService
     // ── Similarity thresholds ────────────────────────────────────────────────
     private const double SimExact   = 0.96;  // raised from 0.94 — reduces false "changed" on near-identical paragraphs
     private const double SimRelated = 0.55;
+    private const double GapPenalty = 0.24;
+    private const int MaxAlignmentCells = 250_000;
 
     // Gate 5 thresholds (word-overlap line-wrap artefact gate)
     private const double WordOverlapThreshold = 0.85;
+    private const double WordOverlapThresholdLong = 0.90;
+    private const int LongLineWords = 12;
     private const double LengthRatioThreshold = 0.55;
+
+    // Gate 7: cross-page bleed suppression
+    private const double CrossPageBleedSim = 0.90;
+    private const int NeighbourContextLines = 8;
 
     // Regex: strip page-number stamps before number extraction.
     // Matches lines that are PURELY a page stamp (e.g. "- 40 -", "Page 3 of 10").
@@ -86,7 +94,12 @@ public class LineComparatorService
     // (i.e. real thousands separator, not arbitrary whitespace between numbers).
     private static readonly Regex _numTokenRe = new(
         @"\b\d{1,3}(?:[,\.]?\d{3})*(?:\.\d+)?\b|\b\d+ \d{3}(?:\.\d+)?\b", RegexOptions.Compiled);
-
+    private static readonly Regex _noteMarkerRe = new(
+        @"^(?:note\s+)?\d+(?:\.\d+)*\.?$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex _sectionHeadingLineRe = new(
+        @"^(?:note\s+)?\d+(?:\.\d+)*\.?\s+[a-z]",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
     // ─────────────────────────────────────────────────────────────────────────
     // SECTION 3.1 · COMPARE LINES (main entry point)
     // ─────────────────────────────────────────────────────────────────────────
@@ -100,10 +113,18 @@ public class LineComparatorService
     {
         var lines1 = SplitLines(text1);
         var lines2 = SplitLines(text2);
+        long cells = (long)lines1.Count * Math.Max(1, lines2.Count);
+        if (cells <= MaxAlignmentCells)
+            return CompareLinesOrdered(lines1, lines2);
+
+        return CompareLinesGreedy(lines1, lines2);
+    }
+
+    private List<LineDiffResult> CompareLinesGreedy(List<string> lines1, List<string> lines2)
+    {
         var index1 = BuildIndex(lines1);   // inverted index over AFS 1
 
         var used1   = new HashSet<int>();
-        var used2   = new HashSet<int>();
         var results = new List<LineDiffResult>(lines2.Count + lines1.Count);
 
         // ── Match each AFS 2 line ─────────────────────────────────────────
@@ -123,7 +144,6 @@ public class LineComparatorService
             if (bestIdx >= 0 && bestSc >= SimRelated)
             {
                 used1.Add(bestIdx);
-                used2.Add(i2);
                 string l1     = lines1[bestIdx];
                 string status = DetermineStatus(l1, l2, bestSc);
                 var    n1set  = ExtractNumbers(l1);
@@ -144,6 +164,9 @@ public class LineComparatorService
             }
             else
             {
+                if (IsIgnorableStandaloneLine(l2))
+                    continue;
+
                 results.Add(new LineDiffResult
                 {
                     Status = "added", Line1 = "", Line2 = l2,
@@ -157,9 +180,153 @@ public class LineComparatorService
         {
             if (!used1.Contains(i1))
             {
+                if (IsIgnorableStandaloneLine(lines1[i1]))
+                    continue;
+
                 results.Add(new LineDiffResult
                 {
                     Status = "removed", Line1 = lines1[i1], Line2 = "",
+                    Similarity = 0.0,
+                });
+            }
+        }
+
+        return results;
+    }
+
+    private List<LineDiffResult> CompareLinesOrdered(List<string> lines1, List<string> lines2)
+    {
+        int n1 = lines1.Count;
+        int n2 = lines2.Count;
+        var results = new List<LineDiffResult>(n1 + n2);
+
+        if (n1 == 0 && n2 == 0) return results;
+
+        var sim = new double[n1, n2];
+        for (int i = 0; i < n1; i++)
+            for (int j = 0; j < n2; j++)
+                sim[i, j] = Score(lines1[i], lines2[j]);
+
+        var dp = new double[n1 + 1, n2 + 1];
+        var move = new byte[n1 + 1, n2 + 1]; // 0=up(remove), 1=left(add), 2=diag(match)
+
+        for (int i = 1; i <= n1; i++)
+        {
+            dp[i, 0] = dp[i - 1, 0] - GapPenalty;
+            move[i, 0] = 0;
+        }
+
+        for (int j = 1; j <= n2; j++)
+        {
+            dp[0, j] = dp[0, j - 1] - GapPenalty;
+            move[0, j] = 1;
+        }
+
+        for (int i = 1; i <= n1; i++)
+        {
+            for (int j = 1; j <= n2; j++)
+            {
+                double best = double.NegativeInfinity;
+                byte bestMove = 0;
+
+                double s = sim[i - 1, j - 1];
+                if (s >= SimRelated)
+                {
+                    best = dp[i - 1, j - 1] + s;
+                    bestMove = 2;
+                }
+
+                double up = dp[i - 1, j] - GapPenalty;
+                if (up > best)
+                {
+                    best = up;
+                    bestMove = 0;
+                }
+
+                double left = dp[i, j - 1] - GapPenalty;
+                if (left > best)
+                {
+                    best = left;
+                    bestMove = 1;
+                }
+
+                dp[i, j] = best;
+                move[i, j] = bestMove;
+            }
+        }
+
+        var aligned = new List<(int? I1, int? I2, double Sim)>(n1 + n2);
+        int ti = n1, tj = n2;
+        while (ti > 0 || tj > 0)
+        {
+            if (ti > 0 && tj > 0 && move[ti, tj] == 2 && sim[ti - 1, tj - 1] >= SimRelated)
+            {
+                aligned.Add((ti - 1, tj - 1, sim[ti - 1, tj - 1]));
+                ti--;
+                tj--;
+            }
+            else if (tj > 0 && (ti == 0 || move[ti, tj] == 1))
+            {
+                aligned.Add((null, tj - 1, 0.0));
+                tj--;
+            }
+            else
+            {
+                aligned.Add((ti - 1, null, 0.0));
+                ti--;
+            }
+        }
+
+        aligned.Reverse();
+
+        foreach (var step in aligned)
+        {
+            if (step.I1.HasValue && step.I2.HasValue)
+            {
+                string l1 = lines1[step.I1.Value];
+                string l2 = lines2[step.I2.Value];
+                string status = DetermineStatus(l1, l2, step.Sim);
+                var n1set = ExtractNumbers(l1);
+                var n2set = ExtractNumbers(l2);
+                var numDiff = status == "changed"
+                    ? SymmetricExcept(n1set, n2set).OrderBy(x => x).ToList()
+                    : new List<string>();
+
+                results.Add(new LineDiffResult
+                {
+                    Status = status,
+                    Line1 = l1,
+                    Line2 = l2,
+                    Similarity = Math.Round(step.Sim, 4),
+                    NumDiff = numDiff,
+                    WordDiff = status == "changed" ? WordDiff(l1, l2) : new(),
+                });
+            }
+            else if (step.I2.HasValue)
+            {
+                string l2 = lines2[step.I2.Value];
+                if (IsIgnorableStandaloneLine(l2))
+                    continue;
+
+                results.Add(new LineDiffResult
+                {
+                    Status = "added",
+                    Line1 = "",
+                    Line2 = l2,
+                    Similarity = 0.0,
+                });
+            }
+            else if (step.I1.HasValue)
+            {
+                string l1 = lines1[step.I1.Value];
+                if (IsIgnorableStandaloneLine(l1))
+                    continue;
+
+                results.Add(new LineDiffResult
+                {
+                    Status = "removed",
+                    Line1 = l1,
+                    Line2 = "",
                     Similarity = 0.0,
                 });
             }
@@ -219,24 +386,29 @@ public class LineComparatorService
         PdfReport report2,
         List<AlignmentEntry> alignment)
     {
-        var results     = new List<PageDiffResult>();
-        var alignedI1   = new HashSet<int>();
-        int pairIndex   = 0;
+        var matchedEntries = alignment.Where(a => a.I2 >= 0).ToList();
+        var alignedI1   = new HashSet<int>(matchedEntries.Select(e => e.I1));
+        var alignedI2   = new HashSet<int>(matchedEntries.Select(e => e.I2));
 
-        foreach (var entry in alignment.Where(a => a.I2 >= 0))
+        // Each page pair's diff is fully independent — compute all in parallel.
+        var matchedResults = new PageDiffResult[matchedEntries.Count];
+        System.Threading.Tasks.Parallel.For(0, matchedEntries.Count, idx =>
         {
+            var entry = matchedEntries[idx];
             int i1 = entry.I1, i2 = entry.I2;
-            alignedI1.Add(i1);
-            var diff  = CompareLines(report1.Pages[i1], report2.Pages[i2]);
-            int same  = diff.Count(d => d.Status == "same");
+            string context1 = BuildNeighbourContext(report1.Pages, i1, NeighbourContextLines);
+            string context2 = BuildNeighbourContext(report2.Pages, i2, NeighbourContextLines);
+            var diff = CompareLinesGreedy(SplitLines(context1), SplitLines(context2));
+            diff = SuppressBleedDiffsV2(diff, report1, report2, i1, i2);
+
+            int same  = diff.Count(d => d.Status == "same" || d.Status == "same-cross-page");
             int chg   = diff.Count(d => d.Status == "changed");
             int add   = diff.Count(d => d.Status == "added");
             int rem   = diff.Count(d => d.Status == "removed");
             int total = Math.Max(diff.Count, 1);
 
-            results.Add(new PageDiffResult
+            matchedResults[idx] = new PageDiffResult
             {
-                PairIndex  = pairIndex++,
                 PageAfs1   = i1 + 1,
                 PageAfs2   = i2 + 1,
                 AlignSim   = entry.Sim,
@@ -247,15 +419,19 @@ public class LineComparatorService
                 TotalLines = diff.Count,
                 PctSame    = Math.Round((double)same / total * 100, 1),
                 Diffs      = diff,
-            });
-        }
+            };
+        });
+
+        // Preserve AFS 1 page order and assign sequential pair indices.
+        var results = matchedResults.OrderBy(r => r.PageAfs1).ToList();
+        int pairIndex = 0;
+        foreach (var r in results) r.PairIndex = pairIndex++;
 
         for (int i1 = 0; i1 < report1.Pages.Count; i1++)
         {
             if (alignedI1.Contains(i1)) continue;
-            int removedCount = report1.Pages[i1]
-                .Split('\n')
-                .Count(l => !PageAlignmentService.IsNoise(l.Trim()));
+
+            var diff = BuildUnmatchedDiffs(report1.Pages[i1], "removed");
 
             results.Add(new PageDiffResult
             {
@@ -263,10 +439,30 @@ public class LineComparatorService
                 PageAfs1   = i1 + 1,
                 PageAfs2   = null,
                 AlignSim   = 0.0,
-                Removed    = removedCount,
-                TotalLines = 0,
+                Removed    = diff.Count,
+                TotalLines = diff.Count,
                 PctSame    = 0.0,
-                Diffs      = new(),
+                Diffs      = diff,
+                Unmatched  = true,
+            });
+        }
+
+        for (int i2 = 0; i2 < report2.Pages.Count; i2++)
+        {
+            if (alignedI2.Contains(i2)) continue;
+
+            var diff = BuildUnmatchedDiffs(report2.Pages[i2], "added");
+
+            results.Add(new PageDiffResult
+            {
+                PairIndex  = pairIndex++,
+                PageAfs1   = null,
+                PageAfs2   = i2 + 1,
+                AlignSim   = 0.0,
+                Added      = diff.Count,
+                TotalLines = diff.Count,
+                PctSame    = 0.0,
+                Diffs      = diff,
                 Unmatched  = true,
             });
         }
@@ -277,6 +473,258 @@ public class LineComparatorService
     // ─────────────────────────────────────────────────────────────────────────
     // SECTION 3-INTERNAL · HELPERS
     // ─────────────────────────────────────────────────────────────────────────
+
+    private static string BuildNeighbourContext(
+        List<string> pages,
+        int pageIndex,
+        int fringeLines)
+    {
+        var sb = new StringBuilder();
+
+        if (pageIndex > 0)
+        {
+            var prevLines = SplitLines(pages[pageIndex - 1]);
+            foreach (var line in prevLines.TakeLast(fringeLines))
+                sb.AppendLine(line);
+        }
+
+        sb.Append(pages[pageIndex]);
+
+        if (pageIndex < pages.Count - 1)
+        {
+            var nextLines = SplitLines(pages[pageIndex + 1]);
+            foreach (var line in nextLines.Take(fringeLines))
+                sb.AppendLine(line);
+        }
+
+        return sb.ToString();
+    }
+
+    private static List<LineDiffResult> SuppressBleedDiffs(
+        List<LineDiffResult> diffs,
+        PdfReport report1,
+        PdfReport report2,
+        int pageIdx1,
+        int pageIdx2)
+    {
+        var pool2 = BuildAdjacentLinePool(report2.Pages, pageIdx2, neighbourRadius: 2)
+            .Select(BuildBleedCandidate)
+            .Where(c => c.Norm.Length >= 6)
+            .ToList();
+
+        var pool1 = BuildAdjacentLinePool(report1.Pages, pageIdx1, neighbourRadius: 2)
+            .Select(BuildBleedCandidate)
+            .Where(c => c.Norm.Length >= 6)
+            .ToList();
+
+        var pool2Norm = pool2.Select(c => c.Norm).Where(s => s.Length >= 15).ToHashSet(StringComparer.Ordinal);
+        var pool2Canon = pool2.Select(c => c.Canon).Where(s => s.Length >= 15).ToHashSet(StringComparer.Ordinal);
+        var pool2Flat = pool2.Select(c => c.Flat).Where(s => s.Length >= 15).ToHashSet(StringComparer.Ordinal);
+        var pool1Norm = pool1.Select(c => c.Norm).Where(s => s.Length >= 15).ToHashSet(StringComparer.Ordinal);
+        var pool1Canon = pool1.Select(c => c.Canon).Where(s => s.Length >= 15).ToHashSet(StringComparer.Ordinal);
+        var pool1Flat = pool1.Select(c => c.Flat).Where(s => s.Length >= 15).ToHashSet(StringComparer.Ordinal);
+
+        foreach (var diff in diffs)
+        {
+            if (diff.Status == "removed" && !string.IsNullOrWhiteSpace(diff.Line1))
+            {
+                string norm = Normalise(diff.Line1);
+                if (norm.Length < 15)
+                    continue;
+                string canon = Canonical(diff.Line1);
+                string flat = WhitespaceAgnosticCanonical(diff.Line1);
+                if (pool2Norm.Contains(norm) || pool2Canon.Contains(canon) || pool2Flat.Contains(flat))
+                {
+                    diff.Status = "same-cross-page";
+                    diff.CrossPageNote = "Content found on adjacent AFS2 page — page layout differs between drafts";
+                }
+            }
+            else if (diff.Status == "added" && !string.IsNullOrWhiteSpace(diff.Line2))
+            {
+                string norm = Normalise(diff.Line2);
+                if (norm.Length < 15)
+                    continue;
+                string canon = Canonical(diff.Line2);
+                string flat = WhitespaceAgnosticCanonical(diff.Line2);
+                if (pool1Norm.Contains(norm) || pool1Canon.Contains(canon) || pool1Flat.Contains(flat))
+                {
+                    diff.Status = "same-cross-page";
+                    diff.CrossPageNote = "Content found on adjacent AFS1 page — page layout differs between drafts";
+                }
+            }
+        }
+
+        return diffs;
+    }
+
+    private static List<string> BuildAdjacentLinePool(
+        List<string> pages,
+        int centerIdx,
+        int neighbourRadius)
+    {
+        var pool = new List<string>();
+
+        for (int delta = -neighbourRadius; delta <= neighbourRadius; delta++)
+        {
+            int idx = centerIdx + delta;
+            if (idx < 0 || idx >= pages.Count)
+                continue;
+
+            pool.AddRange(SplitLines(pages[idx]));
+        }
+
+        return pool;
+    }
+
+    private sealed class BleedCandidate
+    {
+        public string Norm { get; init; } = string.Empty;
+        public string Canon { get; init; } = string.Empty;
+        public string Flat { get; init; } = string.Empty;
+        public HashSet<string> Tokens { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> Numbers { get; init; } = new();
+    }
+
+    private static BleedCandidate BuildBleedCandidate(string line)
+    {
+        string norm = Normalise(line);
+        return new BleedCandidate
+        {
+            Norm = norm,
+            Canon = Canonical(line),
+            Flat = WhitespaceAgnosticCanonical(line),
+            Tokens = norm.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                .Where(t => t.Length >= 3)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase),
+            Numbers = ExtractNumbers(line),
+        };
+    }
+
+    private static List<LineDiffResult> SuppressBleedDiffsV2(
+        List<LineDiffResult> diffs,
+        PdfReport report1,
+        PdfReport report2,
+        int pageIdx1,
+        int pageIdx2)
+    {
+        var pool2 = BuildAdjacentLinePool(report2.Pages, pageIdx2, neighbourRadius: 2)
+            .Select(BuildBleedCandidate)
+            .Where(c => c.Norm.Length >= 6)
+            .ToList();
+        var pool1 = BuildAdjacentLinePool(report1.Pages, pageIdx1, neighbourRadius: 2)
+            .Select(BuildBleedCandidate)
+            .Where(c => c.Norm.Length >= 6)
+            .ToList();
+
+        foreach (var diff in diffs)
+        {
+            if (diff.Status == "removed" && !string.IsNullOrWhiteSpace(diff.Line1))
+            {
+                if (LooksLikeCrossPageEquivalent(diff.Line1, pool2))
+                {
+                    diff.Status = "same-cross-page";
+                    diff.CrossPageNote = "Content found on adjacent AFS2 page - page layout differs between drafts";
+                }
+            }
+            else if (diff.Status == "added" && !string.IsNullOrWhiteSpace(diff.Line2))
+            {
+                if (LooksLikeCrossPageEquivalent(diff.Line2, pool1))
+                {
+                    diff.Status = "same-cross-page";
+                    diff.CrossPageNote = "Content found on adjacent AFS1 page - page layout differs between drafts";
+                }
+            }
+            else if (diff.Status == "changed" &&
+                     !string.IsNullOrWhiteSpace(diff.Line1) &&
+                     !string.IsNullOrWhiteSpace(diff.Line2))
+            {
+                bool leftCross = LooksLikeCrossPageEquivalent(diff.Line1, pool2);
+                bool rightCross = LooksLikeCrossPageEquivalent(diff.Line2, pool1);
+                bool sameNumbers = ExtractNumbers(diff.Line1).SetEquals(ExtractNumbers(diff.Line2));
+
+                if ((leftCross || rightCross) &&
+                    (sameNumbers || diff.Similarity < 0.78 ||
+                     LooksLikeCrossPageFragment(diff.Line1) ||
+                     LooksLikeCrossPageFragment(diff.Line2)))
+                {
+                    diff.Status = "same-cross-page";
+                    diff.CrossPageNote = "Equivalent content resolved on adjacent pages - page layout differs between drafts";
+                }
+            }
+        }
+
+        return diffs;
+    }
+
+    private static bool LooksLikeCrossPageEquivalent(string line, List<BleedCandidate> pool)
+    {
+        string norm = Normalise(line);
+        if (norm.Length < 6)
+            return false;
+
+        string canon = Canonical(line);
+        string flat = WhitespaceAgnosticCanonical(line);
+        var tokens = norm.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .Where(t => t.Length >= 3)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var numbers = ExtractNumbers(line);
+
+        foreach (var candidate in pool)
+        {
+            if (candidate.Norm == norm || candidate.Canon == canon || candidate.Flat == flat)
+                return true;
+
+            if (canon.Length >= 8 &&
+                (candidate.Canon.Contains(canon, StringComparison.Ordinal) ||
+                 canon.Contains(candidate.Canon, StringComparison.Ordinal)) &&
+                SharedTokenCount(tokens, candidate.Tokens) >= Math.Min(2, tokens.Count))
+            {
+                return true;
+            }
+
+            double overlap = TokenOverlap(tokens, candidate.Tokens);
+            bool numbersCompatible = numbers.Count == 0 || candidate.Numbers.SetEquals(numbers);
+
+            if (tokens.Count >= 3 && overlap >= 0.80 && numbersCompatible)
+                return true;
+
+            if (norm.Length >= 25 &&
+                candidate.Norm.Length >= 25 &&
+                numbersCompatible &&
+                PageAlignmentService.SequenceSimilarity(norm, candidate.Norm) >= CrossPageBleedSim)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static int SharedTokenCount(HashSet<string> left, HashSet<string> right)
+        => left.Count == 0 || right.Count == 0 ? 0 : left.Intersect(right).Count();
+
+    private static double TokenOverlap(HashSet<string> left, HashSet<string> right)
+    {
+        if (left.Count == 0 || right.Count == 0)
+            return 0.0;
+
+        int common = left.Intersect(right).Count();
+        return (double)common / Math.Min(left.Count, right.Count);
+    }
+
+    private static bool LooksLikeCrossPageFragment(string line)
+    {
+        string norm = Normalise(line);
+        if (norm.Length == 0)
+            return false;
+
+        var words = norm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        bool noSentenceStop = !norm.EndsWith('.') && !norm.EndsWith('!') && !norm.EndsWith('?');
+        bool hasNumbers = ExtractNumbers(line).Count > 0;
+
+        return (words.Length <= 4 && noSentenceStop) ||
+               (!hasNumbers && words.Length <= 8 && norm.Length <= 60);
+    }
 
     // Split text into non-noise lines.
     // Paragraph reconstruction: only merge a line whose first char is lowercase
@@ -361,7 +809,283 @@ public class LineComparatorService
             }
             deduped.Add(line);
         }
-        return deduped;
+        return deduped.Where(line => !IsIgnorableStandaloneLine(line)).ToList();
+    }
+
+    private PageDiffResult? TryBuildSecondaryMatchFromAfs1(
+        int pageAfs1Index,
+        PdfReport report1,
+        PdfReport report2,
+        int pairIndex)
+    {
+        var sourceLines = SplitLines(report1.Pages[pageAfs1Index]);
+        if (sourceLines.Count < 2)
+            return null;
+
+        PageDiffResult? best = null;
+        double bestScore = 0.0;
+
+        for (int i2 = 0; i2 < report2.Pages.Count; i2++)
+        {
+            var candidateLines = SplitLines(report2.Pages[i2]);
+            var rawDiff = CompareLines(report1.Pages[pageAfs1Index], report2.Pages[i2]);
+            var diff = rawDiff.Where(d => d.Status != "added").ToList();
+            if (diff.Count == 0)
+                continue;
+
+            int same = diff.Count(d => d.Status == "same");
+            int changed = diff.Count(d => d.Status == "changed");
+            int removed = diff.Count(d => d.Status == "removed");
+            int shared = same + changed;
+            double score = (double)shared / Math.Max(1, diff.Count);
+            double sourceCoverage = (double)shared / Math.Max(1, sourceLines.Count);
+            int headingOverlap = SharedSectionHeadingCount(sourceLines, candidateLines);
+            bool defaultMatch = shared >= 2 && score >= 0.72 && (same > 0 || changed >= 2);
+            bool splitPageMatch =
+                headingOverlap > 0 &&
+                shared >= 6 &&
+                sourceCoverage >= 0.60 &&
+                (same >= 4 || changed >= 2);
+
+            if (!defaultMatch && !splitPageMatch)
+                continue;
+
+            double candidateScore = defaultMatch
+                ? score
+                : Math.Max(score, sourceCoverage + Math.Min(0.10, headingOverlap * 0.05));
+
+            if (candidateScore > bestScore)
+            {
+                bestScore = candidateScore;
+                best = new PageDiffResult
+                {
+                    PairIndex = pairIndex,
+                    PageAfs1 = pageAfs1Index + 1,
+                    PageAfs2 = i2 + 1,
+                    AlignSim = Math.Round(candidateScore, 3),
+                    Same = same,
+                    Changed = changed,
+                    Added = 0,
+                    Removed = removed,
+                    TotalLines = diff.Count,
+                    PctSame = Math.Round((double)same / Math.Max(1, diff.Count) * 100, 1),
+                    Diffs = WithCrossPageNote(diff, pageAfs1Index + 1, i2 + 1),
+                    SecondaryMatch = true,
+                };
+            }
+        }
+
+        return best;
+    }
+
+    private PageDiffResult? TryBuildSecondaryMatchFromAfs2(
+        int pageAfs2Index,
+        PdfReport report1,
+        PdfReport report2,
+        int pairIndex)
+    {
+        var sourceLines = SplitLines(report2.Pages[pageAfs2Index]);
+        if (sourceLines.Count < 2)
+            return null;
+
+        PageDiffResult? best = null;
+        double bestScore = 0.0;
+
+        for (int i1 = 0; i1 < report1.Pages.Count; i1++)
+        {
+            var candidateLines = SplitLines(report1.Pages[i1]);
+            var rawDiff = CompareLines(report1.Pages[i1], report2.Pages[pageAfs2Index]);
+            var diff = rawDiff.Where(d => d.Status != "removed").ToList();
+            if (diff.Count == 0)
+                continue;
+
+            int same = diff.Count(d => d.Status == "same");
+            int changed = diff.Count(d => d.Status == "changed");
+            int added = diff.Count(d => d.Status == "added");
+            int shared = same + changed;
+            double score = (double)shared / Math.Max(1, diff.Count);
+            double sourceCoverage = (double)shared / Math.Max(1, sourceLines.Count);
+            int headingOverlap = SharedSectionHeadingCount(sourceLines, candidateLines);
+            bool defaultMatch = shared >= 2 && score >= 0.72 && (same > 0 || changed >= 2);
+            bool splitPageMatch =
+                headingOverlap > 0 &&
+                shared >= 6 &&
+                sourceCoverage >= 0.60 &&
+                (same >= 4 || changed >= 2);
+
+            if (!defaultMatch && !splitPageMatch)
+                continue;
+
+            double candidateScore = defaultMatch
+                ? score
+                : Math.Max(score, sourceCoverage + Math.Min(0.10, headingOverlap * 0.05));
+
+            if (candidateScore > bestScore)
+            {
+                bestScore = candidateScore;
+                best = new PageDiffResult
+                {
+                    PairIndex = pairIndex,
+                    PageAfs1 = i1 + 1,
+                    PageAfs2 = pageAfs2Index + 1,
+                    AlignSim = Math.Round(candidateScore, 3),
+                    Same = same,
+                    Changed = changed,
+                    Added = added,
+                    Removed = 0,
+                    TotalLines = diff.Count,
+                    PctSame = Math.Round((double)same / Math.Max(1, diff.Count) * 100, 1),
+                    Diffs = WithCrossPageNote(diff, i1 + 1, pageAfs2Index + 1),
+                    SecondaryMatch = true,
+                };
+            }
+        }
+
+        return best;
+    }
+
+    private List<LineDiffResult> BuildUnmatchedDiffs(
+        string text,
+        string status,
+        PdfReport? otherReport = null,
+        int currentPageIdx = -1)
+    {
+        var lines = SplitLines(text);
+        var diffs = new List<LineDiffResult>(lines.Count);
+
+        foreach (var line in lines)
+        {
+            string? crossPageNote = null;
+
+            if (otherReport != null && line.Length >= 15)
+            {
+                string lineNorm = Normalise(line);
+                for (int pi = 0; pi < otherReport.Pages.Count; pi++)
+                {
+                    var otherLines = SplitLines(otherReport.Pages[pi]);
+                    foreach (var otherLine in otherLines)
+                    {
+                        double sim = PageAlignmentService.SequenceSimilarity(
+                            lineNorm,
+                            Normalise(otherLine));
+
+                        if (sim >= 0.90)
+                        {
+                            string side = status == "removed" ? "AFS2" : "AFS1";
+                            int display = pi + 1;
+                            int current = currentPageIdx + 1;
+                            crossPageNote =
+                                $"Same content found on {side} page {display} " +
+                                $"(this page: {(status == "removed" ? "AFS1" : "AFS2")} page {current}) " +
+                                "— page layout differs between drafts";
+                            break;
+                        }
+                    }
+
+                    if (crossPageNote != null)
+                        break;
+                }
+            }
+
+            diffs.Add(new LineDiffResult
+            {
+                Status = crossPageNote != null ? "same-different-page" : status,
+                Line1 = status == "removed" ? line : string.Empty,
+                Line2 = status == "added" ? line : string.Empty,
+                Similarity = 0.0,
+                CrossPageNote = crossPageNote,
+            });
+        }
+
+        return diffs;
+    }
+
+    private static int SharedSectionHeadingCount(List<string> leftLines, List<string> rightLines)
+    {
+        var left = leftLines
+            .Select(Normalise)
+            .Where(line => _sectionHeadingLineRe.IsMatch(line))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (left.Count == 0)
+            return 0;
+
+        var right = rightLines
+            .Select(Normalise)
+            .Where(line => _sectionHeadingLineRe.IsMatch(line))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (right.Count == 0)
+            return 0;
+
+        return left.Intersect(right, StringComparer.OrdinalIgnoreCase).Count();
+    }
+
+    private static List<LineDiffResult> WithCrossPageNote(
+        List<LineDiffResult> diffs,
+        int pageAfs1,
+        int pageAfs2)
+    {
+        string note = $"Continuation match: AFS1 p{pageAfs1} is related to AFS2 p{pageAfs2}, so some lines may continue across pages.";
+        foreach (var diff in diffs)
+            diff.CrossPageNote = note;
+        return diffs;
+    }
+
+    private static bool IsIgnorableStandaloneLine(string line)
+    {
+        string norm = Normalise(line);
+        if (string.IsNullOrWhiteSpace(norm))
+            return true;
+
+        if (_noteMarkerRe.IsMatch(norm))
+            return true;
+
+        var words = norm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (words.Length == 0)
+            return true;
+
+        var nums = ExtractNumbers(line);
+        if (nums.Count > 0)
+            return false;
+
+        if (norm is "-" or "–" or "—")
+            return false;
+
+        if (words.Length == 1 && char.IsLower(words[0][0]))
+            return true;
+
+        if (words.Length <= 3)
+        {
+            bool startsLower = char.IsLower(words[0][0]);
+            bool possessiveLead = words[0].EndsWith("'s", StringComparison.Ordinal) || words[0].EndsWith("s'", StringComparison.Ordinal);
+            bool shortAlphaFragment = words.All(w =>
+                w.All(ch => char.IsLetter(ch) || ch == '\'' || ch == '-') &&
+                w.Length <= 4);
+            bool noSentenceStop = !norm.EndsWith('.') && !norm.EndsWith('!') && !norm.EndsWith('?');
+
+            if ((startsLower || possessiveLead) && shortAlphaFragment && noSentenceStop)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static string ParentheticalCanonical(string s)
+    {
+        string t = Normalise(s);
+        t = Regex.Replace(t, @"\([^)]*\)", " ");
+        t = Regex.Replace(t, @"\bcontinued\b", " ");
+        t = Regex.Replace(t, @"^(?:note\s+)?\d+(?:\.\d+)*\.?\s*", "");
+        t = Regex.Replace(t, @"[^\w\s]", " ");
+        t = Regex.Replace(t, @"\s+", " ").Trim();
+        return t;
+    }
+
+    private static string SemanticSkeleton(string s)
+    {
+        string t = ParentheticalCanonical(s);
+        t = Regex.Replace(t, @"\b(?:a|an|are|as|at|be|been|for|from|in|is|of|on|the|to|was|were)\b", " ");
+        t = Regex.Replace(t, @"\s+", " ").Trim();
+        return t;
     }
 
     // Build inverted index: bigram/first-token → set of line indices
@@ -425,7 +1149,10 @@ public class LineComparatorService
     // Reference: Python LineComparator._score()
     private static double Score(string l1, string l2)
     {
-        double sim    = PageAlignmentService.SequenceSimilarity(Normalise(l1), Normalise(l2));
+        double sim = PageAlignmentService.SequenceSimilarity(Normalise(l1), Normalise(l2));
+        sim = Math.Max(sim, PageAlignmentService.SequenceSimilarity(ParentheticalCanonical(l1), ParentheticalCanonical(l2)));
+        sim = Math.Max(sim, PageAlignmentService.SequenceSimilarity(SemanticSkeleton(l1), SemanticSkeleton(l2)));
+        sim = Math.Max(sim, PageAlignmentService.SequenceSimilarity(WhitespaceAgnosticCanonical(l1), WhitespaceAgnosticCanonical(l2)));
         var    nums1  = ExtractNumbers(l1);
         var    nums2  = ExtractNumbers(l2);
         double bonus  = nums1.Count > 0 && nums2.Count > 0 && nums1.SetEquals(nums2) ?  0.04 : 0.0;
@@ -457,19 +1184,66 @@ public class LineComparatorService
     private static string DetermineStatus(string l1, string l2, double rawScore)
     {
         // Gate 0: Case- and whitespace-insensitive equality.
-        // Lines that differ ONLY in capitalisation or spacing are NEVER flagged as
-        // changes — this is an absolute requirement. E.g. "TOTAL ASSETS" == "Total Assets".
+        // Lines that differ ONLY in capitalisation, spacing, or Unicode whitespace variants
+        // are NEVER flagged as changes — font size and spacing must not create diffs.
         if (Normalise(l1) == Normalise(l2))        return "same";
 
-        // Gate 1: Canonical string equality (also strips punctuation)
+        // Gate 0.5: Explicit spacing/punctuation-only gate.
+        // If stripping ALL punctuation AND ALL whitespace from both lines produces
+        // identical strings, the difference is purely formatting (spacing, punctuation,
+        // font-related PDF extraction artefacts) — not content.
+        string pure1 = Regex.Replace(Normalise(l1), @"[^\w\d]", "");
+        string pure2 = Regex.Replace(Normalise(l2), @"[^\w\d]", "");
+        if (pure1.Length > 0 && pure1 == pure2)   return "same";
+
+        // Gate 1: Canonical string equality (also strips punctuation and number formatting)
         if (Canonical(l1) == Canonical(l2))        return "same";
+        if (WhitespaceAgnosticCanonical(l1) == WhitespaceAgnosticCanonical(l2))
+            return "same";
+
+        // Gate 1b: ignore parenthetical wrappers and leading note markers.
+        string p1 = ParentheticalCanonical(l1);
+        string p2 = ParentheticalCanonical(l2);
+        if (p1.Length > 0 && p1 == p2)             return "same";
+
+        string s1 = SemanticSkeleton(l1);
+        string s2 = SemanticSkeleton(l2);
+        var n1 = ExtractNumbers(l1);
+        var n2 = ExtractNumbers(l2);
+
+        if (s1.Length > 0 && s1 == s2 &&
+            n1.SetEquals(n2))
+            return "same";
+
+        // Gate 1c: Pure formatting difference gate.
+        // If the token sets are identical and the numeric content matches, treat
+        // the lines as the same even when PDF extraction introduced subtle
+        // spacing / style artefacts or paragraph reflow noise.
+        var w1set = new HashSet<string>(
+            Normalise(l1).Split(' ', StringSplitOptions.RemoveEmptyEntries),
+            StringComparer.OrdinalIgnoreCase);
+        var w2set = new HashSet<string>(
+            Normalise(l2).Split(' ', StringSplitOptions.RemoveEmptyEntries),
+            StringComparer.OrdinalIgnoreCase);
+
+        if (w1set.Count > 0 && w2set.Count > 0)
+        {
+            if (w1set.SetEquals(w2set) && n1.SetEquals(n2))
+                return "same";
+
+            if (w1set.Count >= 8 && w2set.Count >= 8)
+            {
+                int common = w1set.Intersect(w2set).Count();
+                double overlap = (double)common / Math.Max(w1set.Count, w2set.Count);
+                if (overlap >= 0.95 && n1.SetEquals(n2))
+                    return "same";
+            }
+        }
 
         // Gate 2: Similarity score above exact threshold
         if (rawScore >= SimExact)                  return "same";
 
         // Gate 3: Numbers identical at lower score
-        var n1 = ExtractNumbers(l1);
-        var n2 = ExtractNumbers(l2);
         if (n1.SetEquals(n2) && rawScore >= 0.80)  return "same";
 
         // Gate 4: Normalised text equality (kept for safety; identical to Gate 0)
@@ -507,8 +1281,11 @@ public class LineComparatorService
             int    maxLen       = w2.Count;   // l2 is longer or equal
             double overlap  = (double)intersection / minLen;
             double lenRatio = (double)minLen / maxLen;
+            double threshold = minLen >= LongLineWords
+                ? WordOverlapThresholdLong
+                : WordOverlapThreshold;
 
-            if (overlap >= WordOverlapThreshold && lenRatio >= LengthRatioThreshold)
+            if (overlap >= threshold && lenRatio >= LengthRatioThreshold)
                 return "same";
         }
 
@@ -551,7 +1328,15 @@ public class LineComparatorService
         //    cannot decode a glyph from a non-standard font encoding.
         //    \uFFF0-\uFFFD covers the full Unicode Specials block.
         t = Regex.Replace(t, @"[\p{C}\u00AD\u200B-\u200F\uFEFF\uFFF0-\uFFFD]", "");
-        t = Regex.Replace(t, @"\s+", " ").Trim();
+        // Collapse ALL Unicode whitespace variants (non-breaking space  , thin/en/em spaces,
+        // narrow no-break  , math space  , ideographic 　). PDF column layout
+        // uses these between table cells and must not produce false changed verdicts.
+        t = Regex.Replace(t, @"[\s  -   　]+", " ").Trim();
+        // Normalise ALL dash/minus variants → hyphen-minus so "provisions – 2025" == "provisions - 2025".
+        // PDFs from Word use en-dash (–) or em-dash (—) in headings; other versions use plain hyphen.
+        t = Regex.Replace(t, "[‐-―−﹘﹣－]", "-");
+        // Normalise spacing around hyphens: "provisions  -  2025" → "provisions - 2025"
+        t = Regex.Replace(t, @"\s*-\s*", " - ");
         t = Regex.Replace(t, @"^[-–—\s]*\d{1,4}[-–—\s]*$", "").Trim();
         return t;
     }
@@ -566,6 +1351,14 @@ public class LineComparatorService
         t = Regex.Replace(t, @"(?<=\d)\s+(?=\d)", "");   // "102 575" → "102575"
         t = Regex.Replace(t, @"(?<=\d),(?=\d{3})", "");  // "102,575" → "102575"
         t = Regex.Replace(t, @"[^\w\s]", "");             // strip punctuation
+        t = Regex.Replace(t, @"\s+", " ");                    // re-collapse gaps left by dash/punctuation removal
+        return t.Trim();
+    }
+
+    private static string WhitespaceAgnosticCanonical(string s)
+    {
+        string t = Canonical(s);
+        t = Regex.Replace(t, @"\s+", "");
         return t.Trim();
     }
 
@@ -577,10 +1370,20 @@ public class LineComparatorService
     {
         string cleaned = _pageStampRe.Replace(text ?? "", "");
         var result     = new HashSet<string>();
-        foreach (Match m in _numTokenRe.Matches(cleaned))
+        var extendedPattern = new Regex(
+            @"\((\d{1,3}(?:[\s,]\d{3})*(?:\.\d+)?)\)" +
+            @"|\b(\d{1,3}(?:[,\.]?\d{3})*(?:\.\d+)?)\b" +
+            @"|\b(\d+\s\d{3}(?:\s\d{3})*(?:\.\d+)?)\b",
+            RegexOptions.Compiled);
+
+        foreach (Match m in extendedPattern.Matches(cleaned))
         {
-            string canon = Regex.Replace(m.Value, @"[\s,]", "");
-            if (Regex.IsMatch(canon, @"^\d+(?:\.\d+)?$"))
+            string raw = m.Groups[1].Success ? m.Groups[1].Value
+                : m.Groups[2].Success ? m.Groups[2].Value
+                : m.Groups[3].Value;
+
+            string canon = Regex.Replace(raw, @"[\s,]", "");
+            if (Regex.IsMatch(canon, @"^\d+(?:\.\d+)?$") && canon.Length >= 2)
                 result.Add(canon);
         }
         return result;
@@ -591,6 +1394,19 @@ public class LineComparatorService
     private static List<string> SymmetricExcept(HashSet<string> a, HashSet<string> b)
         => a.Except(b).Concat(b.Except(a)).OrderBy(x => x).ToList();
 
+    private static string NormaliseWordToken(string word)
+    {
+        string t = (word ?? "")
+            .Normalize(NormalizationForm.FormKD)
+            .ToLowerInvariant()
+            .Trim();
+        t = Regex.Replace(t, @"[\p{C}\u00AD\u200B-\u200F\uFEFF\uFFF0-\uFFFD]", "");
+        t = Regex.Replace(t, @"r\s+(?=\d)",            "r");
+        t = Regex.Replace(t, @"(?<=\d)\s*\.\s*(?=\d)", ".");
+        t = Regex.Replace(t, @"(?<=\d)\s*,\s*(?=\d)",  ",");
+        return t;
+    }
+
     // Word-level diff using Ratcliff/Obershelp opcodes.
     // Produces (word, tag) pairs: tag ∈ {"same", "added", "removed"}.
     // Reference: Python LineComparator._word_diff() — s1.split() splits on ALL whitespace.
@@ -599,6 +1415,13 @@ public class LineComparatorService
         // Null-coalesce and split on ALL whitespace (mirrors Python str.split() behaviour).
         var w1  = (s1 ?? "").Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
         var w2  = (s2 ?? "").Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+
+        if (w1.Length == w2.Length &&
+            w1.Zip(w2).All(p => NormaliseWordToken(p.First) == NormaliseWordToken(p.Second)))
+        {
+            return w1.Select(w => new WordDiffToken { Word = w, Tag = "same" }).ToList();
+        }
+
         var ops = GetOpcodes(w1, w2);
         var out_ = new List<WordDiffToken>();
 
@@ -660,7 +1483,7 @@ public class LineComparatorService
             t = Regex.Replace(t, @"(?<=\d)\s*,\s*(?=\d)",  ",");  // 1 , 000 → 1,000
             return t;
         }
-        static bool Eq(string x, string y) => Nw(x) == Nw(y);
+        static bool Eq(string x, string y) => NormaliseWordToken(x) == NormaliseWordToken(y);
 
         int m = a.Length, n = b.Length;
 

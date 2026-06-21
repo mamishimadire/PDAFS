@@ -16,6 +16,7 @@
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 using System.Text.Json.Serialization;
+using AfsPdfComparison.Services;
 
 namespace AfsPdfComparison.Models;
 
@@ -40,6 +41,9 @@ public class AlignmentEntry
     public double Sim { get; set; }
 }
 
+/// <summary>AI-assigned highlight severity — drives the highlight colour in snapshots.</summary>
+public enum AiHighlightSeverity { Normal, Medium, High }
+
 /// <summary>Specifies a line to locate in a PDF snapshot and which words to highlight.</summary>
 public class HighlightSpec
 {
@@ -47,6 +51,18 @@ public class HighlightSpec
     public string LineText { get; set; } = string.Empty;
     /// <summary>Specific changed words to highlight. Empty list = highlight entire line band.</summary>
     public List<string> ChangedWords { get; set; } = new();
+    /// <summary>Stable context words used to anchor the highlight to the right visual line.</summary>
+    public List<string> AnchorWords { get; set; } = new();
+    /// <summary>Short phrase windows around changed words, used to paint the actual changed span.</summary>
+    public List<string> ChangedPhrases { get; set; } = new();
+    /// <summary>AI-driven severity: High = red, Medium = orange, Normal = yellow.</summary>
+    public AiHighlightSeverity Severity { get; set; } = AiHighlightSeverity.Normal;
+    /// <summary>
+    /// When true the renderer uses a lower match threshold (0.45) and highlights the
+    /// entire line band. Set for added/removed lines and for changed lines where only
+    /// a trailing number differs (e.g. TOC page references).
+    /// </summary>
+    public bool WholeLineMode { get; set; } = false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -124,7 +140,7 @@ public class PdfReport
     /// "scanned" if text came from a rasterised image (OCR not implemented in
     /// this C# version — scanned PDFs return empty pages with a warning).
     /// </summary>
-    public string DocType     { get; set; } = "digital";
+    public string DocType     { get; set; } = string.Empty;
 
     /// <summary>
     /// Text extracted per page.  Index 0 = page 1.
@@ -203,6 +219,12 @@ public class LineDiffResult
     /// Each tuple is (word, "same"|"added"|"removed").
     /// </summary>
     public List<WordDiffToken> WordDiff { get; set; } = new();
+
+    /// <summary>
+    /// Optional note explaining that this diff belongs to a continuation /
+    /// cross-page match rather than a normal primary page pair.
+    /// </summary>
+    public string? CrossPageNote { get; set; }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -258,6 +280,12 @@ public class PageDiffResult
 
     /// <summary>True if AFS 1 page has no matching AFS 2 page.</summary>
     public bool Unmatched     { get; set; }
+
+    /// <summary>
+    /// True when this is a secondary continuation/reference match rather than
+    /// the primary one-to-one page alignment.
+    /// </summary>
+    public bool SecondaryMatch { get; set; }
 
     // Convenience helpers for the Razor view
     [JsonIgnore] public int IssueCount     => Changed + Added + Removed;
@@ -348,6 +376,27 @@ public class ComparisonResult
     /// Reference: <see cref="Services.PageAlignmentService.BuildAlignment"/>.
     /// </summary>
     public List<AlignmentEntry> Alignment { get; set; } = new();
+
+    /// <summary>
+    /// Semantic smart-comparison result built on semantic blocks and smart diffing.
+    /// Stored alongside the legacy line/page diff model so existing UI paths keep working.
+    /// </summary>
+    public SmartComparisonResult? SmartComparison { get; set; }
+
+    /// <summary>
+    /// Document-derived section comparison built from rich page extraction and
+    /// heading/section discovery from the PDF itself.
+    /// </summary>
+    public DocumentComparisonReport? DocumentIntelligence { get; set; }
+
+    /// <summary>
+    /// Optional Gemini-assisted review layered on top of the deterministic
+    /// comparison output. This does not replace the core diff engine.
+    /// </summary>
+    public AiAssistResult? AiAssist { get; set; }
+
+    /// <summary>Result from Gemini directly reading and comparing both AFS documents (content-level AI).</summary>
+    public AiContentReadResult? AiContentRead { get; set; }
 
     // Convenience filtered views used by the Razor pages and export services
     // [JsonIgnore] prevents these computed views from being serialised to session

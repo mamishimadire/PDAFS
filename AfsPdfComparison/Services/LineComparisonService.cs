@@ -196,13 +196,38 @@ namespace AfsPdfComparison.Services
             if (TextNormaliser.Canonicalise(l1) == TextNormaliser.Canonicalise(l2))
                 return DiffStatus.Same;
 
+            // Gate 1c: Formatting-only gate (bold/italic rendering artefact).
+            // When PDFs differ only in visual styling, PdfPig may surface
+            // invisible formatting differences while the underlying words and
+            // numbers are unchanged.
+            var ws1 = new HashSet<string>(
+                TextNormaliser.Normalise(l1).Split(' ', StringSplitOptions.RemoveEmptyEntries),
+                StringComparer.OrdinalIgnoreCase);
+            var ws2 = new HashSet<string>(
+                TextNormaliser.Normalise(l2).Split(' ', StringSplitOptions.RemoveEmptyEntries),
+                StringComparer.OrdinalIgnoreCase);
+            var n1 = TextNormaliser.ExtractNumbers(l1);
+            var n2 = TextNormaliser.ExtractNumbers(l2);
+
+            if (ws1.Count > 0 && ws2.Count > 0 && ws1.SetEquals(ws2))
+            {
+                if (n1.SetEquals(n2))
+                    return DiffStatus.Same;
+            }
+
+            if (ws1.Count >= 8 && ws2.Count >= 8)
+            {
+                int common = ws1.Intersect(ws2).Count();
+                double overlap = (double)common / Math.Max(ws1.Count, ws2.Count);
+                if (overlap >= 0.95 && n1.SetEquals(n2))
+                    return DiffStatus.Same;
+            }
+
             // Gate 2: Similarity score above exact threshold
             if (rawScore >= SIM_EXACT)
                 return DiffStatus.Same;
 
             // Gate 3: Numbers identical at lower score
-            var n1 = TextNormaliser.ExtractNumbers(l1);
-            var n2 = TextNormaliser.ExtractNumbers(l2);
             if (n1.SetEquals(n2) && rawScore >= 0.80)
                 return DiffStatus.Same;
 
