@@ -2,7 +2,7 @@
 #  AFS PDF COMPARISON ANALYSER -- Launch Script
 #  Author  : Mamishi Tonny Madire
 #  Version : 4.4
-#  Usage   : Right-click -> "Run with PowerShell"  OR  run from any terminal
+#  Usage   : Run from PowerShell, or right-click -> "Run with PowerShell"
 # ==============================================================================
 
 # Capture script folder
@@ -72,25 +72,23 @@ Start-Sleep -Seconds 2
 Write-Host "Building project ..." -ForegroundColor Cyan
 Set-Location $projectDir
 
-$buildOutput = dotnet build --no-restore 2>&1
-$buildOk     = $buildOutput | Select-String "Build succeeded"
+$buildOutput  = dotnet build 2>&1
+$buildExitCode = $LASTEXITCODE
 
-if (-not $buildOk) {
-    $lockHit = $buildOutput | Select-String "CS2012|MSB3027|MSB3021"
-    if ($lockHit) {
-        Write-Host "File lock detected -- waiting 4 s and retrying ..." -ForegroundColor Yellow
-        Start-Sleep -Seconds 4
-        $buildOutput = dotnet build --no-restore 2>&1
-        $buildOk     = $buildOutput | Select-String "Build succeeded"
-    }
+$lockHit = $buildOutput | Select-String "CS2012|MSB3027|MSB3021"
+if ($buildExitCode -ne 0 -and $lockHit) {
+    Write-Host "File lock detected -- waiting 4 s and retrying ..." -ForegroundColor Yellow
+    Start-Sleep -Seconds 4
+    $buildOutput   = dotnet build 2>&1
+    $buildExitCode = $LASTEXITCODE
 }
 
-if (-not $buildOk) {
+if ($buildExitCode -ne 0) {
     Write-Host ""
     Write-Host "BUILD FAILED" -ForegroundColor Red
-    $buildOutput | Select-String "error CS|error MSB" | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+    $buildOutput | ForEach-Object { Write-Host $_ -ForegroundColor Red }
     Read-Host "Press Enter to exit"
-    exit 1
+    exit $buildExitCode
 }
 
 Write-Host "Build OK" -ForegroundColor Green
@@ -99,8 +97,24 @@ Write-Host "Starting web server at $url ..." -ForegroundColor Cyan
 Write-Host "Press Ctrl+C in this window to stop the server." -ForegroundColor Yellow
 Write-Host ""
 
-# Open browser after 6 s (background process -- no admin needed)
-$browserCmd = "Start-Sleep -Seconds 6; Start-Process '" + $url + "'"
+# Wait for Kestrel to listen before opening the browser.
+$port = ([Uri]$url).Port
+$browserCmd = @'
+$deadline = (Get-Date).AddSeconds(60)
+do {
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $client.Connect("127.0.0.1", __PORT__)
+        $client.Close()
+        Start-Process "__URL__"
+        exit 0
+    } catch {
+        $client.Dispose()
+        Start-Sleep -Seconds 1
+    }
+} while ((Get-Date) -lt $deadline)
+'@
+$browserCmd = $browserCmd.Replace("__PORT__", [string]$port).Replace("__URL__", $url)
 Start-Process powershell.exe -ArgumentList @("-NoProfile", "-WindowStyle", "Hidden", "-Command", $browserCmd) -WindowStyle Hidden
 
 # Launch app
