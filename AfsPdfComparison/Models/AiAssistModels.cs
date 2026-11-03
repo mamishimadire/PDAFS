@@ -29,6 +29,9 @@ public class AiSectionDiff
     public string Afs2Summary { get; set; } = string.Empty;
     public string ChangeDescription { get; set; } = string.Empty;
     public List<string> ChangedValues { get; set; } = new();
+    public int? PageAfs1 { get; set; }
+    public int? PageAfs2 { get; set; }
+    public int? PairIndex { get; set; }
 }
 
 public class AiLineItemChange
@@ -38,6 +41,9 @@ public class AiLineItemChange
     public string ValueInAfs2 { get; set; } = string.Empty;
     public string PctChange { get; set; } = string.Empty;
     public string MaterialityNote { get; set; } = string.Empty;
+    public int? PageAfs1 { get; set; }
+    public int? PageAfs2 { get; set; }
+    public int? PairIndex { get; set; }
 }
 
 public class AiAssistResult

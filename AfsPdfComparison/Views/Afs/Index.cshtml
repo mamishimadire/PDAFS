@@ -72,9 +72,11 @@
         </div>
 
         <div style="margin-top:8px;padding:0 10px">
-            <div style="background:rgba(200,16,46,0.18);border:1px solid rgba(200,16,46,0.3);border-radius:10px;padding:9px 12px">
-                <div style="color:#ff9ab1;font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px">Boost Status</div>
-                <div style="color:rgba(255,255,255,0.8);font-size:11.5px">Active</div>
+            <div class="boost-status-card" id="boost-status-card">
+                <div class="boost-status-label">Boost Status</div>
+                <div class="boost-status-value" id="boost-status-value">Checking...</div>
+                <div id="boost-status-summary" style="display:none"></div>
+                <div class="boost-status-lights" id="boost-status-lights"></div>
             </div>
         </div>
     </nav>

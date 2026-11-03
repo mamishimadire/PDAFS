@@ -43,16 +43,23 @@ public class ComparisonService
     private readonly LineComparatorService _comparator;
     private readonly SmartComparisonOrchestrator _smartOrchestrator;
     private readonly DocumentIntelligenceService _documentIntelligence;
+    private readonly AutoReviewEngine _autoReview;
+    private readonly TableDiffService _tableDiff;
+
     public ComparisonService(
         PageAlignmentService  aligner,
         LineComparatorService comparator,
         SmartComparisonOrchestrator smartOrchestrator,
-        DocumentIntelligenceService documentIntelligence)
+        DocumentIntelligenceService documentIntelligence,
+        AutoReviewEngine autoReview,
+        TableDiffService tableDiff)
     {
         _aligner              = aligner;
         _comparator           = comparator;
         _smartOrchestrator    = smartOrchestrator;
         _documentIntelligence = documentIntelligence;
+        _autoReview           = autoReview;
+        _tableDiff            = tableDiff;
     }
 
     /// <summary>
@@ -61,8 +68,16 @@ public class ComparisonService
     /// </summary>
     /// <param name="report1">Baseline AFS (first uploaded).</param>
     /// <param name="report2">Comparand AFS (second uploaded).</param>
+    /// <param name="includeDeferredInsights">
+    /// When true, also computes the heavier semantic section analyses.
+    /// The Step 4 UI does not need those to render, so the fast path leaves them out.
+    /// </param>
     /// <returns>Populated <see cref="ComparisonResult"/>.</returns>
-    public async Task<ComparisonResult> BuildComparisonAsync(PdfReport report1, PdfReport report2, CancellationToken cancellationToken = default)
+    public async Task<ComparisonResult> BuildComparisonAsync(
+        PdfReport report1,
+        PdfReport report2,
+        CancellationToken cancellationToken = default,
+        bool includeDeferredInsights = false)
     {
         var sw = Stopwatch.StartNew();
         // ── 4.1  Smart page alignment ──────────────────────────────────────
@@ -91,6 +106,11 @@ public class ComparisonService
             .ToList();
         Console.WriteLine($"[Compare] Page diffs completed in {sw.ElapsedMilliseconds} ms");
 
+        // ── 4.4b  Cross-page move detection ───────────────────────────────
+        // Reclassifies removed+added pairs that match as "moved" to reduce noise.
+        DetectMovedContent(fullDiff, pageDiffs);
+        Console.WriteLine($"[Compare] Move detection completed in {sw.ElapsedMilliseconds} ms");
+
         // ── 4.5  Count aggregation ─────────────────────────────────────────
         var counts = fullDiff
             .GroupBy(d => d.Status is "same" or "same-cross-page" ? "same" : d.Status)
@@ -98,24 +118,31 @@ public class ComparisonService
         SmartComparisonResult? smartResult = null;
         DocumentComparisonReport? documentResult = null;
 
-        try
+        if (includeDeferredInsights)
         {
-            smartResult = _smartOrchestrator.Compare(report1, report2);
-            Console.WriteLine($"[Compare] Smart comparison completed in {sw.ElapsedMilliseconds} ms");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[Compare] Smart comparison failed: {ex.Message}");
-        }
+            try
+            {
+                smartResult = _smartOrchestrator.Compare(report1, report2);
+                Console.WriteLine($"[Compare] Smart comparison completed in {sw.ElapsedMilliseconds} ms");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Compare] Smart comparison failed: {ex.Message}");
+            }
 
-        try
-        {
-            documentResult = _documentIntelligence.Compare(report1, report2);
-            Console.WriteLine($"[Compare] Document intelligence completed in {sw.ElapsedMilliseconds} ms");
+            try
+            {
+                documentResult = _documentIntelligence.Compare(report1, report2);
+                Console.WriteLine($"[Compare] Document intelligence completed in {sw.ElapsedMilliseconds} ms");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Compare] Document intelligence failed: {ex.Message}");
+            }
         }
-        catch (Exception ex)
+        else
         {
-            Console.WriteLine($"[Compare] Document intelligence failed: {ex.Message}");
+            Console.WriteLine($"[Compare] Deferred semantic analysis skipped; total pipeline {sw.ElapsedMilliseconds} ms");
         }
 
         var result = new ComparisonResult
@@ -132,9 +159,91 @@ public class ComparisonService
             ComparedAt = DateTime.UtcNow,
         };
 
-        Console.WriteLine($"[Compare] Deterministic comparison completed in {sw.ElapsedMilliseconds} ms");
+        // ── 4.6  Auto-review engine (deterministic — no AI required) ───────
+        try
+        {
+            var (autoFindings, labeledChanges) = _autoReview.GenerateFindings(result);
+            result.AutoReview            = autoFindings;
+            result.LabeledNumberChanges  = labeledChanges;
+            Console.WriteLine($"[Compare] Auto-review generated {autoFindings.Count} finding(s) in {sw.ElapsedMilliseconds} ms");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Compare] Auto-review failed (non-fatal): {ex.Message}");
+        }
+
+        // ── 4.7  Table cell-level diff (#3) ───────────────────────────────
+        try
+        {
+            result.TableCellDiffs = _tableDiff.Diff(result);
+            Console.WriteLine($"[Compare] Table diff: {result.TableCellDiffs.Count} cell change(s) in {sw.ElapsedMilliseconds} ms");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Compare] Table diff failed (non-fatal): {ex.Message}");
+        }
+
+        Console.WriteLine($"[Compare] Core comparison completed in {sw.ElapsedMilliseconds} ms");
         // AI analysis runs separately via /api/ai-analyze — does not block this response
         return result;
+    }
+
+    // ── Move detection ────────────────────────────────────────────────────────
+    private static void DetectMovedContent(List<LineDiffResult> fullDiff, List<PageDiffResult> pageDiffs)
+    {
+        // Only operate on non-trivially short lines
+        var removed = fullDiff
+            .Where(d => d.Status == "removed" && (d.Line1?.Length ?? 0) >= 30)
+            .ToList();
+        var added = fullDiff
+            .Where(d => d.Status == "added" && (d.Line2?.Length ?? 0) >= 30)
+            .ToList();
+
+        if (removed.Count == 0 || added.Count == 0) return;
+
+        // O(n²) but with short-circuit — only matters for large docs
+        // Cap at 200 candidates each to avoid performance issues
+        var removedSample = removed.Take(200).ToList();
+        var addedSample   = added.Take(200).ToList();
+
+        var reclassifiedAdded = new HashSet<LineDiffResult>(ReferenceEqualityComparer.Instance);
+
+        foreach (var rem in removedSample)
+        {
+            string norm1 = Normalise(rem.Line1 ?? "");
+            if (norm1.Length < 20) continue;
+
+            foreach (var add in addedSample)
+            {
+                if (reclassifiedAdded.Contains(add)) continue;
+                string norm2 = Normalise(add.Line2 ?? "");
+                if (norm2.Length < 20) continue;
+
+                double sim = PageAlignmentService.SequenceSimilarity(norm1, norm2);
+                if (sim >= 0.94)
+                {
+                    rem.Status = "moved";
+                    add.Status = "moved";
+                    reclassifiedAdded.Add(add);
+                    break;
+                }
+            }
+        }
+
+        // Recompute per-page issue counts after reclassification
+        foreach (var pd in pageDiffs)
+        {
+            pd.Changed = pd.Diffs.Count(d => d.Status == "changed");
+            pd.Added   = pd.Diffs.Count(d => d.Status == "added");
+            pd.Removed = pd.Diffs.Count(d => d.Status == "removed");
+            pd.Same    = pd.Diffs.Count(d => d.Status == "same" || d.Status == "same-cross-page");
+        }
+    }
+
+    private static string Normalise(string s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) return "";
+        return System.Text.RegularExpressions.Regex.Replace(s.ToLowerInvariant().Trim(), @"\s+", " ");
     }
 
 }

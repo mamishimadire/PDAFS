@@ -60,6 +60,7 @@ public class AfsController : Controller
     private readonly WorkingPaperExportService          _wpExporter;
     private readonly MultiAiOrchestrator                 _multiAi;
     private readonly AiContentReaderService              _aiContentReader;
+    private readonly AiBackendStatusService              _aiBackendStatus;
 
     public AfsController(
         PageExtractorService              extractor,
@@ -71,7 +72,8 @@ public class AfsController : Controller
         PageSnapshotService               snapshots,
         WorkingPaperExportService         wpExporter,
         MultiAiOrchestrator               multiAi,
-        AiContentReaderService            aiContentReader)
+        AiContentReaderService            aiContentReader,
+        AiBackendStatusService            aiBackendStatus)
     {
         _extractor       = extractor;
         _comparer        = comparer;
@@ -83,6 +85,7 @@ public class AfsController : Controller
         _wpExporter      = wpExporter;
         _multiAi         = multiAi;
         _aiContentReader = aiContentReader;
+        _aiBackendStatus = aiBackendStatus;
     }
 
     private string SessionId => HttpContext.Session.Id;
@@ -693,58 +696,51 @@ public class AfsController : Controller
         if (!reports.Any())
             return Json(new { success = false, message = "No PDFs in queue." });
 
-        var results  = new List<object>();
-        var errors   = new List<string>();
+        var results = new List<object>();
+        var errors  = new List<string>();
+        var ct      = HttpContext.RequestAborted;
 
         for (int i = 0; i < reports.Count; i++)
         {
             var r = reports[i];
             try
             {
-                var extracted  = await _extractor.ExtractAsync(r.PdfPath, r.Filename, HttpContext.RequestAborted);
+                var extracted = await _extractor.ExtractAsync(r.PdfPath, r.Filename, ct);
                 extracted.Label   = "AFS " + (i + 1);
                 extracted.PdfPath = r.PdfPath;
                 reports[i]        = extracted;
                 results.Add(new
                 {
-                    label     = extracted.Label,
-                    filename  = extracted.Filename,
-                    docType   = extracted.DocType,
-                    year      = extracted.PrimaryYear?.ToString() ?? "unknown",
-                    pages     = extracted.PageCount,
-                    words     = extracted.WordCount,
+                    label    = extracted.Label,
+                    filename = extracted.Filename,
+                    docType  = extracted.DocType,
+                    year     = extracted.PrimaryYear?.ToString() ?? "unknown",
+                    pages    = extracted.PageCount,
+                    words    = extracted.WordCount,
                 });
                 if (extracted.WordCount == 0)
                 {
                     string reason =
                         extracted.DocType?.Contains("invalid streams", StringComparison.OrdinalIgnoreCase) == true
-                            ? "PDF structure is damaged (invalid compressed streams). Re-export it from the source system, or Print to PDF, then extract again."
+                            ? "PDF structure is damaged. Re-export from the source system or Print to PDF, then extract again."
                         : extracted.DocType?.Contains("AI OCR key missing", StringComparison.OrdinalIgnoreCase) == true
-                            ? "The PDF needs OCR, but Gemini OCR is not enabled yet. Set GEMINI_API_KEY or install Tesseract, then extract again."
+                            ? "The PDF needs OCR but GEMINI_API_KEY is not set. Add the key to .env or install Tesseract."
                         : extracted.DocType?.Contains("AI OCR disabled", StringComparison.OrdinalIgnoreCase) == true
-                            ? "The PDF needs OCR, but AI OCR is disabled in configuration. Enable AiOcr or install Tesseract, then extract again."
+                            ? "The PDF needs OCR but AI OCR is disabled. Enable AiOcr or install Tesseract."
                         : extracted.DocType?.Contains("AI OCR failed", StringComparison.OrdinalIgnoreCase) == true
-                            ? "The PDF appears image-based and local OCR did not recover text. Gemini OCR fallback was attempted but failed. Retry extraction or review the AI OCR configuration."
+                            ? "Image-based PDF — local OCR and AI OCR both failed. Retry or review the AI OCR configuration."
                         : extracted.DocType?.Contains("OCR unavailable", StringComparison.OrdinalIgnoreCase) == true
-                            ? "PDF pages could be rendered, but no OCR engine is installed on this machine. Install Tesseract or re-save the PDF with selectable text."
+                            ? "No OCR engine found. Install Tesseract or re-save the PDF with selectable text."
                         : extracted.DocType?.Contains("corrupted", StringComparison.OrdinalIgnoreCase) == true
-                            ? "PDF appears corrupted, not scanned. Re-save or repair the PDF and extract again."
+                            ? "PDF appears corrupted. Re-save or repair the file and try again."
                             : $"No readable text was recovered ({extracted.DocType}).";
-                    errors.Add($"AFS {i+1} - {r.Filename}: {reason}");
+                    errors.Add($"AFS {i + 1} — {r.Filename}: {reason}");
                 }
             }
             catch (Exception ex)
             {
-                errors.Add($"AFS {i+1} — {r.Filename}: {ex.Message}");
-                results.Add(new
-                {
-                    label    = "AFS " + (i + 1),
-                    filename = r.Filename,
-                    docType  = "error",
-                    year     = "",
-                    pages    = 0,
-                    words    = 0,
-                });
+                results.Add(new { label = "AFS " + (i + 1), filename = r.Filename, docType = "error", year = "", pages = 0, words = 0 });
+                errors.Add($"AFS {i + 1} — {r.Filename}: {ex.Message}");
             }
         }
 
@@ -960,12 +956,88 @@ public class AfsController : Controller
                 totalChanged = result.ChangedLines.Count(),
                 totalAdded   = result.AddedLines.Count(),
                 totalRemoved = result.RemovedLines.Count(),
+                autoReview   = result.AutoReview.Select(f => new
+                {
+                    id           = f.Id,
+                    category     = f.Category,
+                    title        = f.Title,
+                    description  = f.Description,
+                    severity     = f.Severity,
+                    pageAfs1     = f.PageAfs1,
+                    pageAfs2     = f.PageAfs2,
+                    pairIndex    = f.PairIndex,
+                    before       = f.Before,
+                    after        = f.After,
+                    pctChange    = f.PctChange,
+                    absChange    = f.AbsChange,
+                    confidence   = f.Confidence,
+                    sectionGroup = f.SectionGroup,
+                    signOff      = f.SignOff,
+                }).ToList(),
+                tableCellDiffs = result.TableCellDiffs.Select(t => new
+                {
+                    t.Row, t.Col, t.Label, t.ColHeader,
+                    t.ValueAfs1, t.ValueAfs2, t.Status, t.PctChange,
+                    t.PageAfs1, t.PageAfs2, t.PairIndex,
+                }).ToList(),
+                labeledNumberChanges = result.LabeledNumberChanges.Select(n => new
+                {
+                    label       = n.Label,
+                    rawBefore   = n.RawBefore,
+                    rawAfter    = n.RawAfter,
+                    before      = n.Before,
+                    after       = n.After,
+                    pctChange   = n.PctChange,
+                    absChange   = n.AbsChange,
+                    severity    = n.Severity,
+                    pageAfs1    = n.PageAfs1,
+                    pageAfs2    = n.PageAfs2,
+                    pairIndex   = n.PairIndex,
+                    signChanged = n.SignChanged,
+                }).ToList(),
+                materialityThreshold = result.MaterialityThreshold,
             });
         }
         catch (Exception ex)
         {
             return Json(new { success = false, message = "Comparison error: " + ex.Message });
         }
+    }
+
+    // ── API: Sign-off a System Review finding (#5) ───────────────────────────
+    [HttpPost("api/finding-signoff")]
+    [ValidateAntiForgeryToken]
+    public IActionResult ApiFindingSignoff([FromForm] string id, [FromForm] string action)
+    {
+        var cmp = GetActiveComparison();
+        if (cmp == null)
+            return Json(new { success = false, message = "No active comparison." });
+
+        var allowed = new HashSet<string> { "cleared", "query", "escalate", "" };
+        if (!allowed.Contains(action ?? ""))
+            return Json(new { success = false, message = "Invalid action." });
+
+        var finding = cmp.AutoReview.FirstOrDefault(f => f.Id == id);
+        if (finding == null)
+            return Json(new { success = false, message = "Finding not found." });
+
+        finding.SignOff = action ?? "";
+        StoreComparison(cmp);
+        return Json(new { success = true, id, action = finding.SignOff });
+    }
+
+    // ── API: Set materiality threshold (#6) ──────────────────────────────────
+    [HttpPost("api/materiality")]
+    [ValidateAntiForgeryToken]
+    public IActionResult ApiSetMateriality([FromForm] decimal threshold)
+    {
+        var cmp = GetActiveComparison();
+        if (cmp == null)
+            return Json(new { success = false, message = "No active comparison." });
+
+        cmp.MaterialityThreshold = Math.Max(0, threshold);
+        StoreComparison(cmp);
+        return Json(new { success = true, threshold = cmp.MaterialityThreshold });
     }
 
     // ── API: AI Analyze (runs after compare, non-blocking) ────────────────────
@@ -984,6 +1056,30 @@ public class AfsController : Controller
 
         cmp.AiAssist      = assistTask.Result;
         cmp.AiContentRead = readTask.Result;
+
+        // Resolve PairIndex on section diffs and line items using page numbers
+        if (cmp.AiContentRead?.SectionDiffs != null)
+        {
+            foreach (var s in cmp.AiContentRead.SectionDiffs)
+            {
+                if (s.PairIndex.HasValue) continue;
+                var pd = cmp.PageDiffs.FirstOrDefault(p =>
+                    (s.PageAfs1.HasValue && p.PageAfs1 == s.PageAfs1) ||
+                    (s.PageAfs2.HasValue && p.PageAfs2 == s.PageAfs2));
+                if (pd != null) s.PairIndex = pd.PairIndex;
+            }
+        }
+        if (cmp.AiContentRead?.LineItemChanges != null)
+        {
+            foreach (var l in cmp.AiContentRead.LineItemChanges)
+            {
+                if (l.PairIndex.HasValue) continue;
+                var pd = cmp.PageDiffs.FirstOrDefault(p =>
+                    (l.PageAfs1.HasValue && p.PageAfs1 == l.PageAfs1) ||
+                    (l.PageAfs2.HasValue && p.PageAfs2 == l.PageAfs2));
+                if (pd != null) l.PairIndex = pd.PairIndex;
+            }
+        }
 
         // Re-store so snapshot highlights can pick up AI severity
         StoreComparison(cmp);
@@ -1043,6 +1139,9 @@ public class AfsController : Controller
                     afs2Summary       = s.Afs2Summary,
                     changeDescription = s.ChangeDescription,
                     changedValues     = s.ChangedValues,
+                    pageAfs1          = s.PageAfs1,
+                    pageAfs2          = s.PageAfs2,
+                    pairIndex         = s.PairIndex,
                 }).ToList(),
                 lineItemChanges    = read.LineItemChanges.Select(l => new
                 {
@@ -1051,6 +1150,9 @@ public class AfsController : Controller
                     valueInAfs2     = l.ValueInAfs2,
                     pctChange       = l.PctChange,
                     materialityNote = l.MaterialityNote,
+                    pageAfs1        = l.PageAfs1,
+                    pageAfs2        = l.PageAfs2,
+                    pairIndex       = l.PairIndex,
                 }).ToList(),
                 newDisclosures     = read.NewDisclosures,
                 removedDisclosures = read.RemovedDisclosures,
@@ -1239,6 +1341,12 @@ public class AfsController : Controller
         return Json(new { queue, hasComparison = GetActiveComparison() != null });
     }
 
+    [HttpGet("api/model-status")]
+    public IActionResult ApiModelStatus()
+    {
+        return Json(_aiBackendStatus.GetSnapshot());
+    }
+
     private List<HighlightSpec> BuildSnapshotHighlightSpecs(
         ComparisonResult cmp,
         PageDiffResult pageDiff,
@@ -1268,10 +1376,9 @@ public class AfsController : Controller
             .ToDictionary(x => x.diff, x => x.ordinal);
         var aiFocusScores    = GetAiSnapshotFocusScores(cmp, pageDiff);
         var aiSeverityByOrd  = GetAiSnapshotSeverityByOrdinal(cmp, pageDiff);
+        var aiProtectedOrdinals = GetAiProtectedSnapshotOrdinals(aiFocusScores, aiSeverityByOrd);
 
         return relevantDiffs
-            .Where(d => !HasMirrorSnapshotMoveDiff(d, issueDiffs, afsNum))
-            .Where(d => !IsPageNumberOnlySnapshotDiff(d, afsNum))
             .Where((d, idx) => !ShouldSuppressSnapshotDiff(
                 d,
                 issueDiffs,
@@ -1280,7 +1387,8 @@ public class AfsController : Controller
                 siblingPageTexts,
                 oppositeReport.FullText,
                 hasStrongChangedContext,
-                HasSnapshotIssueCluster(relevantDiffs, idx, afsNum)))
+                HasSnapshotIssueCluster(relevantDiffs, idx, afsNum),
+                IsAiProtectedSnapshotDiff(d, issueOrdinals, aiProtectedOrdinals)))
             .OrderByDescending(d => GetAiSnapshotFocusScore(d, issueOrdinals, aiFocusScores))
             .ThenByDescending(d => d.Status == "changed")
             .ThenByDescending(d => d.NumDiff.Count)
@@ -1351,6 +1459,25 @@ public class AfsController : Controller
         }
 
         return result;
+    }
+
+    private static HashSet<int> GetAiProtectedSnapshotOrdinals(
+        IReadOnlyDictionary<int, int> aiFocusScores,
+        IReadOnlyDictionary<int, AiHighlightSeverity> aiSeverityByOrd)
+    {
+        return aiFocusScores.Keys
+            .Concat(aiSeverityByOrd.Keys)
+            .Where(o => o > 0)
+            .ToHashSet();
+    }
+
+    private static bool IsAiProtectedSnapshotDiff(
+        LineDiffResult diff,
+        IReadOnlyDictionary<LineDiffResult, int> issueOrdinals,
+        IReadOnlySet<int> aiProtectedOrdinals)
+    {
+        return issueOrdinals.TryGetValue(diff, out int ordinal) &&
+               aiProtectedOrdinals.Contains(ordinal);
     }
 
     private static void AddAiSnapshotFocusOrdinals(
@@ -1441,8 +1568,18 @@ public class AfsController : Controller
         IReadOnlyList<string> siblingPageTexts,
         string oppositeFullText,
         bool hasStrongChangedContext,
-        bool hasNearbyIssueCluster)
+        bool hasNearbyIssueCluster,
+        bool aiProtected)
     {
+        if (HasMirrorSnapshotMoveDiff(diff, peerDiffs, afsNum))
+            return true;
+
+        if (IsPageNumberOnlySnapshotDiff(diff, afsNum))
+            return true;
+
+        if (aiProtected)
+            return false;
+
         bool afs1 = afsNum == 1;
         string ownText = afs1 ? (diff.Line1 ?? "") : (diff.Line2 ?? "");
         string otherText = afs1 ? (diff.Line2 ?? "") : (diff.Line1 ?? "");
@@ -1468,7 +1605,10 @@ public class AfsController : Controller
 
         if (diff.Status is "added" or "removed")
         {
-            if (IsPureNumericSnapshotLine(ownText))
+            // Only suppress pure-numeric lines that are short standalone page stamps (≤8 chars).
+            // Financial table rows like "(155 190 247) (155 186 940)" are pure-numeric but LONG
+            // and must be highlighted — they represent real financial differences.
+            if (IsPureNumericSnapshotLine(ownText) && ownText.Trim().Length <= 8)
                 return true;
 
             int ownAnchorCount = CountSnapshotLexicalAnchors(ownText);
@@ -2113,8 +2253,10 @@ public class AfsController : Controller
         if (onlyNumbersChanged)
         {
             spec.ChangedWords.Clear();
-            spec.AnchorWords.Clear();
-            spec.ChangedPhrases.Clear();
+            if (lineText.Length > 0)
+            {
+                spec.ChangedPhrases = new List<string> { lineText };
+            }
             spec.WholeLineMode = true;
         }
 
@@ -2282,6 +2424,85 @@ public class AfsController : Controller
             .Where(w => SnapTokenNormRaw(w).Length > 0)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    private static bool HasStrongSnapshotLineMatch(
+        string lineNorm,
+        string specNorm,
+        HighlightSpec spec,
+        HashSet<string> lineTokenSet,
+        double phraseMatch)
+    {
+        if (lineNorm.Length == 0 || specNorm.Length == 0)
+            return false;
+
+        if (lineNorm == specNorm)
+            return true;
+
+        var changedTokens = spec.ChangedWords
+            .Select(SnapTokenNormRaw)
+            .Where(token => token.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var anchorTokens = spec.AnchorWords
+            .Select(SnapTokenNormRaw)
+            .Where(token => token.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        int changedHits = changedTokens.Count(lineTokenSet.Contains);
+        int anchorHits = anchorTokens.Count(lineTokenSet.Contains);
+        bool orderedFragment = IsOrderedSnapshotFragmentMatch(lineNorm, specNorm);
+
+        if (changedTokens.Count > 0)
+        {
+            if (changedHits == 0)
+                return false;
+
+            int requiredAnchorHits = Math.Min(2, anchorTokens.Count);
+            bool hasAnchorContext = requiredAnchorHits > 0 && anchorHits >= requiredAnchorHits;
+            return orderedFragment || hasAnchorContext || phraseMatch >= 0.8;
+        }
+
+        if (spec.WholeLineMode)
+        {
+            int requiredAnchorHits = Math.Min(2, anchorTokens.Count);
+            bool hasAnchorContext = requiredAnchorHits > 0 && anchorHits >= requiredAnchorHits;
+            return orderedFragment && (hasAnchorContext || phraseMatch >= 0.8);
+        }
+
+        return orderedFragment;
+    }
+
+    private static bool IsOrderedSnapshotFragmentMatch(string firstNorm, string secondNorm)
+    {
+        var firstTokens = firstNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var secondTokens = secondNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (firstTokens.Length < 3 || secondTokens.Length < 3)
+            return false;
+
+        var shorter = firstTokens.Length <= secondTokens.Length ? firstTokens : secondTokens;
+        var longer = firstTokens.Length <= secondTokens.Length ? secondTokens : firstTokens;
+        if ((double)shorter.Length / longer.Length < 0.6)
+            return false;
+
+        for (int start = 0; start <= longer.Length - shorter.Length; start++)
+        {
+            bool matches = true;
+            for (int offset = 0; offset < shorter.Length; offset++)
+            {
+                if (!string.Equals(longer[start + offset], shorter[offset], StringComparison.Ordinal))
+                {
+                    matches = false;
+                    break;
+                }
+            }
+
+            if (matches)
+                return true;
+        }
+
+        return false;
     }
 
     private static double SnapshotPhraseMatchScore(SnapshotRenderLine line, List<string> phrases)
@@ -2740,6 +2961,16 @@ public class AfsController : Controller
                     double phraseMatch = hasUsefulPhrase
                         ? SnapshotPhraseMatchScore(renderLines[lineIndex], spec.ChangedPhrases)
                         : 0.0;
+                    if (!HasStrongSnapshotLineMatch(
+                            renderLines[lineIndex].NormalizedText,
+                            specNorm,
+                            spec,
+                            lineTokenSet,
+                            phraseMatch))
+                    {
+                        continue;
+                    }
+
                     double score;
 
                     if (specChangedTokens.Count > 0 || specAnchorTokens.Count > 0)

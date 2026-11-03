@@ -36,7 +36,6 @@ public class SmartDiff
 /// </summary>
 public class SmartDiffEngine
 {
-    private const double ExactThreshold = 0.96;
     private const double RelatedThreshold = 0.50;
 
     public List<SmartDiff> Compare(
@@ -206,20 +205,14 @@ public class SmartDiffEngine
 
     private SmartDiff CompareParagraphBlocks(SemanticBlock p1, SemanticBlock p2, double topicScore)
     {
-        if (p1.NormText == p2.NormText)
+        if (TextNormaliser.Canonicalise(p1.NormText) ==
+            TextNormaliser.Canonicalise(p2.NormText))
             return MakeSame(p1, p2);
 
         double fullSim = PageAlignmentService.SequenceSimilarity(p1.NormText, p2.NormText);
-        if (fullSim >= ExactThreshold)
-            return MakeSame(p1, p2);
-
-        if (IsLineWrapArtefact(p1.NormText, p2.NormText))
-            return MakeSame(p1, p2);
 
         var n1 = new HashSet<string>(p1.Numbers);
         var n2 = new HashSet<string>(p2.Numbers);
-        if (n1.SetEquals(n2) && fullSim >= 0.85)
-            return MakeSame(p1, p2);
 
         bool isMaterial =
             !n1.SetEquals(n2) ||
@@ -291,7 +284,6 @@ public class SmartDiffEngine
             var status = DetermineLineStatus(
                 b1block.NormText,
                 b2block.NormText,
-                bestScore,
                 b1block.Numbers,
                 b2block.Numbers);
 
@@ -320,7 +312,6 @@ public class SmartDiffEngine
     private static SmartChangeType DetermineLineStatus(
         string n1,
         string n2,
-        double score,
         List<string> nums1,
         List<string> nums2)
     {
@@ -332,15 +323,10 @@ public class SmartDiffEngine
         if (c1 == c2)
             return SmartChangeType.FormattingOnly;
 
-        if (score >= ExactThreshold)
-            return SmartChangeType.Same;
-
         var ns1 = new HashSet<string>(nums1);
         var ns2 = new HashSet<string>(nums2);
-        if (ns1.SetEquals(ns2) && score >= 0.80)
-            return SmartChangeType.Same;
 
-        if (IsLineWrapArtefact(n1, n2))
+        if (ns1.SetEquals(ns2) && IsLineWrapArtefact(n1, n2))
             return SmartChangeType.Same;
 
         var w1 = new HashSet<string>(
@@ -350,7 +336,10 @@ public class SmartDiffEngine
             n2.Split(' ', StringSplitOptions.RemoveEmptyEntries),
             StringComparer.OrdinalIgnoreCase);
 
-        if (w1.SetEquals(w2) && ns1.SetEquals(ns2))
+        if (w1.Count is > 0 and <= 4 &&
+            w2.Count is > 0 and <= 4 &&
+            w1.SetEquals(w2) &&
+            ns1.SetEquals(ns2))
             return SmartChangeType.FormattingOnly;
 
         return SmartChangeType.LineChanged;
@@ -414,29 +403,21 @@ public class SmartDiffEngine
 
     private static bool IsLineWrapArtefact(string n1, string n2)
     {
-        var w1 = new HashSet<string>(
-            n1.Split(' ', StringSplitOptions.RemoveEmptyEntries),
-            StringComparer.OrdinalIgnoreCase);
-        var w2 = new HashSet<string>(
-            n2.Split(' ', StringSplitOptions.RemoveEmptyEntries),
-            StringComparer.OrdinalIgnoreCase);
-
-        if (w1.Count < 4 || w2.Count < 4)
+        string[] words1 = AggressiveCanon(n1).Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        string[] words2 = AggressiveCanon(n2).Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (words1.Length < 4 || words2.Length < 4)
             return false;
 
-        var shorter = w1.Count <= w2.Count ? w1 : w2;
-        var longer = w1.Count <= w2.Count ? w2 : w1;
-        string sText = w1.Count <= w2.Count ? n1 : n2;
-        string lText = w1.Count <= w2.Count ? n2 : n1;
+        var shorter = words1.Length <= words2.Length ? words1 : words2;
+        var longer = words1.Length <= words2.Length ? words2 : words1;
+        string shorterText = words1.Length <= words2.Length ? n1 : n2;
+        bool endsWithSentenceStop = shorterText.Length > 0 &&
+                                    shorterText[^1] is '.' or '!' or '?';
+        double lengthRatio = (double)shorter.Length / longer.Length;
 
-        int hits = shorter.Count(w => longer.Contains(w));
-        double overlap = (double)hits / shorter.Count;
-        double lenRatio = (double)shorter.Count / longer.Count;
-
-        bool isPrefix = lText.StartsWith(sText, StringComparison.OrdinalIgnoreCase) &&
-                        !sText[^1..].Contains('.');
-
-        return (overlap >= 0.85 && lenRatio >= 0.55) || isPrefix;
+        return !endsWithSentenceStop &&
+               lengthRatio >= 0.55 &&
+               longer.Take(shorter.Length).SequenceEqual(shorter, StringComparer.OrdinalIgnoreCase);
     }
 
     private static string StripNumbers(string text) =>

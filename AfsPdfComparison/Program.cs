@@ -17,6 +17,8 @@
 using AfsPdfComparison.Services;
 using QuestPDF.Infrastructure;
 
+DotEnvLoader.LoadIfPresent();
+
 var builder = WebApplication.CreateBuilder(args);
 
 builder.WebHost.ConfigureKestrel(opts =>
@@ -67,8 +69,12 @@ builder.Services.AddSingleton<DocumentIntelligenceService>();
 builder.Services.AddSingleton<AiComparisonAssistantService>();
 builder.Services.AddSingleton<AiContentReaderService>();
 builder.Services.AddSingleton<OpenAiCompatibleAiService>();
+builder.Services.AddSingleton<AiBackendStatusService>();
 builder.Services.AddSingleton<MultiAiOrchestrator>();
 builder.Services.AddSingleton<ComparisonRuntimeStore>();
+builder.Services.AddSingleton<LabeledNumberExtractor>();
+builder.Services.AddSingleton<AutoReviewEngine>();
+builder.Services.AddSingleton<TableDiffService>();
 builder.Services.AddSingleton<ComparisonService>();
 builder.Services.AddSingleton<ExportService>();
 builder.Services.AddScoped<SessionStateService>();

@@ -116,6 +116,47 @@ function refreshDashboard() {
     if (stageEl) stageEl.textContent = currentWorkflowStage();
 }
 
+function renderModelStatus(status) {
+    const card = document.getElementById('boost-status-card');
+    const valueEl = document.getElementById('boost-status-value');
+    const summaryEl = document.getElementById('boost-status-summary');
+    const lightsEl = document.getElementById('boost-status-lights');
+    if (!card || !valueEl || !summaryEl || !lightsEl) return;
+
+    const providers = Array.isArray(status && status.providers) ? status.providers : [];
+    const boostActive = !!(status && status.boostActive);
+
+    card.classList.toggle('is-active', boostActive);
+    card.classList.toggle('is-inactive', !boostActive);
+    valueEl.textContent = boostActive ? 'Active' : 'Inactive';
+    summaryEl.textContent = '';
+
+    lightsEl.innerHTML = providers.map(provider => {
+        const active = !!provider.active;
+        const stateClass = active ? 'is-active' : 'is-inactive';
+        return `<span class="boost-model-light ${stateClass}" data-key="${esc((provider.key || '').toLowerCase())}">
+            <span class="boost-model-light-dot"></span>
+        </span>`;
+    }).join('');
+
+    if (!providers.length) {
+        lightsEl.innerHTML = `<span class="boost-model-light is-inactive"><span class="boost-model-light-dot"></span></span>`;
+    }
+}
+
+async function loadModelStatus() {
+    try {
+        const status = await apiGetJson('/api/model-status');
+        renderModelStatus(status);
+    } catch (e) {
+        renderModelStatus({
+            boostActive: false,
+            summary: 'Model status unavailable right now.',
+            providers: []
+        });
+    }
+}
+
 function focusStep(step) {
     openAcc(step);
     setActiveStep(step);
@@ -139,6 +180,56 @@ function showBanner(containerId, msg, type) {
     el.innerHTML = `<div style="background:${c}22;border-left:4px solid ${c};padding:9px 14px;border-radius:5px;margin:5px 0;font-family:'IBM Plex Sans',sans-serif;font-size:13px;font-weight:600;color:${c}">${esc(msg)}</div>`;
 }
 
+function friendlyRequestError(err, timeoutMs) {
+    if (err && err.name === 'AbortError') {
+        return `Request timed out after ${Math.round(timeoutMs / 1000)}s.`;
+    }
+
+    const msg = String(err && err.message ? err.message : '').trim();
+    if (!msg) {
+        return 'The request could not be completed. Please retry.';
+    }
+
+    if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || msg.includes('Load failed')) {
+        return 'Unable to reach the server. Please retry.';
+    }
+
+    return msg;
+}
+
+async function apiGetJson(url, options = {}) {
+    const timeoutMs = options.timeoutMs || 15000;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+        const r = await fetch(url, {
+            method: 'GET',
+            signal: controller.signal,
+            headers: { 'Accept': 'application/json' }
+        });
+
+        if (!r.ok) {
+            throw new Error(`Server returned HTTP ${r.status}.`);
+        }
+
+        const body = (await r.text()).trim();
+        if (!body) {
+            throw new Error('Server returned an empty response.');
+        }
+
+        try {
+            return JSON.parse(body);
+        } catch {
+            throw new Error('Server returned an invalid response.');
+        }
+    } catch (err) {
+        throw new Error(friendlyRequestError(err, timeoutMs));
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
 async function apiPost(url, formData, options = {}) {
     const timeoutMs = options.timeoutMs || 30000;
     const controller = new AbortController();
@@ -160,8 +251,7 @@ async function apiPost(url, formData, options = {}) {
         const body = (raw || '').trim();
 
         if (!r.ok) {
-            const preview = body ? `: ${body.substring(0, 180)}` : '';
-            throw new Error(`HTTP ${r.status}${preview}`);
+            throw new Error(`Server returned HTTP ${r.status}.`);
         }
 
         if (!body) {
@@ -171,13 +261,10 @@ async function apiPost(url, formData, options = {}) {
         try {
             return JSON.parse(body);
         } catch {
-            throw new Error(`Server returned invalid JSON: ${body.substring(0, 180)}`);
+            throw new Error('Server returned an invalid response.');
         }
     } catch (err) {
-        if (err && err.name === 'AbortError') {
-            throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s.`);
-        }
-        throw err;
+        throw new Error(friendlyRequestError(err, timeoutMs));
     } finally {
         clearTimeout(timeout);
     }
@@ -443,7 +530,7 @@ async function runComparison() {
         return;
     }
 
-    setStatus('compare-status', 'Running comparison... Deep comparisons can take several minutes.', 'info');
+    setStatus('compare-status', 'Running comparison... Core page diff can take a few minutes on large PDFs.', 'info');
     progWrap.style.display = 'block';
     results.innerHTML      = '';
     if (runBtn) runBtn.disabled = true;
@@ -455,22 +542,27 @@ async function runComparison() {
         { pct: 22,  msg: 'Extracting text from all pages…' },
         { pct: 38,  msg: 'Running line-by-line comparison…' },
         { pct: 52,  msg: 'Computing word-level differences…' },
-        { pct: 64,  msg: 'Building snapshot highlights…' },
-        { pct: 75,  msg: 'Rendering page snapshots…' },
-        { pct: 84,  msg: 'Finalising comparison results…' },
-        { pct: 91,  msg: 'Almost done — preparing report…' },
+        { pct: 64,  msg: 'Building snapshot highlights...' },
+        { pct: 75,  msg: 'Rendering page snapshots...' },
+        { pct: 84,  msg: 'Finalising comparison results...' },
+        { pct: 91,  msg: 'Core page diff still running...' },
     ];
     let pct = 0, stageIdx = 0;
     const startTime = Date.now();
+    const formatElapsed = (elapsedSeconds) => {
+        const mins = Math.floor(elapsedSeconds / 60);
+        const secs = elapsedSeconds % 60;
+        return `${mins}:${String(secs).padStart(2, '0')}`;
+    };
     const timer = setInterval(() => {
-        const elapsed = (Date.now() - startTime) / 1000;
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
         // Advance through stages based on elapsed time (each stage ~7-10 s)
         while (stageIdx < stages.length - 1 && elapsed > (stageIdx + 1) * 8) stageIdx++;
         const target = stages[stageIdx].pct;
         pct += (target - pct) * 0.12;
         const shown = Math.min(pct, 91);
         progBar.style.width = shown + '%';
-        progLbl.textContent = stages[stageIdx].msg;
+        progLbl.textContent = `${stages[stageIdx].msg} Elapsed ${formatElapsed(elapsed)}.`;
     }, 300);
 
     const finishProgress = (success) => {
@@ -505,51 +597,63 @@ async function runComparison() {
 
 // Fires after comparison renders — calls /api/ai-analyze in background
 // then patches the Insights tab without a full re-render.
-async function runAiAnalysis() {
+async function runAiAnalysis(isRetry = false) {
     const insightsTab = document.getElementById('tab-ai');
     if (insightsTab) {
+        const msg = isRetry ? 'Switching to backup model — retrying…' : 'Deep analysis in progress…';
+        const sub = isRetry ? 'A different AI model is now processing your documents…' : 'Reading both documents and comparing changes…';
         insightsTab.innerHTML = `<div style="padding:20px;text-align:center;color:#A78BFA">
-            <div style="font-size:13px;font-weight:600;margin-bottom:8px">Deep analysis in progress…</div>
+            <div style="font-size:13px;font-weight:600;margin-bottom:8px">${msg}</div>
             <div style="width:100%;height:4px;background:#1E2F5A;border-radius:2px;overflow:hidden">
                 <div style="height:4px;background:linear-gradient(90deg,#7B4FFF,#C8102E);border-radius:2px;animation:afs-scan 1.6s ease-in-out infinite"></div>
             </div>
-            <div style="margin-top:8px;color:#475569;font-size:11.5px">Reading both documents and comparing changes…</div>
+            <div style="margin-top:8px;color:#475569;font-size:11.5px">${sub}</div>
         </div>`;
     }
     try {
-        const res = await apiPost('/api/ai-analyze', new FormData(), { timeoutMs: 300000 });
-        if (!res.success) {
+        const res = await apiPost('/api/ai-analyze', new FormData(), { timeoutMs: 360000 });
+        const aiReady   = res.aiAssist      && res.aiAssist.status      === 'ready';
+        const readReady = res.aiContentRead && res.aiContentRead.status === 'ready';
+
+        if (!res.success || (!aiReady && !readReady)) {
+            if (!isRetry) {
+                setTimeout(() => runAiAnalysis(true), 8000);
+                return;
+            }
             if (insightsTab) insightsTab.innerHTML = renderAiUnavailableNotice(
-                'Review currently unavailable. Please try again later.',
-                'The comparison result is still available — only the intelligent materiality review could not be completed at this time.');
+                'Intelligent review could not be completed.',
+                'All AI models returned errors. The document comparison is still available. You can retry below.',
+                true);
             return;
         }
-        // Patch the stored comparison data so snapshots use AI severity
         if (window._cmpData) {
             window._cmpData.aiAssist      = res.aiAssist      || null;
             window._cmpData.aiContentRead = res.aiContentRead || null;
         }
-        // Re-render just the Insights tab content
         const newHtml = renderAiReviewTab(res.aiAssist || null, res.aiContentRead || null);
         const wrap = document.createElement('div');
         wrap.innerHTML = newHtml;
         const newPanel = wrap.querySelector('#tab-ai');
         if (newPanel && insightsTab) {
-            newPanel.style.display = insightsTab.style.display; // keep visibility
+            newPanel.style.display = insightsTab.style.display;
             insightsTab.replaceWith(newPanel);
         }
         const findCount = res.aiAssist && res.aiAssist.materialFindings ? res.aiAssist.materialFindings.length : 0;
         setStatus('compare-status', `Comparison complete. ${findCount} insight(s) found.`, 'ok');
-        // Update the Insights tab badge count
         document.querySelectorAll('.afs-tab').forEach(btn => {
             if (btn.textContent.includes('Review')) {
                 btn.innerHTML = `Review <span class="afs-badge">${findCount}</span>`;
             }
         });
     } catch (e) {
+        if (!isRetry) {
+            setTimeout(() => runAiAnalysis(true), 8000);
+            return;
+        }
         if (insightsTab) insightsTab.innerHTML = renderAiUnavailableNotice(
-            'Review currently unavailable. Please try again later.',
-            'The comparison result is still available — only the intelligent materiality review could not be completed at this time.');
+            'Intelligent review could not be completed.',
+            'A network error occurred. The document comparison is still available. You can retry below.',
+            true);
     }
 }
 
@@ -560,6 +664,8 @@ function renderComparison(data) {
     const nc   = data.numCmp;
     const ai         = data.aiAssist || null;
     const aiRead     = data.aiContentRead || null;
+    const autoReview         = data.autoReview || [];
+    const materialityThresh  = data.materialityThreshold || 0;
     const total = c.total || 1;
     const pctAffected = ((c.changed + c.added + c.removed) / total * 100).toFixed(1);
     dashboardState.pairCount = data.pageDiffs ? data.pageDiffs.length : 0;
@@ -597,6 +703,7 @@ function renderComparison(data) {
         <button class="afs-tab" onclick="switchTab('tab-pagemap')">Page Map</button>
         <button class="afs-tab" onclick="switchTab('tab-visual')">📄 Visual</button>
         <button class="afs-tab" onclick="switchTab('tab-ai')">Review <span class="afs-badge">${ai && ai.materialFindings ? ai.materialFindings.length : 0}</span></button>
+        <button class="afs-tab" onclick="switchTab('tab-sysreview')">System Review <span class="afs-badge">${autoReview.length}</span></button>
         <button class="afs-tab" onclick="switchTab('tab-comments')">Comments</button>
     </div>
     <div class="afs-tab-content">`;
@@ -796,6 +903,9 @@ function renderComparison(data) {
         <div id="snap-results"></div>
     </div>`;
 
+    // ── Tab: System Review (deterministic — no AI required) ──────────────
+    html += renderSystemReviewTab(autoReview);
+
     // ── Tab: Comments ─────────────────────────────────────────────────────
     html += renderAiReviewTab(ai, aiRead);
 
@@ -811,6 +921,13 @@ function renderComparison(data) {
     // Store data for page diff viewer
     data._snapshotNonce = Date.now();
     window._cmpData = data;
+
+    // Pre-populate materiality threshold from server state
+    const matInput = document.getElementById('materiality-input');
+    if (matInput && materialityThresh > 0) {
+        matInput.value = materialityThresh;
+        applyMaterialityFilter();
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -950,16 +1067,254 @@ function jumpToPageSnapshot(pairIndex, afsNum) {
     }, 150);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SYSTEM REVIEW TAB — Deterministic audit findings (no AI required)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function renderSystemReviewTab(findings) {
+    let html = `<div id="tab-sysreview" class="afs-tab-pane" style="display:none">`;
+
+    // Header row with materiality control (#6)
+    html += `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0 8px">
+        <span style="color:#A78BFA;font-weight:700;font-size:13px">&#128269; SYSTEM REVIEW</span>
+        <span style="background:#7B4FFF22;border:1px solid #7B4FFF55;color:#C4B5FD;border-radius:999px;padding:1px 10px;font-size:10.5px;font-family:'IBM Plex Mono',monospace">Deterministic &#8212; no AI</span>
+        <span style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:11px;color:#94A3B8">
+            Materiality threshold:
+            <input id="materiality-input" type="number" min="0" step="1000" value="0"
+                style="width:90px;background:#0D1B2A;border:1px solid #334155;color:#E2E8F0;border-radius:5px;padding:2px 6px;font-size:11px;font-family:'IBM Plex Mono',monospace"
+                title="Hide findings where the absolute change is below this amount (0 = show all)"
+                oninput="applyMaterialityFilter()">
+            <span style="color:#475569">R</span>
+        </span>
+    </div>`;
+
+    if (!findings || findings.length === 0) {
+        html += `<div style="padding:24px;text-align:center;color:#64748B;font-size:13px;background:#0D1B2A;border-radius:8px;border:1px dashed #334155">
+            Documents are identical &#8212; no differences were detected.
+        </div></div>`;
+        return html;
+    }
+
+    // Summary bar
+    const high    = findings.filter(f => f.severity === 'high').length;
+    const medium  = findings.filter(f => f.severity === 'medium').length;
+    const low     = findings.filter(f => f.severity === 'low').length;
+    const changed = findings.filter(f => ['numeric-change','text-change','sign-change','policy-change','director-change','comparative-mismatch'].includes(f.category)).length;
+    const added   = findings.filter(f => ['content-added','section-added'].includes(f.category)).length;
+    const removed = findings.filter(f => ['content-removed','section-removed'].includes(f.category)).length;
+
+    html += `<div style="background:#0D1B2A;border:1px solid #1E3A5F;border-radius:10px;padding:10px 14px;margin-bottom:14px">
+        <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
+            <span style="color:#E2E8F0;font-weight:700;font-size:12px">${findings.length} system finding(s)</span>
+            ${high   > 0 ? `<span style="color:#EF4444;font-weight:700;font-size:11px">&#9679; ${high} HIGH</span>` : ''}
+            ${medium > 0 ? `<span style="color:#F59E0B;font-weight:700;font-size:11px">&#9679; ${medium} MEDIUM</span>` : ''}
+            ${low    > 0 ? `<span style="color:#60A5FA;font-size:11px">&#9679; ${low} LOW</span>` : ''}
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            ${changed  > 0 ? `<span style="background:#F59E0B18;border:1px solid #F59E0B44;color:#FDE68A;border-radius:6px;padding:3px 9px;font-size:10.5px;font-family:'IBM Plex Mono',monospace">~ ${changed} Changed</span>` : ''}
+            ${added    > 0 ? `<span style="background:#10B98118;border:1px solid #10B98144;color:#6EE7B7;border-radius:6px;padding:3px 9px;font-size:10.5px;font-family:'IBM Plex Mono',monospace">+ ${added} Added</span>` : ''}
+            ${removed  > 0 ? `<span style="background:#EF444418;border:1px solid #EF444444;color:#FCA5A5;border-radius:6px;padding:3px 9px;font-size:10.5px;font-family:'IBM Plex Mono',monospace">&#8722; ${removed} Removed</span>` : ''}
+        </div>
+    </div>`;
+
+    html += renderAutoReviewFindings(findings);
+    html += `</div>`;
+    return html;
+}
+
+// #6 — Apply materiality filter: hide findings below threshold client-side
+function applyMaterialityFilter() {
+    const threshold = parseFloat(document.getElementById('materiality-input')?.value || 0) || 0;
+    document.querySelectorAll('.sysreview-finding').forEach(el => {
+        const abs = parseFloat(el.dataset.abschange || 0);
+        // Show if: no threshold, no absChange (non-numeric), or above threshold
+        const hide = threshold > 0 && abs > 0 && abs < threshold;
+        el.style.display = hide ? 'none' : '';
+    });
+    // Also persist to server
+    if (threshold > 0) {
+        const fd = new FormData();
+        fd.append('threshold', threshold);
+        fetch('/api/materiality', { method:'POST', body: fd,
+            headers:{'RequestVerificationToken': document.querySelector('input[name="__RequestVerificationToken"]')?.value || ''} });
+    }
+}
+
+function renderAutoReviewFindings(findings) {
+    if (!findings || findings.length === 0) return '';
+
+    const catMeta = {
+        'sign-change':          { label:'Sign Reversals',        color:'#F87171', icon:'&#8645;' },
+        'policy-change':        { label:'Policy Changes',        color:'#FB923C', icon:'&#128196;' },
+        'director-change':      { label:'Key Personnel',         color:'#FBBF24', icon:'&#128100;' },
+        'section-added':        { label:'Pages Added',           color:'#34D399', icon:'+' },
+        'section-removed':      { label:'Pages Removed',         color:'#F87171', icon:'&#8722;' },
+        'numeric-change':       { label:'Numeric Changes',       color:'#A78BFA', icon:'#' },
+        'comparative-mismatch': { label:'Comparative Mismatch',  color:'#F472B6', icon:'&#8596;' },
+        'stale-reference':      { label:'Stale References',      color:'#FB923C', icon:'&#9875;' },
+        'content-added':        { label:'Content Added',         color:'#34D399', icon:'+' },
+        'content-removed':      { label:'Content Removed',       color:'#F87171', icon:'&#8722;' },
+        'text-change':          { label:'Text Changes',          color:'#94A3B8', icon:'T' },
+    };
+
+    // #1 — Group by sectionGroup (outer), then category (inner)
+    const sectionMap = {};
+    findings.forEach(f => {
+        const sec = f.sectionGroup || 'Other';
+        const cat = f.category || 'text-change';
+        if (!sectionMap[sec]) sectionMap[sec] = {};
+        if (!sectionMap[sec][cat]) sectionMap[sec][cat] = [];
+        sectionMap[sec][cat].push(f);
+    });
+
+    // Sort sections: "Other" last
+    const sections = Object.keys(sectionMap).sort((a,b) =>
+        a === 'Other' ? 1 : b === 'Other' ? -1 : a.localeCompare(b));
+
+    let html = '';
+    let globalIdx = 0;
+
+    sections.forEach(sec => {
+        const cats = sectionMap[sec];
+        const secTotal = Object.values(cats).reduce((s,a) => s + a.length, 0);
+        const secId = 'sec-' + sec.replace(/[^a-z0-9]/gi,'_');
+
+        html += `<div style="margin-bottom:18px">
+            <div onclick="toggleSection('${secId}')" style="display:flex;align-items:center;gap:8px;margin-bottom:8px;padding:5px 10px;background:#0D1B2A;border:1px solid #1E3A5F;border-radius:8px;cursor:pointer;user-select:none">
+                <span id="${secId}-arrow" style="color:#7B4FFF;font-size:12px;transition:transform 0.2s">&#9660;</span>
+                <span style="color:#C4B5FD;font-weight:700;font-size:12px;flex:1">${esc(sec)}</span>
+                <span style="background:#7B4FFF22;color:#A78BFA;border-radius:999px;padding:1px 9px;font-size:10px;font-family:'IBM Plex Mono',monospace">${secTotal}</span>
+            </div>
+            <div id="${secId}">`;
+
+        Object.keys(cats).forEach(cat => {
+            const items = cats[cat];
+            const meta  = catMeta[cat] || { label: cat, color:'#A78BFA', icon:'•' };
+
+            html += `<div style="margin-bottom:10px;padding-left:8px;border-left:2px solid ${meta.color}44">
+                <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+                    <span style="background:${meta.color}22;color:${meta.color};border-radius:5px;padding:1px 7px;font-size:10.5px;font-weight:700;font-family:'IBM Plex Mono',monospace">${meta.icon} ${esc(meta.label)}</span>
+                    <span style="color:#475569;font-size:10px">${items.length}</span>
+                </div>`;
+
+            items.forEach(f => {
+                globalIdx++;
+                const sev      = (f.severity || 'low').toLowerCase();
+                const sevColor = sev === 'high' ? '#EF4444' : sev === 'medium' ? '#F59E0B' : '#60A5FA';
+                const pairIdx  = typeof f.pairIndex === 'number' ? f.pairIndex : null;
+                const signOff  = f.signOff || '';
+
+                // #7 — Confidence badge
+                const conf = typeof f.confidence === 'number' ? f.confidence : null;
+                const confColor = conf === null ? '' : conf >= 80 ? '#10B981' : conf >= 60 ? '#F59E0B' : '#EF4444';
+                const confBadge = conf !== null
+                    ? `<span title="Confidence score: ${conf}/100" style="background:${confColor}22;border:1px solid ${confColor}55;color:${confColor};border-radius:999px;padding:1px 6px;font-size:9px;font-family:'IBM Plex Mono',monospace">${conf}%</span>`
+                    : '';
+
+                // Snapshot buttons
+                const snapBtnStyle = 'border-radius:5px;padding:2px 7px;font-size:9.5px;cursor:pointer;font-family:\'IBM Plex Mono\',monospace;white-space:nowrap;border:1px solid';
+                const snapBtn = pairIdx !== null ? [
+                    f.pageAfs1 ? `<button onclick="jumpToPageSnapshot(${pairIdx},1)" style="${snapBtnStyle} #3B82F655;background:#0D213718;color:#93C5FD">AFS1·p${f.pageAfs1} &#8594;</button>` : '',
+                    f.pageAfs2 ? `<button onclick="jumpToPageSnapshot(${pairIdx},2)" style="${snapBtnStyle} #10B98155;background:#06291818;color:#6EE7B7">AFS2·p${f.pageAfs2} &#8594;</button>` : '',
+                ].filter(Boolean).join(' ') : '';
+
+                const signOffButtons = '';
+
+                // Before/After diff block
+                let diffBlock = '';
+                if (f.before && f.after && !['content-added','content-removed'].includes(f.category)) {
+                    diffBlock = `<div style="margin-top:7px;border-radius:6px;overflow:hidden;font-family:'IBM Plex Mono',monospace;font-size:10.5px">
+                        <div style="background:rgba(239,68,68,0.08);padding:4px 8px;color:#FCA5A5;border-left:3px solid #EF4444">&#8722; ${esc(f.before)}</div>
+                        <div style="background:rgba(34,197,94,0.08);padding:4px 8px;color:#86EFAC;border-left:3px solid #10B981">+ ${esc(f.after)}</div>
+                        ${typeof f.pctChange === 'number' && f.pctChange > 0
+                            ? `<div style="background:rgba(251,191,36,0.06);padding:3px 8px;color:#FDE68A;font-size:10px">Change: ${f.pctChange}%${f.absChange ? ' | Abs: R ' + (f.absChange >= 1000000 ? (f.absChange/1000000).toFixed(2)+'M' : f.absChange >= 1000 ? (f.absChange/1000).toFixed(0)+'K' : f.absChange) : ''}</div>`
+                            : ''}
+                    </div>`;
+                } else if (f.before && !f.after) {
+                    diffBlock = `<div style="margin-top:6px;background:rgba(239,68,68,0.07);border-left:3px solid #EF4444;border-radius:5px;padding:4px 8px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:#FCA5A5">&#8722; ${esc(f.before)}</div>`;
+                } else if (!f.before && f.after) {
+                    diffBlock = `<div style="margin-top:6px;background:rgba(34,197,94,0.07);border-left:3px solid #10B981;border-radius:5px;padding:4px 8px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:#86EFAC">+ ${esc(f.after)}</div>`;
+                }
+
+                // Card container — data-abschange for materiality filter
+                const cardOpacity = signOff === 'cleared' ? '0.45' : '1';
+                const cardBorderExtra = signOff === 'escalate' ? `;box-shadow:0 0 0 1px #EF444488` : '';
+                html += `<div class="sysreview-finding" data-abschange="${f.absChange || 0}"
+                    style="background:#0F172A;border-left:3px solid ${sevColor};border-radius:7px;padding:9px 12px;margin-bottom:7px;opacity:${cardOpacity}${cardBorderExtra};${signOff==='cleared'?'text-decoration:line-through;text-decoration-color:#334155':''}"
+                    >
+                    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px">
+                        <div style="color:#F1F5F9;font-weight:600;font-size:11.5px;line-height:1.4;flex:1;${signOff==='cleared'?'text-decoration:none':''}">${globalIdx}. ${esc(f.title || 'Untitled')}</div>
+                        <div style="display:flex;gap:4px;align-items:center;flex-shrink:0">
+                            <span style="background:${sevColor}22;border:1px solid ${sevColor}55;color:${sevColor};border-radius:999px;padding:1px 6px;font-size:9px;font-family:'IBM Plex Mono',monospace">${sev.toUpperCase()}</span>
+                            ${confBadge}
+                            ${snapBtn}
+                        </div>
+                    </div>
+                    <div style="color:#94A3B8;font-size:11px;line-height:1.5">${esc(f.description || '')}</div>
+                    ${diffBlock}
+                    ${signOffButtons}
+                </div>`;
+            });
+
+            html += `</div>`;  // cat block
+        });
+
+        html += `</div></div>`;  // sectionMap block + section wrapper
+    });
+
+    return html;
+}
+
+// Toggle section collapse (#1)
+function toggleSection(secId) {
+    const el    = document.getElementById(secId);
+    const arrow = document.getElementById(secId + '-arrow');
+    if (!el) return;
+    const open = el.style.display !== 'none';
+    el.style.display  = open ? 'none' : '';
+    if (arrow) arrow.style.transform = open ? 'rotate(-90deg)' : '';
+}
+
+// #5 — Sign-off action: POST to /api/finding-signoff, update card visually
+function findingSignOff(id, action, btn) {
+    const fd = new FormData();
+    fd.append('id', id);
+    fd.append('action', action);
+    const token = document.querySelector('input[name="__RequestVerificationToken"]')?.value || '';
+    fetch('/api/finding-signoff', { method:'POST', body: fd, headers:{'RequestVerificationToken': token} })
+        .then(r => r.ok ? r.json() : null)
+        .then(() => {
+            const card = document.getElementById('finding-card-' + id);
+            if (!card) return;
+            // Update visual state
+            const isCleared   = action === 'cleared';
+            const isEscalate  = action === 'escalate';
+            card.style.opacity = isCleared ? '0.45' : '1';
+            card.style.boxShadow = isEscalate ? '0 0 0 1px #EF444488' : '';
+            // Update button active states within this card
+            card.querySelectorAll('[data-action]').forEach(b => {
+                const a = b.dataset.action;
+                const active = a === action;
+                const colors = { cleared:'#10B981', query:'#F59E0B', escalate:'#EF4444' };
+                const c = colors[a] || '#64748B';
+                b.style.borderColor = active ? c : c + '55';
+                b.style.background  = active ? c + '22' : 'transparent';
+                b.style.color       = active ? c : c;
+            });
+        })
+        .catch(() => {});
+}
+
 function renderAiReviewTab(ai, aiRead) {
     const aiReady = ai && ai.status === 'ready';
     const readReady = aiRead && aiRead.status === 'ready';
 
     if (!aiReady && !readReady) {
         return `<div id="tab-ai" class="afs-tab-pane" style="display:none">
-            <div class="afs-info afs-info-violet" style="margin-bottom:8px">
-                <b>Review currently unavailable.</b> Please try again later.<br>
-                <span style="color:#94A3B8;font-size:12px">The comparison result is still available — only the intelligent materiality review could not be completed at this time.</span>
-            </div>
+            ${renderAiUnavailableNotice(
+                'Intelligent review could not be completed.',
+                'All AI models returned errors. The document comparison is still available.',
+                true)}
         </div>`;
     }
 
@@ -987,8 +1342,9 @@ function renderAiReviewTab(ai, aiRead) {
 
     if (!aiReady) {
         html += renderAiUnavailableNotice(
-            'Review currently unavailable. Please try again later.',
-            'The comparison result is still available — only the intelligent materiality review could not be completed at this time.');
+            'Diff review could not be completed.',
+            'The comparison result is still available. You can retry the AI analysis.',
+            true);
     } else {
         const riskColor = (ai.overallRisk || '').toLowerCase() === 'high' ? '#EF4444'
             : (ai.overallRisk || '').toLowerCase() === 'medium' ? '#F59E0B' : '#10B981';
@@ -1121,8 +1477,9 @@ function renderAiReviewTab(ai, aiRead) {
 
     if (!readReady) {
         html += renderAiUnavailableNotice(
-            'Content reading currently unavailable. Please try again later.',
-            'The comparison result is still available — only the AI content reading step could not be completed at this time.');
+            'Content reading could not be completed.',
+            'The comparison result is still available. You can retry the AI analysis.',
+            true);
     } else {
         const riskClr = (aiRead.riskLevel || '').toLowerCase() === 'high' ? '#EF4444'
             : (aiRead.riskLevel || '').toLowerCase() === 'medium' ? '#F59E0B' : '#10B981';
@@ -1140,10 +1497,11 @@ function renderAiReviewTab(ai, aiRead) {
         // Section-level diffs
         if (Array.isArray(aiRead.sectionDiffs) && aiRead.sectionDiffs.length) {
             html += `<div style="margin:10px 0 6px;color:#F59E0B;font-weight:700;font-size:11.5px;letter-spacing:.05em">SECTION-BY-SECTION CHANGES</div>`;
-            aiRead.sectionDiffs.forEach(s => {
+            aiRead.sectionDiffs.forEach((s, si) => {
                 const sev = (s.severity || '').toLowerCase();
                 const sevClr = sev === 'high' ? '#EF4444' : sev === 'medium' ? '#F59E0B' : '#10B981';
                 const ctClr  = s.changeType === 'numeric' ? '#FBBF24' : s.changeType === 'structural' ? '#A78BFA' : '#CBD5E1';
+                const ref = resolveSnapshotRef(s.pairIndex, s.pageAfs1, s.pageAfs2, s.sectionName);
                 html += `<div style="background:#111827;border-left:3px solid ${sevClr};border-radius:8px;padding:10px 12px;margin-bottom:7px">
                     <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:5px">
                         <div style="color:#F8FAFC;font-weight:700;font-size:12.5px">${esc(s.sectionName)}</div>
@@ -1158,26 +1516,32 @@ function renderAiReviewTab(ai, aiRead) {
                         <div style="background:#0D1B2A;border-radius:5px;padding:5px 8px"><div style="color:#64748B;font-size:10px;margin-bottom:2px">AFS 2</div><div style="color:#94A3B8">${esc(s.afs2Summary || '—')}</div></div>
                     </div>
                     ${Array.isArray(s.changedValues) && s.changedValues.length ? `<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">${s.changedValues.map(v => `<span style="background:#1E3A5F;color:#FBBF24;border-radius:5px;padding:2px 6px;font-size:10.5px;font-family:'IBM Plex Mono',monospace">${esc(v)}</span>`).join('')}</div>` : ''}
+                    ${snapshotRefHtml(ref, ref ? undefined : si)}
                 </div>`;
             });
         }
 
-        // Line item changes
+        // Line item changes — table with page ref column and snapshot button per row
         if (Array.isArray(aiRead.lineItemChanges) && aiRead.lineItemChanges.length) {
             html += `<div style="margin:14px 0 6px;color:#A78BFA;font-weight:700;font-size:11.5px;letter-spacing:.05em">NUMERIC LINE ITEMS</div>`;
             html += `<table style="width:100%;border-collapse:collapse;font-size:11.5px">
                 <thead><tr style="background:#1E2F5A">
-                    <th style="${thStyle}">LINE ITEM</th><th style="${thStyle}">AFS 1</th><th style="${thStyle}">AFS 2</th><th style="${thStyle}">CHANGE</th><th style="${thStyle}">NOTE</th>
+                    <th style="${thStyle}">LINE ITEM</th><th style="${thStyle}">AFS 1</th><th style="${thStyle}">AFS 2</th><th style="${thStyle}">CHANGE</th><th style="${thStyle}">PAGE</th>
                 </tr></thead><tbody>`;
             aiRead.lineItemChanges.forEach((l, i) => {
                 const bg = i % 2 === 0 ? '#162347' : '#111827';
                 const chgClr = (l.pctChange || '').startsWith('-') ? '#EF4444' : '#10B981';
+                const ref = resolveSnapshotRef(l.pairIndex, l.pageAfs1, l.pageAfs2, l.lineItem);
+                const pageCell = ref
+                    ? `<span style="color:#64748B;font-size:10px;font-family:'IBM Plex Mono',monospace;display:block">p.${ref.pageAfs1||'?'}↔p.${ref.pageAfs2||'?'}</span>
+                       <button onclick="jumpToPageSnapshot(${ref.pairIndex},1)" style="margin-top:2px;padding:1px 8px;font-size:10px;border-radius:999px;border:1px solid #7B4FFF55;background:#7B4FFF18;color:#C4B5FD;cursor:pointer">View →</button>`
+                    : `<span style="color:#334155;font-size:10px">—</span>`;
                 html += `<tr style="background:${bg}">
                     <td style="${tdStyle};font-weight:600">${esc(l.lineItem)}</td>
                     <td style="${tdStyle};font-family:'IBM Plex Mono',monospace">${esc(l.valueInAfs1 || '—')}</td>
                     <td style="${tdStyle};font-family:'IBM Plex Mono',monospace">${esc(l.valueInAfs2 || '—')}</td>
                     <td style="${tdStyle};color:${chgClr};font-family:'IBM Plex Mono',monospace;font-weight:700">${esc(l.pctChange || '—')}</td>
-                    <td style="${tdStyle};color:#94A3B8">${esc(l.materialityNote || '')}</td>
+                    <td style="${tdStyle}">${pageCell}</td>
                 </tr>`;
             });
             html += `</tbody></table>`;
@@ -1210,8 +1574,59 @@ function renderAiReviewTab(ai, aiRead) {
     return html;
 }
 
+// Resolves a pairIndex from optional page numbers, falling back to a text search
+// through already-loaded pageDiffs. Returns { pairIndex, pageAfs1, pageAfs2 } or null.
+function resolveSnapshotRef(pairIndex, pageAfs1, pageAfs2, searchText) {
+    const data = window._cmpData;
+    if (!data || !data.pageDiffs) return null;
+
+    // Direct pairIndex provided
+    if (typeof pairIndex === 'number') {
+        const p = data.pageDiffs.find(d => (d.pairIndex ?? d.k) === pairIndex);
+        if (p) return { pairIndex, pageAfs1: p.pageAfs1, pageAfs2: p.pageAfs2 };
+    }
+
+    // Match by page numbers
+    if (pageAfs1 || pageAfs2) {
+        const p = data.pageDiffs.find(d =>
+            (pageAfs1 && d.pageAfs1 === pageAfs1) ||
+            (pageAfs2 && d.pageAfs2 === pageAfs2));
+        if (p) return { pairIndex: p.pairIndex ?? p.k, pageAfs1: p.pageAfs1, pageAfs2: p.pageAfs2 };
+    }
+
+    // Fallback: text search in already-loaded diffs
+    if (searchText) {
+        const lower = searchText.toLowerCase().trim().substring(0, 40);
+        for (const p of data.pageDiffs) {
+            if (!Array.isArray(p.diffs)) continue;
+            const found = p.diffs.some(d =>
+                (d.line1 || '').toLowerCase().includes(lower) ||
+                (d.line2 || '').toLowerCase().includes(lower));
+            if (found) return { pairIndex: p.pairIndex ?? p.k, pageAfs1: p.pageAfs1, pageAfs2: p.pageAfs2 };
+        }
+    }
+    return null;
+}
+
+// Renders a "View Snapshot →" button for Document Reading section diffs.
+// Always shows the button — uses the best available ref or falls back to pairIndex 0.
+function snapshotRefHtml(ref, fallbackPairIndex) {
+    const r = ref || null;
+    const pairIdx = r?.pairIndex ?? fallbackPairIndex ?? 0;
+    const p1 = r?.pageAfs1 ? `AFS 1 p.${r.pageAfs1}` : '';
+    const p2 = r?.pageAfs2 ? `AFS 2 p.${r.pageAfs2}` : '';
+    const pageLabel = [p1, p2].filter(Boolean).join(' ↔ ');
+    return `<div style="display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap;border-top:1px solid #1E3A5F;padding-top:7px">
+        ${pageLabel ? `<span style="color:#64748B;font-size:10.5px;font-family:'IBM Plex Mono',monospace">${esc(pageLabel)}</span>` : ''}
+        <button onclick="jumpToPageSnapshot(${pairIdx},1)"
+            style="padding:3px 12px;font-size:11px;border-radius:999px;border:1px solid #7B4FFF88;background:#7B4FFF28;color:#C4B5FD;cursor:pointer;font-family:'IBM Plex Mono',monospace;font-weight:600;letter-spacing:.02em">
+            View Snapshot →
+        </button>
+    </div>`;
+}
+
 function aiTab(name) {
-    ['diff','content'].forEach(n => {
+    ['diff','content','sysreview'].forEach(n => {
         const panel = document.getElementById('aipanel-' + n);
         const btn   = document.getElementById('aibtn-' + n);
         if (!panel || !btn) return;
@@ -1247,10 +1662,18 @@ function renderAiRunBanner(ai) {
     </div>`;
 }
 
-function renderAiUnavailableNotice(title, detail) {
+function renderAiUnavailableNotice(title, detail, showRetry = false) {
+    const retryBtn = showRetry
+        ? `<div style="margin-top:10px">
+               <button onclick="runAiAnalysis(false)" style="background:#7B4FFF;color:#fff;border:none;padding:6px 16px;border-radius:6px;font-size:12px;cursor:pointer;font-weight:600">
+                   Retry AI Analysis
+               </button>
+           </div>`
+        : '';
     return `<div class="afs-info afs-info-violet" style="margin-bottom:10px">
         <div><b>${esc(title)}</b></div>
         <div style="margin-top:4px;color:#94A3B8">${esc(detail)}</div>
+        ${retryBtn}
     </div>`;
 }
 
@@ -1737,6 +2160,8 @@ function renderExportResults(res) {
 document.addEventListener('DOMContentLoaded', async () => {
     refreshDashboard();
     setActiveStep('step1');
+    await loadModelStatus();
+    window.setInterval(() => { loadModelStatus(); }, 30000);
 
     try {
         // Pre-fill engagement form

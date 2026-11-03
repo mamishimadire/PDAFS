@@ -38,6 +38,10 @@ public class PageExtractorService
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             @"Programs\Tesseract-OCR\tesseract.exe"),
         @"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        @"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            @"Microsoft\WinGet\Links\tesseract.exe"),
     };
 
     private readonly AiVisionOcrService _aiVisionOcr;
@@ -290,8 +294,9 @@ public class PageExtractorService
                         CreateNoWindow = true,
                     };
                     renderPsi.ArgumentList.Add("-png");
+                    renderPsi.ArgumentList.Add("-gray");
                     renderPsi.ArgumentList.Add("-r");
-                    renderPsi.ArgumentList.Add("220");
+                    renderPsi.ArgumentList.Add("300");
                     renderPsi.ArgumentList.Add("-f");
                     renderPsi.ArgumentList.Add(pageNum.ToString());
                     renderPsi.ArgumentList.Add("-l");
@@ -319,34 +324,7 @@ public class PageExtractorService
                         continue;
                     }
 
-                    var ocrPsi = new ProcessStartInfo(tesseract)
-                    {
-                        RedirectStandardError = true,
-                        RedirectStandardOutput = true,
-                        UseShellExecute = false,
-                        CreateNoWindow = true,
-                    };
-                    ocrPsi.ArgumentList.Add(imagePath);
-                    ocrPsi.ArgumentList.Add("stdout");
-                    ocrPsi.ArgumentList.Add("--psm");
-                    ocrPsi.ArgumentList.Add("6");
-
-                    using var ocrProc = Process.Start(ocrPsi);
-                    if (ocrProc == null)
-                    {
-                        pages.Add(string.Empty);
-                        continue;
-                    }
-
-                    string pageText = ocrProc.StandardOutput.ReadToEnd();
-                    if (!ocrProc.WaitForExit(30_000))
-                    {
-                        try { ocrProc.Kill(true); } catch { }
-                        pages.Add(string.Empty);
-                        continue;
-                    }
-
-                    pages.Add(NormalizeOcrPage(pageText));
+                    pages.Add(RunBestEffortOcr(tesseract, imagePath));
                 }
                 catch
                 {
@@ -360,6 +338,82 @@ public class PageExtractorService
         }
 
         return pages;
+    }
+
+    private static string RunBestEffortOcr(string tesseractPath, string imagePath)
+    {
+        string bestText = string.Empty;
+        int bestScore = 0;
+
+        foreach (int psm in new[] { 6, 4, 11 })
+        {
+            string candidate = RunTesseract(tesseractPath, imagePath, psm);
+            int score = ScoreOcrText(candidate);
+            if (score <= bestScore)
+                continue;
+
+            bestScore = score;
+            bestText = candidate;
+        }
+
+        return bestText;
+    }
+
+    private static string RunTesseract(string tesseractPath, string imagePath, int psm)
+    {
+        try
+        {
+            var ocrPsi = new ProcessStartInfo(tesseractPath)
+            {
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            ocrPsi.ArgumentList.Add(imagePath);
+            ocrPsi.ArgumentList.Add("stdout");
+            ocrPsi.ArgumentList.Add("-l");
+            ocrPsi.ArgumentList.Add("eng");
+            ocrPsi.ArgumentList.Add("--oem");
+            ocrPsi.ArgumentList.Add("1");
+            ocrPsi.ArgumentList.Add("--psm");
+            ocrPsi.ArgumentList.Add(psm.ToString());
+            ocrPsi.ArgumentList.Add("-c");
+            ocrPsi.ArgumentList.Add("preserve_interword_spaces=1");
+
+            using var ocrProc = Process.Start(ocrPsi);
+            if (ocrProc == null)
+                return string.Empty;
+
+            string pageText = ocrProc.StandardOutput.ReadToEnd();
+            if (!ocrProc.WaitForExit(30_000))
+            {
+                try { ocrProc.Kill(true); } catch { }
+                return string.Empty;
+            }
+
+            return NormalizeOcrPage(pageText);
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static int ScoreOcrText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return 0;
+
+        int alnumChars = text.Count(char.IsLetterOrDigit);
+        int lineCount = text
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Count(line => line.Trim().Length > 0);
+        int wordCount = text
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+            .Length;
+
+        return alnumChars + (lineCount * 25) + (wordCount * 2);
     }
 
     private static string NormalizeOcrPage(string text)

@@ -34,75 +34,144 @@ public class MultiAiOrchestrator
         string           geminiPromptOverride = "",
         CancellationToken cancellationToken = default)
     {
-        // ── Kick off all models in parallel ──────────────────────────────────
-        var geminiTask = _gemini.AnalyzeAsync(comparison, cancellationToken);
+        int readyResultTarget = Math.Max(1, AiConfiguration.GetInt(
+            _config,
+            1,
+            "AiAssist:ReadyResultTarget",
+            "AI_READY_RESULT_TARGET"));
+        int consensusWindowMs = Math.Max(0, AiConfiguration.GetInt(
+            _config,
+            0,
+            "AiAssist:ConsensusWindowMs",
+            "AI_CONSENSUS_WINDOW_MS"));
 
-        var groqTask   = RunGroqAsync(comparison, cancellationToken);
-        var orTask     = RunOpenRouterAsync(comparison, cancellationToken);
+        var attempts = new[]
+        {
+            new AiProviderAttempt<AiAssistResult>("Gemini",      ct => _gemini.AnalyzeAsync(comparison, ct)),
+            new AiProviderAttempt<AiAssistResult>("Groq",        ct => RunGroqAsync(comparison, ct)),
+            new AiProviderAttempt<AiAssistResult>("OpenRouter",  ct => RunOpenRouterAsync(comparison, ct)),
+        };
 
-        await Task.WhenAll(geminiTask, groqTask, orTask);
+        AiFailoverOutcome<AiAssistResult> outcome = await AiFailoverExecutor.ExecuteAsync(
+            attempts,
+            result => result.Status,
+            readyResultTarget,
+            TimeSpan.FromMilliseconds(consensusWindowMs),
+            cancellationToken);
 
-        var allResults = new[] { geminiTask.Result, groqTask.Result, orTask.Result };
-        var results = allResults
-            .Where(r => r.Status == "ready")
-            .ToList();
+        var allResults = outcome.CompletedResults.ToList();
+        var results    = outcome.ReadyResults.ToList();
 
         _logger.LogInformation(
-            "[MultiAI] {Count}/3 models returned ready results.", results.Count);
+            "[MultiAI] {Count}/3 models returned ready results within the failover window ({WindowMs} ms).",
+            results.Count,
+            consensusWindowMs);
 
         if (results.Count == 0)
         {
+            string geminiStatus      = allResults.FirstOrDefault(r => string.Equals(r.Provider, "Gemini",      StringComparison.OrdinalIgnoreCase))?.Status ?? "not_started";
+            string groqStatus        = allResults.FirstOrDefault(r => string.Equals(r.Provider, "Groq",        StringComparison.OrdinalIgnoreCase))?.Status ?? "not_started";
+            string openRouterStatus  = allResults.FirstOrDefault(r => string.Equals(r.Provider, "OpenRouter",  StringComparison.OrdinalIgnoreCase))?.Status ?? "not_started";
+
             _logger.LogWarning(
-                "[MultiAI] No ready results. Gemini={GeminiStatus}, Groq={GroqStatus}, OpenRouter={OpenRouterStatus}.",
-                geminiTask.Result.Status,
-                groqTask.Result.Status,
-                orTask.Result.Status);
+                "[MultiAI] All models failed. Gemini={GeminiStatus}, Groq={GroqStatus}, OpenRouter={OpenRouterStatus}. Retrying with lean prompt.",
+                geminiStatus, groqStatus, openRouterStatus);
+
+            // ── Retry once with a leaner prompt (fewer diffs, less text) ──────
+            // This handles the case where the standard prompt was too large for the model.
+            bool anyKeyConfigured = allResults.Any(r =>
+                !string.Equals(r.Status, "disabled",    StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(r.Status, "missing_key", StringComparison.OrdinalIgnoreCase));
+
+            if (anyKeyConfigured && !cancellationToken.IsCancellationRequested)
+            {
+                var retryAttempts = new[]
+                {
+                    new AiProviderAttempt<AiAssistResult>("Gemini-Lean",     ct => _gemini.AnalyzeAsync(comparison, ct, lean: true)),
+                    new AiProviderAttempt<AiAssistResult>("Groq-Lean",       ct => RunGroqAsync(comparison, ct, lean: true)),
+                    new AiProviderAttempt<AiAssistResult>("OpenRouter-Lean", ct => RunOpenRouterAsync(comparison, ct, lean: true)),
+                };
+
+                var retryOutcome = await AiFailoverExecutor.ExecuteAsync(
+                    retryAttempts,
+                    result => result.Status,
+                    readyResultTarget: 1,
+                    waitAfterFirstReady: TimeSpan.Zero,
+                    cancellationToken);
+
+                var retryReady = retryOutcome.ReadyResults.ToList();
+                if (retryReady.Count > 0)
+                {
+                    _logger.LogInformation("[MultiAI] Lean-prompt retry succeeded via {Provider}.", retryReady[0].Provider);
+                    return retryReady[0];
+                }
+
+                allResults.AddRange(retryOutcome.CompletedResults);
+            }
 
             return AiUserFacingMessages.CreateUnavailableReviewResult(allResults);
         }
 
-        return Merge(results);
+        return results.Count == 1 ? results[0] : Merge(results);
     }
 
     // ── Groq ─────────────────────────────────────────────────────────────────
     private async Task<AiAssistResult> RunGroqAsync(
-        ComparisonResult cmp, CancellationToken ct)
+        ComparisonResult cmp, CancellationToken ct, bool lean = false)
     {
-        string? key = _config["GROQ_API_KEY"]
-            ?? Environment.GetEnvironmentVariable("GROQ_API_KEY");
+        string? key = AiConfiguration.GetOptional(_config, "AiAssist:GroqApiKey", "GROQ_API_KEY");
         if (string.IsNullOrWhiteSpace(key))
             return Skipped("Groq", "GROQ_API_KEY not set.");
 
-        string model    = _config["AiAssist:GroqModel"] ?? "llama-3.3-70b-versatile";
-        string endpoint = _config["AiAssist:GroqUrl"]   ?? "https://api.groq.com/openai/v1/chat/completions";
-        string prompt   = BuildOpenAiPrompt(cmp);
+        string model = AiConfiguration.GetString(
+            _config,
+            "llama-3.3-70b-versatile",
+            "AiAssist:GroqModel",
+            "GROQ_MODEL");
+        string endpoint = AiConfiguration.GetString(
+            _config,
+            "https://api.groq.com/openai/v1/chat/completions",
+            "AiAssist:GroqUrl",
+            "GROQ_URL");
+        string prompt   = BuildOpenAiPrompt(cmp, lean);
 
         return await _openAiAdapter.AnalyzeAsync(endpoint, key, model, "Groq", prompt, 60, ct);
     }
 
     // ── OpenRouter ────────────────────────────────────────────────────────────
     private async Task<AiAssistResult> RunOpenRouterAsync(
-        ComparisonResult cmp, CancellationToken ct)
+        ComparisonResult cmp, CancellationToken ct, bool lean = false)
     {
-        string? key = _config["OPENROUTER_API_KEY"]
-            ?? Environment.GetEnvironmentVariable("OPENROUTER_API_KEY");
+        string? key = AiConfiguration.GetOptional(_config, "AiAssist:OpenRouterApiKey", "OPENROUTER_API_KEY");
         if (string.IsNullOrWhiteSpace(key))
             return Skipped("OpenRouter", "OPENROUTER_API_KEY not set.");
 
-        string model    = _config["AiAssist:OpenRouterModel"] ?? "deepseek/deepseek-chat";
-        string endpoint = _config["AiAssist:OpenRouterUrl"]   ?? "https://openrouter.ai/api/v1/chat/completions";
-        string prompt   = BuildOpenAiPrompt(cmp);
+        string model = AiConfiguration.GetString(
+            _config,
+            "deepseek/deepseek-chat",
+            "AiAssist:OpenRouterModel",
+            "OPENROUTER_MODEL");
+        string endpoint = AiConfiguration.GetString(
+            _config,
+            "https://openrouter.ai/api/v1/chat/completions",
+            "AiAssist:OpenRouterUrl",
+            "OPENROUTER_URL");
+        string prompt   = BuildOpenAiPrompt(cmp, lean);
 
         return await _openAiAdapter.AnalyzeAsync(endpoint, key, model, "OpenRouter", prompt, 90, ct);
     }
 
     // ── Prompt for chat-completion models (no JSON schema enforcement) ────────
-    private static string BuildOpenAiPrompt(ComparisonResult cmp)
+    private static string BuildOpenAiPrompt(ComparisonResult cmp, bool lean = false)
     {
+        int pairCap = lean ? 6  : 18;
+        int diffCap = lean ? 6  : 10;
+        int textCap = lean ? 800 : 1400;
+
         var pagePairs = cmp.PageDiffs
             .Where(p => p.IssueCount > 0)
             .OrderByDescending(p => p.IssueCount)
-            .Take(18)
+            .Take(pairCap)
             .Select((p, idx) => new
             {
                 pairIndex  = p.PairIndex,
@@ -116,38 +185,65 @@ public class MultiAiOrchestrator
                     .Where(d => d.Status != "same" &&
                                 d.Status != "same-cross-page" &&
                                 d.Status != "same-different-page")
-                    .Take(10)
+                    .Take(diffCap)
                     .Select((d, i) => new
                     {
-                        ordinal = i + 1,
-                        status  = d.Status,
-                        afs1    = Trim(d.Line1, 300),
-                        afs2    = Trim(d.Line2, 300),
-                        nums    = d.NumDiff.Take(6).ToList(),
+                        ordinal  = i + 1,
+                        status   = d.Status,
+                        afs1     = Trim(d.Line1, 250),
+                        afs2     = Trim(d.Line2, 250),
+                        wordDiff = d.WordDiff.Select(w => new { word = w.Word, tag = w.Tag }).Take(15).ToList(),
+                        nums     = d.NumDiff.Take(6).ToList(),
                     })
             });
 
-        // Include page text for the most-changed pages
+        // Page text for the most-changed pages
         var pageContent = cmp.PageDiffs
             .Where(p => p.IssueCount > 0)
             .OrderByDescending(p => p.IssueCount)
-            .Take(4)
+            .Take(lean ? 2 : 4)
             .Select(p => new
             {
                 pairIndex = p.PairIndex,
                 textAfs1  = p.PageAfs1.HasValue && p.PageAfs1.Value - 1 < cmp.Report1.Pages.Count
-                    ? Trim(cmp.Report1.Pages[p.PageAfs1.Value - 1], 1400) : null,
+                    ? Trim(cmp.Report1.Pages[p.PageAfs1.Value - 1], textCap) : null,
                 textAfs2  = p.PageAfs2.HasValue && p.PageAfs2.Value - 1 < cmp.Report2.Pages.Count
-                    ? Trim(cmp.Report2.Pages[p.PageAfs2.Value - 1], 1400) : null,
+                    ? Trim(cmp.Report2.Pages[p.PageAfs2.Value - 1], textCap) : null,
             });
+
+        // Compact diff report — covers every change with ~4x better token efficiency than JSON
+        int lineCap = lean ? 50 : int.MaxValue;
+        string compactDiffReport = BuildCompactDiffReport(cmp, lineCap);
+
+        var pageAlignmentSummary = cmp.Alignment.Select((a, i) => new
+        {
+            afs1Page = a.I1 + 1,
+            afs2Page = a.I2 >= 0 ? (int?)(a.I2 + 1) : null,
+            sim      = Math.Round(a.Sim, 3),
+        }).ToList();
+
+        var systemReviewFindings = cmp.AutoReview.Take(lean ? 40 : int.MaxValue).Select(f => new
+        {
+            f.Category,
+            f.Title,
+            f.Severity,
+            f.PageAfs1,
+            f.PageAfs2,
+            f.PairIndex,
+            f.Before,
+            f.After,
+            pctChange = f.PctChange.HasValue ? Math.Round(f.PctChange.Value, 1) : (double?)null,
+        }).ToList();
 
         var ctx = new
         {
             task = "You are an expert financial auditor AI at SNG Grant Thornton. " +
-                   "Compare two versions of an Annual Financial Statement (AFS). " +
-                   "Read the ACTUAL page content samples carefully — do not rely only on the diff output. " +
-                   "Identify ALL material changes including: directorate changes (appointments/resignations/date changes), " +
-                   "numeric changes, policy changes, added/removed disclosures, and any other differences.",
+                   "You have: (1) compactDiffReport — every line changed/added/removed, " +
+                   "and (2) systemReviewFindings — deterministic findings already categorised by the comparison engine. " +
+                   "Start from systemReviewFindings: convert each into a materialFinding with a professional auditRationale " +
+                   "and recommendedProcedure. Then check compactDiffReport for any genuine changes the system missed. " +
+                   "Use pageAfs1/pageAfs2 from systemReviewFindings for correct snapshot references. " +
+                   "No cap on findings — report ALL genuine material changes.",
             report1 = new { cmp.Report1.Label, cmp.Report1.Filename, pages = cmp.Report1.PageCount },
             report2 = new { cmp.Report2.Label, cmp.Report2.Filename, pages = cmp.Report2.PageCount },
             counts  = new
@@ -157,6 +253,9 @@ public class MultiAiOrchestrator
                 added   = cmp.Counts.GetValueOrDefault("added", 0),
                 removed = cmp.Counts.GetValueOrDefault("removed", 0),
             },
+            systemReviewFindings,
+            compactDiffReport,
+            pageAlignmentSummary,
             pageContent,
             pagePairs,
         };
@@ -382,6 +481,69 @@ public class MultiAiOrchestrator
     {
         "high" => 2, "medium" => 1, _ => 0
     };
+
+    private static string BuildCompactDiffReport(ComparisonResult cmp, int lineCap)
+    {
+        var sb = new System.Text.StringBuilder(8192);
+
+        var lineToPage = new Dictionary<LineDiffResult, (int? p1, int? p2)>(
+            ReferenceEqualityComparer.Instance);
+        foreach (var pd in cmp.PageDiffs)
+            foreach (var d in pd.Diffs)
+                lineToPage.TryAdd(d, (pd.PageAfs1, pd.PageAfs2));
+
+        // Changed
+        var changed = cmp.ChangedLines.Take(lineCap).ToList();
+        int total   = cmp.ChangedLines.Count();
+        sb.AppendLine($"=== CHANGED LINES ({total} total" +
+                      (changed.Count < total ? $", showing {changed.Count}" : "") + ") ===");
+        int ord = 0;
+        foreach (var d in changed)
+        {
+            ord++;
+            lineToPage.TryGetValue(d, out var pg);
+            string pageRef = pg.p1.HasValue || pg.p2.HasValue ? $"p{pg.p1}→p{pg.p2}" : "?";
+            string suffix = "";
+            if (d.NumDiff.Count > 0)  suffix += $" | nums:[{string.Join(",", d.NumDiff.Take(6))}]";
+            var rem = d.WordDiff.Where(w => w.Tag == "removed").Select(w => w.Word).Take(5).ToList();
+            var add = d.WordDiff.Where(w => w.Tag == "added").Select(w => w.Word).Take(5).ToList();
+            if (rem.Count > 0) suffix += $" | -[{string.Join(",", rem)}]";
+            if (add.Count > 0) suffix += $" | +[{string.Join(",", add)}]";
+            sb.AppendLine($"CHG-{ord:D3} [{pageRef}]: \"{Trim(d.Line1, 120)}\" → \"{Trim(d.Line2, 120)}\"{suffix}");
+        }
+
+        // Added
+        var added    = cmp.AddedLines.Take(lineCap).ToList();
+        int addTotal = cmp.AddedLines.Count();
+        sb.AppendLine();
+        sb.AppendLine($"=== LINES ADDED IN AFS 2 ({addTotal} total" +
+                      (added.Count < addTotal ? $", showing {added.Count}" : "") + ") ===");
+        ord = 0;
+        foreach (var d in added)
+        {
+            ord++;
+            lineToPage.TryGetValue(d, out var pg);
+            string pageRef = pg.p2.HasValue ? $"AFS2-p{pg.p2}" : "AFS2-?";
+            sb.AppendLine($"ADD-{ord:D3} [{pageRef}]: \"{Trim(d.Line2, 150)}\"");
+        }
+
+        // Removed
+        var removed  = cmp.RemovedLines.Take(lineCap).ToList();
+        int remTotal = cmp.RemovedLines.Count();
+        sb.AppendLine();
+        sb.AppendLine($"=== LINES REMOVED FROM AFS 1 ({remTotal} total" +
+                      (removed.Count < remTotal ? $", showing {removed.Count}" : "") + ") ===");
+        ord = 0;
+        foreach (var d in removed)
+        {
+            ord++;
+            lineToPage.TryGetValue(d, out var pg);
+            string pageRef = pg.p1.HasValue ? $"AFS1-p{pg.p1}" : "AFS1-?";
+            sb.AppendLine($"REM-{ord:D3} [{pageRef}]: \"{Trim(d.Line1, 150)}\"");
+        }
+
+        return sb.ToString();
+    }
 
     private static string Trim(string? s, int max)
     {

@@ -86,55 +86,54 @@ namespace AfsPdfComparison.Services
             if (specNorm.Length < 4)
                 return false;
 
+            var lineTokenSet = new HashSet<string>(
+                lineNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries),
+                StringComparer.OrdinalIgnoreCase);
+            var changedNorms = spec.ChangedWords
+                .SelectMany(w => SnapNorm(w ?? "")
+                    .Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var anchorNorms = spec.AnchorWords
+                .SelectMany(w => SnapNorm(w ?? "")
+                    .Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
             if (lineNorm == specNorm)
             {
-                if (spec.ChangedWords.Count > 0)
-                {
-                    var lineTokenSet = new HashSet<string>(
-                        lineNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries),
-                        StringComparer.OrdinalIgnoreCase);
-                    var changedNorms = spec.ChangedWords
-                        .Select(w => SnapNorm(w ?? ""))
-                        .Where(w => w.Length > 0)
-                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                if (spec.WholeLineMode)
+                    return true;
 
-                    bool allAlreadyInLine = changedNorms.All(cw => lineTokenSet.Contains(cw));
-                    if (allAlreadyInLine)
-                        return false;
-                }
-                else
-                {
+                if (changedNorms.Count == 0 ||
+                    changedNorms.All(changed => lineTokenSet.Contains(changed)))
                     return false;
-                }
             }
+
+            bool changedTokenPresent = changedNorms.Any(lineTokenSet.Contains);
+            if (changedNorms.Count > 0 && !changedTokenPresent)
+                return false;
+
+            int anchorHits = anchorNorms.Count(lineTokenSet.Contains);
+            int requiredAnchorHits = Math.Min(2, anchorNorms.Count);
+            bool hasAnchorContext = requiredAnchorHits > 0 && anchorHits >= requiredAnchorHits;
 
             if (specNorm.Length >= 30 && lineNorm.Length >= 30)
             {
                 string shorter = specNorm.Length <= lineNorm.Length ? specNorm : lineNorm;
                 string longer = specNorm.Length <= lineNorm.Length ? lineNorm : specNorm;
                 double ratio = (double)shorter.Length / longer.Length;
-                if (ratio >= 0.60 && longer.StartsWith(shorter, StringComparison.Ordinal))
-                    return HasNumericChangedWords(spec) || spec.ChangedWords.Count == 0;
+                bool orderedPrefix = ratio >= 0.60 &&
+                    longer.StartsWith(shorter, StringComparison.Ordinal);
+                bool hasChangeContext = hasAnchorContext || spec.WholeLineMode;
+                if (orderedPrefix &&
+                    hasChangeContext &&
+                    (HasNumericChangedWords(spec) || changedTokenPresent ||
+                     (spec.ChangedWords.Count == 0 && spec.WholeLineMode)))
+                {
+                    return true;
+                }
             }
 
-            var lineTokens = lineNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            var specTokens = specNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (lineTokens.Length >= 8 && specTokens.Length >= 8)
-            {
-                var lineSet = lineTokens.ToHashSet(StringComparer.Ordinal);
-                var specSet = specTokens.ToHashSet(StringComparer.Ordinal);
-                int common = lineSet.Intersect(specSet).Count();
-                int maxWc = Math.Max(lineSet.Count, specSet.Count);
-                int minWc = Math.Min(lineSet.Count, specSet.Count);
-                double wordOverlap = (double)common / maxWc;
-                double wordRatio = (double)minWc / maxWc;
-
-                return wordOverlap >= 0.92 &&
-                       wordRatio >= 0.75 &&
-                       (HasNumericChangedWords(spec) || spec.ChangedWords.Count == 0);
-            }
-
-            return lineNorm == specNorm && spec.ChangedWords.Count > 0;
+            return lineNorm == specNorm && (spec.ChangedWords.Count > 0 || spec.WholeLineMode);
         }
 
         private static HashSet<string> BuildChangedTokenSet(IEnumerable<string> changedWords)
@@ -358,97 +357,10 @@ namespace AfsPdfComparison.Services
                             HighlightSpec? matchedSpec = null;
                             foreach (var spec in specs)
                             {
-                                var specNorm = SnapNorm((spec.LineText ?? "").Trim());
-                                if (specNorm.Length < 4) continue;
-
-                                // ── Strict match strategy ────────────────────
-                                // Only highlight this rendered line when the spec
-                                // text is demonstrably the SAME line — not just a
-                                // word that happens to appear inside a longer sentence.
-                                //
-                                // Rule 1: exact normalised equality (handles case /
-                                //         spacing / invisible-char differences).
-                                if (lineNorm == specNorm)
+                                if (ShouldMatchSnapshotSpec(lineNorm, spec))
                                 {
-                                    if (spec.ChangedWords.Count > 0)
-                                    {
-                                        var lineTokenSet = new HashSet<string>(
-                                            lineNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries),
-                                            StringComparer.OrdinalIgnoreCase);
-                                        var changedNorms = spec.ChangedWords
-                                            .Select(w => SnapNorm(w ?? ""))
-                                            .Where(w => w.Length > 0)
-                                            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-                                        bool allAlreadyInLine = changedNorms.All(cw => lineTokenSet.Contains(cw));
-                                        if (allAlreadyInLine)
-                                            continue;
-                                    }
-                                    else
-                                    {
-                                        continue;
-                                    }
-                                }
-
-                                // Rule 2: prefix match for long lines that wrap
-                                // differently across PDFs (spec is the shorter version).
-                                // Both must be at least 30 chars to avoid false hits.
-                                if (specNorm.Length >= 30 && lineNorm.Length >= 30)
-                                {
-                                    string shorter = specNorm.Length <= lineNorm.Length ? specNorm : lineNorm;
-                                    string longer  = specNorm.Length <= lineNorm.Length ? lineNorm : specNorm;
-                                    // Length ratio must be ≥ 0.60 — spec must cover at
-                                    // least 60 % of the line to be a genuine prefix match,
-                                    // not just a short fragment of a long paragraph.
-                                    double ratio = (double)shorter.Length / longer.Length;
-                                    if (ratio >= 0.60 && longer.StartsWith(shorter, StringComparison.Ordinal))
-                                    {
-                                        bool hasNumericChange = spec.ChangedWords
-                                            .Any(w => System.Text.RegularExpressions.Regex.IsMatch(w ?? "", @"\d"));
-                                        if (hasNumericChange || spec.ChangedWords.Count == 0)
-                                        {
-                                            matchedSpec = spec;
-                                            break;
-                                        }
-
-                                        continue;
-                                    }
-                                }
-
-                                // Rule 3: high ordered-token overlap for long lines
-                                // (handles minor wording differences in the same sentence).
-                                // Only fires when BOTH spec and line have ≥ 6 words,
-                                // preventing short headings / single words from matching.
-                                var lineTokens = lineNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                                var specTokens = specNorm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                                if (lineTokens.Length >= 8 && specTokens.Length >= 8)
-                                {
-                                    var lineSet = lineTokens.ToHashSet(StringComparer.Ordinal);
-                                    var specSet = specTokens.ToHashSet(StringComparer.Ordinal);
-                                    int common  = lineSet.Intersect(specSet).Count();
-                                    int maxWc   = Math.Max(lineSet.Count, specSet.Count);
-                                    int minWc   = Math.Min(lineSet.Count, specSet.Count);
-                                    double wordOverlap = (double)common / maxWc;
-                                    double wordRatio   = (double)minWc  / maxWc;
-                                    // Both overlap AND length-ratio must clear high bars
-                                    // to ensure this is the SAME sentence, not a paragraph
-                                    // that happens to share many common English words.
-                                    bool hasNumericChange = spec.ChangedWords
-                                        .Any(w => System.Text.RegularExpressions.Regex.IsMatch(w ?? "", @"\d"));
-                                    if (wordOverlap >= 0.92 && wordRatio >= 0.75 &&
-                                        (hasNumericChange || spec.ChangedWords.Count == 0))
-                                    {
-                                        matchedSpec = spec;
-                                        break;
-                                    }
-                                }
-                                else if (lineNorm == specNorm)
-                                {
-                                    if (spec.ChangedWords.Count > 0)
-                                    {
-                                        matchedSpec = spec;
-                                        break;
-                                    }
+                                    matchedSpec = spec;
+                                    break;
                                 }
                             }
 

@@ -9,7 +9,7 @@
 // ║  SERVICE — LineComparatorService                                             ║
 // ║  Core diff engine: line comparison, word diff, number extraction.            ║
 // ║                                                                              ║
-// ║  v4.3.2 FIX — Gate 5: Word-overlap line-wrap artefact gate                  ║
+// ║  Content-aware status checks distinguish edits from extraction formatting.  ║
 // ║  ROOT CAUSE: pdfplumber/PdfPig wraps long paragraphs at different column    ║
 // ║  widths per PDF. The sentence:                                               ║
 // ║    "used. The separate financial statements...IAS 27 Consolidated"           ║
@@ -18,8 +18,7 @@
 // ║     and Separate Financial Statements."                                      ║
 // ║  These score 0.87–0.91 — above SIM_RELATED(0.55) so they are matched,      ║
 // ║  but below SIM_EXACT(0.94) so they were falsely flagged "changed".          ║
-// ║  Gate 5 fix: if >=85% of shorter line's words appear in the longer line     ║
-// ║  AND shorter is >=55% the length of longer → line-wrap artefact → "same"    ║
+// ║  Wrap suppression requires an ordered prefix, not loose word overlap.       ║
 // ║                                                                              ║
 // ║  References:                                                                 ║
 // ║   • Ratcliff/Obershelp string similarity — see PageAlignmentService         ║
@@ -49,12 +48,8 @@ namespace AfsPdfComparison.Services;
 //      d. Determine final status using the three-gate equality check.
 //   4. AFS 1 lines that were never matched are flagged as "removed".
 //
-// Five-gate equality (v4.3.2):
-//   Gate 1 — Canonical string equality (ignores whitespace, punctuation, number fmt)
-//   Gate 2 — Similarity score ≥ SIM_EXACT (0.94)
-//   Gate 3 — All numbers match AND score ≥ 0.80
-//   Gate 4 — Normalised text equality
-//   Gate 5 — Word-overlap ≥ 0.85 AND length ratio ≥ 0.55 (line-wrap artefact)
+// Equality is based on normalized content. Similarity scores pair candidate
+// lines; they do not by themselves prove the content is unchanged.
 //
 // Reference: Python LineComparator class in the notebook v4.3.2
 // ─────────────────────────────────────────────────────────────────────────────
@@ -71,14 +66,8 @@ public class LineComparatorService
     private const double GapPenalty = 0.24;
     private const int MaxAlignmentCells = 250_000;
 
-    // Gate 5 thresholds (word-overlap line-wrap artefact gate)
-    private const double WordOverlapThreshold = 0.85;
-    private const double WordOverlapThresholdLong = 0.90;
-    private const int LongLineWords = 12;
     private const double LengthRatioThreshold = 0.55;
 
-    // Gate 7: cross-page bleed suppression
-    private const double CrossPageBleedSim = 0.90;
     private const int NeighbourContextLines = 8;
 
     // Regex: strip page-number stamps before number extraction.
@@ -88,12 +77,40 @@ public class LineComparatorService
         @"(?m)^[-–—\s]*\(?\s*\d{1,4}\s*\)?[-–—\s]*$",
         RegexOptions.Compiled | RegexOptions.Multiline);
 
+    // #2 — Header/footer line detector.
+    // Matches lines that appear as page decoration rather than audit content:
+    //   "Page 3 of 10", "3 of 10", "(continued)", "...continued", copyright notices,
+    //   confidentiality notices, standalone years (4-digit), and running-header
+    //   short ALL-CAPS fragments (≤3 words, no digits — e.g. repeated title bars).
+    private static readonly Regex _headerFooterRe = new(
+        @"^(?:page\s+\d+\s+of\s+\d+|p\.\s*\d+|\d{1,4}\s+of\s+\d{1,4}|" +
+        @"\(?continued\.?\)?|\.{2,}continued|continued\.{2,}|" +
+        @"copyright\s*©|©\s*\d{4}|all\s+rights?\s+reserved|" +
+        @"confidential(?:ity)?|for\s+official\s+use\s+only|" +
+        @"unaudited|draft\s+only|prepared\s+by|" +
+        @"(?:19|20)\d{2})$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    // #10 — Number-format normalization: "R 1 234 567" and "R1,234,567" and "1234567" are the same.
+    private static readonly Regex _rCurrencyRe   = new(@"\br\s*(?=\d)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex _saThousandsRe = new(@"(?<=\d) (?=\d{3}\b)", RegexOptions.Compiled);
+    private static readonly Regex _commaDecimalRe = new(@"(\d),(\d\d?)(?!\d)", RegexOptions.Compiled);
+
     // Regex: extract numeric tokens (integers and decimals).
     // Handles South African space-thousands-separator format: "6 835" → 6835.
     // Only allows a SINGLE space between digit groups of exactly 3 digits
     // (i.e. real thousands separator, not arbitrary whitespace between numbers).
     private static readonly Regex _numTokenRe = new(
         @"\b\d{1,3}(?:[,\.]?\d{3})*(?:\.\d+)?\b|\b\d+ \d{3}(?:\.\d+)?\b", RegexOptions.Compiled);
+
+    // Static compiled pattern for ExtractNumbers — must NOT be created inside the method
+    // because RegexOptions.Compiled triggers IL compilation on every instantiation,
+    // adding seconds of overhead when ExtractNumbers is called thousands of times per comparison.
+    private static readonly Regex _extNumRe = new(
+        @"\((\d{1,3}(?:[\s,]\d{3})*(?:\.\d+)?)\)" +
+        @"|\b(\d{1,3}(?:[,\.]?\d{3})*(?:\.\d+)?)\b" +
+        @"|\b(\d+\s\d{3}(?:\s\d{3})*(?:\.\d+)?)\b",
+        RegexOptions.Compiled);
     private static readonly Regex _noteMarkerRe = new(
         @"^(?:note\s+)?\d+(?:\.\d+)*\.?$",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
@@ -145,7 +162,7 @@ public class LineComparatorService
             {
                 used1.Add(bestIdx);
                 string l1     = lines1[bestIdx];
-                string status = DetermineStatus(l1, l2, bestSc);
+                string status = DetermineStatus(l1, l2);
                 var    n1set  = ExtractNumbers(l1);
                 var    n2set  = ExtractNumbers(l2);
                 var    numDiff = status == "changed"
@@ -285,7 +302,7 @@ public class LineComparatorService
             {
                 string l1 = lines1[step.I1.Value];
                 string l2 = lines2[step.I2.Value];
-                string status = DetermineStatus(l1, l2, step.Sim);
+                string status = DetermineStatus(l1, l2);
                 var n1set = ExtractNumbers(l1);
                 var n2set = ExtractNumbers(l2);
                 var numDiff = status == "changed"
@@ -400,6 +417,7 @@ public class LineComparatorService
             string context2 = BuildNeighbourContext(report2.Pages, i2, NeighbourContextLines);
             var diff = CompareLinesGreedy(SplitLines(context1), SplitLines(context2));
             diff = SuppressBleedDiffsV2(diff, report1, report2, i1, i2);
+            diff = MergeParagraphReflowArtefacts(diff);
 
             int same  = diff.Count(d => d.Status == "same" || d.Status == "same-cross-page");
             int chg   = diff.Count(d => d.Status == "changed");
@@ -473,6 +491,108 @@ public class LineComparatorService
     // ─────────────────────────────────────────────────────────────────────────
     // SECTION 3-INTERNAL · HELPERS
     // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Post-processing pass that detects paragraph-reflow false positives.
+    ///
+    /// When two PDFs use different font sizes or column widths, the same paragraph
+    /// text is broken into lines at different points. The line-by-line comparison
+    /// marks these as "changed" because individual lines differ. But when consecutive
+    /// changed line pairs are joined and their pure alphanumeric content compared,
+    /// they are identical — a reflow artefact, not a real change.
+    ///
+    /// Safety guards:
+    ///   • Only merges narrative runs (content must contain letters — not number-only rows).
+    ///   • Does NOT merge when numbers differ (financial table values are preserved).
+    ///   • Requires ≥ 20 chars of pure content to avoid merging trivial noise.
+    ///   • Checks runs of 2–6 consecutive changed pairs.
+    /// </summary>
+    private static List<LineDiffResult> MergeParagraphReflowArtefacts(List<LineDiffResult> diffs)
+    {
+        var result = new List<LineDiffResult>(diffs.Count);
+        int i = 0;
+
+        while (i < diffs.Count)
+        {
+            var d = diffs[i];
+
+            // Only start a merge attempt on a "changed" pair with both sides filled.
+            if (d.Status != "changed" ||
+                string.IsNullOrEmpty(d.Line1) ||
+                string.IsNullOrEmpty(d.Line2))
+            {
+                result.Add(d);
+                i++;
+                continue;
+            }
+
+            // Scan ahead up to 12 positions, tolerating up to 2 "same" lines
+            // between "changed" lines — font-size reflow produces mixed runs.
+            int runEnd      = i;
+            int sameSkipped = 0;
+            for (int j = i + 1; j < Math.Min(i + 12, diffs.Count); j++)
+            {
+                var next = diffs[j];
+                if (next.Status == "changed" &&
+                    !string.IsNullOrEmpty(next.Line1) &&
+                    !string.IsNullOrEmpty(next.Line2))
+                {
+                    runEnd = j;
+                    sameSkipped = 0;
+                }
+                else if ((next.Status == "same" || next.Status == "same-cross-page")
+                         && sameSkipped < 2)
+                {
+                    sameSkipped++;   // allow a short gap without breaking the run
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            if (runEnd > i)
+            {
+                // Include everything from i to runEnd (changed + skipped sames).
+                var run = diffs.GetRange(i, runEnd - i + 1);
+                string joinedL1 = string.Join(" ", run
+                    .Where(r => !string.IsNullOrEmpty(r.Line1)).Select(r => r.Line1));
+                string joinedL2 = string.Join(" ", run
+                    .Where(r => !string.IsNullOrEmpty(r.Line2)).Select(r => r.Line2));
+
+                // Strip everything except word chars (letters + digits + underscore).
+                string pure1 = Regex.Replace(Normalise(joinedL1), @"[^\w]", "");
+                string pure2 = Regex.Replace(Normalise(joinedL2), @"[^\w]", "");
+
+                // Must be substantially alphabetic (not a financial number block)
+                // and the joined content must be identical.
+                bool hasAlpha   = pure1.Any(char.IsLetter);
+                bool longEnough = pure1.Length >= 20;
+                bool matches    = pure1 == pure2;
+
+                if (hasAlpha && longEnough && matches)
+                {
+                    foreach (var rd in run)
+                        result.Add(new LineDiffResult
+                        {
+                            Status     = "same",
+                            Line1      = rd.Line1,
+                            Line2      = rd.Line2,
+                            Similarity = 1.0,
+                            NumDiff    = new List<string>(),
+                            WordDiff   = new List<WordDiffToken>(),
+                        });
+                    i = runEnd + 1;
+                    continue;
+                }
+            }
+
+            result.Add(d);
+            i++;
+        }
+
+        return result;
+    }
 
     private static string BuildNeighbourContext(
         List<string> pages,
@@ -560,14 +680,15 @@ public class LineComparatorService
     private static List<string> BuildAdjacentLinePool(
         List<string> pages,
         int centerIdx,
-        int neighbourRadius)
+        int neighbourRadius,
+        int excludedPageIdx = -1)
     {
         var pool = new List<string>();
 
         for (int delta = -neighbourRadius; delta <= neighbourRadius; delta++)
         {
             int idx = centerIdx + delta;
-            if (idx < 0 || idx >= pages.Count)
+            if (idx < 0 || idx >= pages.Count || idx == excludedPageIdx)
                 continue;
 
             pool.AddRange(SplitLines(pages[idx]));
@@ -581,8 +702,6 @@ public class LineComparatorService
         public string Norm { get; init; } = string.Empty;
         public string Canon { get; init; } = string.Empty;
         public string Flat { get; init; } = string.Empty;
-        public HashSet<string> Tokens { get; init; } = new(StringComparer.OrdinalIgnoreCase);
-        public HashSet<string> Numbers { get; init; } = new();
     }
 
     private static BleedCandidate BuildBleedCandidate(string line)
@@ -593,10 +712,6 @@ public class LineComparatorService
             Norm = norm,
             Canon = Canonical(line),
             Flat = WhitespaceAgnosticCanonical(line),
-            Tokens = norm.Split(' ', StringSplitOptions.RemoveEmptyEntries)
-                .Where(t => t.Length >= 3)
-                .ToHashSet(StringComparer.OrdinalIgnoreCase),
-            Numbers = ExtractNumbers(line),
         };
     }
 
@@ -607,11 +722,19 @@ public class LineComparatorService
         int pageIdx1,
         int pageIdx2)
     {
-        var pool2 = BuildAdjacentLinePool(report2.Pages, pageIdx2, neighbourRadius: 2)
+        var pool2 = BuildAdjacentLinePool(
+                report2.Pages,
+                pageIdx2,
+                neighbourRadius: 2,
+                excludedPageIdx: pageIdx2)
             .Select(BuildBleedCandidate)
             .Where(c => c.Norm.Length >= 6)
             .ToList();
-        var pool1 = BuildAdjacentLinePool(report1.Pages, pageIdx1, neighbourRadius: 2)
+        var pool1 = BuildAdjacentLinePool(
+                report1.Pages,
+                pageIdx1,
+                neighbourRadius: 2,
+                excludedPageIdx: pageIdx1)
             .Select(BuildBleedCandidate)
             .Where(c => c.Norm.Length >= 6)
             .ToList();
@@ -634,23 +757,6 @@ public class LineComparatorService
                     diff.CrossPageNote = "Content found on adjacent AFS1 page - page layout differs between drafts";
                 }
             }
-            else if (diff.Status == "changed" &&
-                     !string.IsNullOrWhiteSpace(diff.Line1) &&
-                     !string.IsNullOrWhiteSpace(diff.Line2))
-            {
-                bool leftCross = LooksLikeCrossPageEquivalent(diff.Line1, pool2);
-                bool rightCross = LooksLikeCrossPageEquivalent(diff.Line2, pool1);
-                bool sameNumbers = ExtractNumbers(diff.Line1).SetEquals(ExtractNumbers(diff.Line2));
-
-                if ((leftCross || rightCross) &&
-                    (sameNumbers || diff.Similarity < 0.78 ||
-                     LooksLikeCrossPageFragment(diff.Line1) ||
-                     LooksLikeCrossPageFragment(diff.Line2)))
-                {
-                    diff.Status = "same-cross-page";
-                    diff.CrossPageNote = "Equivalent content resolved on adjacent pages - page layout differs between drafts";
-                }
-            }
         }
 
         return diffs;
@@ -663,67 +769,9 @@ public class LineComparatorService
             return false;
 
         string canon = Canonical(line);
-        string flat = WhitespaceAgnosticCanonical(line);
-        var tokens = norm.Split(' ', StringSplitOptions.RemoveEmptyEntries)
-            .Where(t => t.Length >= 3)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var numbers = ExtractNumbers(line);
-
-        foreach (var candidate in pool)
-        {
-            if (candidate.Norm == norm || candidate.Canon == canon || candidate.Flat == flat)
-                return true;
-
-            if (canon.Length >= 8 &&
-                (candidate.Canon.Contains(canon, StringComparison.Ordinal) ||
-                 canon.Contains(candidate.Canon, StringComparison.Ordinal)) &&
-                SharedTokenCount(tokens, candidate.Tokens) >= Math.Min(2, tokens.Count))
-            {
-                return true;
-            }
-
-            double overlap = TokenOverlap(tokens, candidate.Tokens);
-            bool numbersCompatible = numbers.Count == 0 || candidate.Numbers.SetEquals(numbers);
-
-            if (tokens.Count >= 3 && overlap >= 0.80 && numbersCompatible)
-                return true;
-
-            if (norm.Length >= 25 &&
-                candidate.Norm.Length >= 25 &&
-                numbersCompatible &&
-                PageAlignmentService.SequenceSimilarity(norm, candidate.Norm) >= CrossPageBleedSim)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private static int SharedTokenCount(HashSet<string> left, HashSet<string> right)
-        => left.Count == 0 || right.Count == 0 ? 0 : left.Intersect(right).Count();
-
-    private static double TokenOverlap(HashSet<string> left, HashSet<string> right)
-    {
-        if (left.Count == 0 || right.Count == 0)
-            return 0.0;
-
-        int common = left.Intersect(right).Count();
-        return (double)common / Math.Min(left.Count, right.Count);
-    }
-
-    private static bool LooksLikeCrossPageFragment(string line)
-    {
-        string norm = Normalise(line);
-        if (norm.Length == 0)
-            return false;
-
-        var words = norm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        bool noSentenceStop = !norm.EndsWith('.') && !norm.EndsWith('!') && !norm.EndsWith('?');
-        bool hasNumbers = ExtractNumbers(line).Count > 0;
-
-        return (words.Length <= 4 && noSentenceStop) ||
-               (!hasNumbers && words.Length <= 8 && norm.Length <= 60);
+        return pool.Any(candidate =>
+            candidate.Norm == norm ||
+            candidate.Canon == canon);
     }
 
     // Split text into non-noise lines.
@@ -787,6 +835,8 @@ public class LineComparatorService
         // it misses the reversed order.  This second pass scans ALL lines:
         // any ≤3-word line that is a whole-word substring of ANY other line in
         // the same page is an orphan annotation duplicate and is removed.
+        // Pre-compute normalised forms once to avoid O(n²) repeated Normalise calls.
+        var mergedNormsDedup = merged.Select(Normalise).ToArray();
         var deduped = new List<string>(merged.Count);
         for (int k = 0; k < merged.Count; k++)
         {
@@ -794,12 +844,12 @@ public class LineComparatorService
             int wc = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
             if (wc > 0 && wc <= 3)
             {
-                string nm = Normalise(line);
+                string nm = mergedNormsDedup[k];
                 bool orphan = false;
                 for (int j = 0; j < merged.Count; j++)
                 {
                     if (j == k) continue;
-                    if ((" " + Normalise(merged[j]) + " ").Contains(" " + nm + " "))
+                    if ((" " + mergedNormsDedup[j] + " ").Contains(" " + nm + " "))
                     {
                         orphan = true;
                         break;
@@ -809,7 +859,34 @@ public class LineComparatorService
             }
             deduped.Add(line);
         }
-        return deduped.Where(line => !IsIgnorableStandaloneLine(line)).ToList();
+        return deduped
+            .Where(line => !IsIgnorableStandaloneLine(line))
+            .Where(line => !IsHeaderOrFooter(line))
+            .ToList();
+    }
+
+    // #2 — Returns true for lines that are pure page decoration (header/footer artefacts).
+    // Conservative: only strips clear-cut patterns so real content is never lost.
+    private static bool IsHeaderOrFooter(string line)
+    {
+        string norm = Normalise(line);
+        if (string.IsNullOrWhiteSpace(norm) || norm.Length > 120)
+            return false;
+        // Already handled by _pageStampRe / IsIgnorableStandaloneLine — belt-and-braces
+        if (_headerFooterRe.IsMatch(norm))
+            return true;
+        // Short ALL-CAPS line with no digits and ≤5 words: likely a running header/title bar
+        // but NOT a financial statement heading (those have lowercase words too)
+        if (norm.Length <= 60 && norm == norm.ToUpperInvariant() &&
+            !norm.Any(char.IsDigit) &&
+            norm.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length <= 5 &&
+            norm.All(c => char.IsLetter(c) || char.IsWhiteSpace(c) || c == '-' || c == '/' || c == '&'))
+        {
+            // Allowlist: short ALL-CAPS that are valid section headings
+            // (we preserve these because auditors need them as section markers)
+            return false;
+        }
+        return false;
     }
 
     private PageDiffResult? TryBuildSecondaryMatchFromAfs1(
@@ -1147,41 +1224,49 @@ public class LineComparatorService
 
     // Score two lines: base similarity + numeric bonus/penalty.
     // Reference: Python LineComparator._score()
+    // Early-exit: if the first (cheapest) similarity already clears SimExact we skip the
+    // three heavier canonical-form comparisons; if it is above SimRelated we still check
+    // the others because canonical forms can expose additional matches.
     private static double Score(string l1, string l2)
     {
         double sim = PageAlignmentService.SequenceSimilarity(Normalise(l1), Normalise(l2));
-        sim = Math.Max(sim, PageAlignmentService.SequenceSimilarity(ParentheticalCanonical(l1), ParentheticalCanonical(l2)));
-        sim = Math.Max(sim, PageAlignmentService.SequenceSimilarity(SemanticSkeleton(l1), SemanticSkeleton(l2)));
-        sim = Math.Max(sim, PageAlignmentService.SequenceSimilarity(WhitespaceAgnosticCanonical(l1), WhitespaceAgnosticCanonical(l2)));
+        if (sim < SimExact)
+        {
+            sim = Math.Max(sim, PageAlignmentService.SequenceSimilarity(ParentheticalCanonical(l1), ParentheticalCanonical(l2)));
+            if (sim < SimExact)
+            {
+                sim = Math.Max(sim, PageAlignmentService.SequenceSimilarity(SemanticSkeleton(l1), SemanticSkeleton(l2)));
+                if (sim < SimExact)
+                    sim = Math.Max(sim, PageAlignmentService.SequenceSimilarity(WhitespaceAgnosticCanonical(l1), WhitespaceAgnosticCanonical(l2)));
+            }
+        }
         var    nums1  = ExtractNumbers(l1);
         var    nums2  = ExtractNumbers(l2);
-        double bonus  = nums1.Count > 0 && nums2.Count > 0 && nums1.SetEquals(nums2) ?  0.04 : 0.0;
-        double penalty= nums1.Count > 0 && nums2.Count > 0 && !nums1.SetEquals(nums2) ? -0.06 : 0.0;
+        double bonus  = nums1.Count > 0 && nums2.Count > 0 && nums1.SetEquals(nums2) ? 0.04 : 0.0;
+
+        // When numbers differ, CAP similarity below SimExact so the line is always
+        // flagged "changed" regardless of how similar the surrounding text is.
+        // This is the key fix for lines like "Revenue 5 234 000" vs "Revenue 5 345 000"
+        // which score ~0.95 text similarity but have genuinely different amounts.
+        double penalty = 0.0;
+        if (nums1.Count > 0 && nums2.Count > 0 && !nums1.SetEquals(nums2))
+        {
+            // Cap at 0.92 (below SimExact 0.96) to ensure "changed" status
+            sim     = Math.Min(sim, 0.92);
+            penalty = -0.02;   // small additional push down
+        }
+
         return Math.Min(1.0, sim + bonus + penalty);
     }
 
     /// <summary>
-    /// Five-gate equality determination. (v4.3.2)
+    /// Determines whether a matched line has the same normalized content.
     ///
-    /// Gate 1 — Canonical string equality
-    /// Gate 2 — Similarity score ≥ SIM_EXACT (0.94)
-    /// Gate 3 — All numbers identical AND score ≥ 0.80
-    /// Gate 4 — Normalised text equality
-    /// Gate 5 — Word-overlap line-wrap artefact gate (NEW in v4.3.2)
-    ///
-    /// Gate 5 rationale:
-    /// PDF text extraction wraps long paragraphs at the column width of each
-    /// individual PDF. Two PDFs with slightly different margins produce the
-    /// same sentence broken at different points, e.g.:
-    ///   AFS1: "...requirements of IAS 27 Consolidated"         (line ends here)
-    ///   AFS2: "...requirements of IAS 27 Consolidated and Separate Financial..."
-    /// These score ~0.87–0.91 — matched but below SIM_EXACT — causing a false
-    /// "changed" flag and incorrect yellow highlight on the snapshot.
-    /// Gate 5: if ≥85% of the shorter line's word tokens appear in the longer
-    /// line AND the shorter is ≥55% the length of the longer, this is a
-    /// line-wrap artefact, not a genuine content change → return "same".
+    /// Whitespace and punctuation normalization prevents formatting-only
+    /// highlights. A wrap extension is ignored only when its ordered words
+    /// form a prefix; loose word overlap can conceal substantive edits.
     /// </summary>
-    private static string DetermineStatus(string l1, string l2, double rawScore)
+    private static string DetermineStatus(string l1, string l2)
     {
         // Gate 0: Case- and whitespace-insensitive equality.
         // Lines that differ ONLY in capitalisation, spacing, or Unicode whitespace variants
@@ -1201,24 +1286,11 @@ public class LineComparatorService
         if (WhitespaceAgnosticCanonical(l1) == WhitespaceAgnosticCanonical(l2))
             return "same";
 
-        // Gate 1b: ignore parenthetical wrappers and leading note markers.
-        string p1 = ParentheticalCanonical(l1);
-        string p2 = ParentheticalCanonical(l2);
-        if (p1.Length > 0 && p1 == p2)             return "same";
-
-        string s1 = SemanticSkeleton(l1);
-        string s2 = SemanticSkeleton(l2);
         var n1 = ExtractNumbers(l1);
         var n2 = ExtractNumbers(l2);
 
-        if (s1.Length > 0 && s1 == s2 &&
-            n1.SetEquals(n2))
-            return "same";
-
-        // Gate 1c: Pure formatting difference gate.
-        // If the token sets are identical and the numeric content matches, treat
-        // the lines as the same even when PDF extraction introduced subtle
-        // spacing / style artefacts or paragraph reflow noise.
+        // Keep the legacy short-label reorder allowance without allowing a
+        // single changed word in a longer disclosure to disappear in a set match.
         var w1set = new HashSet<string>(
             Normalise(l1).Split(' ', StringSplitOptions.RemoveEmptyEntries),
             StringComparer.OrdinalIgnoreCase);
@@ -1226,76 +1298,38 @@ public class LineComparatorService
             Normalise(l2).Split(' ', StringSplitOptions.RemoveEmptyEntries),
             StringComparer.OrdinalIgnoreCase);
 
-        if (w1set.Count > 0 && w2set.Count > 0)
-        {
-            if (w1set.SetEquals(w2set) && n1.SetEquals(n2))
-                return "same";
+        if (w1set.Count is > 0 and <= 4 &&
+            w2set.Count is > 0 and <= 4 &&
+            w1set.SetEquals(w2set) &&
+            n1.SetEquals(n2))
+            return "same";
 
-            if (w1set.Count >= 8 && w2set.Count >= 8)
-            {
-                int common = w1set.Intersect(w2set).Count();
-                double overlap = (double)common / Math.Max(w1set.Count, w2set.Count);
-                if (overlap >= 0.95 && n1.SetEquals(n2))
-                    return "same";
-            }
-        }
-
-        // Gate 2: Similarity score above exact threshold
-        if (rawScore >= SimExact)                  return "same";
-
-        // Gate 3: Numbers identical at lower score
-        if (n1.SetEquals(n2) && rawScore >= 0.80)  return "same";
-
-        // Gate 4: Normalised text equality (kept for safety; identical to Gate 0)
-        if (Normalise(l1) == Normalise(l2))        return "same";
-
-        // Gate 5: Word-overlap line-wrap artefact gate
-        var w1 = new HashSet<string>(
-            Normalise(l1).Split(' ', StringSplitOptions.RemoveEmptyEntries),
-            StringComparer.OrdinalIgnoreCase);
-        var w2 = new HashSet<string>(
-            Normalise(l2).Split(' ', StringSplitOptions.RemoveEmptyEntries),
-            StringComparer.OrdinalIgnoreCase);
-
-        // Gate 5 is directional: only fires when l2 (AFS2) has at least as many
-        // words as l1 (AFS1).  Rationale: line-wrap artefacts occur when AFS1
-        // wraps a sentence EARLIER than AFS2 (AFS2's column is wider), so l2 is
-        // LONGER.  If l2 is SHORTER, the missing words in AFS2 represent real
-        // content removals (e.g. a number like "11 639" present in AFS1 but
-        // absent in AFS2) and must NOT be silenced — they are genuine changes.
-        //
-        // NUMBER GUARD: if the lines contain any numeric tokens and those sets
-        // differ even by one digit (e.g. R217 vs R218), this is a genuine content
-        // change — Gate 5 must NOT suppress it regardless of word-overlap.
-        //
-        // SHORT-LINE GUARD: a 1–3 word line (e.g. single hyperlink word "users")
-        // must not be silenced by matching against a long paragraph that happens
-        // to contain that word.
+        // A wrap can extend a line, but shared words alone cannot prove that
+        // longer disclosures are equivalent. Require the shorter line to be an
+        // exact ordered prefix of the longer line.
         bool numbersMatch = n1.Count == 0 && n2.Count == 0 || n1.SetEquals(n2);
-        if (w1.Count > 0 && w2.Count > 0 && w2.Count >= w1.Count
-            && numbersMatch
-            && w1.Count >= 4)   // short-line guard: skip for 1–3 word lines
+        var orderedW1 = Canonical(l1).Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var orderedW2 = Canonical(l2).Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var shorterWords = orderedW1.Length <= orderedW2.Length ? orderedW1 : orderedW2;
+        var longerWords = orderedW1.Length <= orderedW2.Length ? orderedW2 : orderedW1;
+        string shorterText = orderedW1.Length <= orderedW2.Length ? Normalise(l1) : Normalise(l2);
+        bool isOrderedPrefix = shorterWords.Length >= 4 &&
+                               shorterWords.Length <= longerWords.Length &&
+                               longerWords.Take(shorterWords.Length).SequenceEqual(
+                                   shorterWords,
+                                   StringComparer.OrdinalIgnoreCase);
+        bool endsWithSentenceStop = shorterText.Length > 0 &&
+                                    shorterText[^1] is '.' or '!' or '?';
+        double lengthRatio = longerWords.Length == 0
+            ? 0
+            : (double)shorterWords.Length / longerWords.Length;
+        if (numbersMatch && isOrderedPrefix && !endsWithSentenceStop && lengthRatio >= LengthRatioThreshold)
         {
-            int    intersection = w1.Intersect(w2).Count();
-            int    minLen       = w1.Count;   // l1 is shorter or equal
-            int    maxLen       = w2.Count;   // l2 is longer or equal
-            double overlap  = (double)intersection / minLen;
-            double lenRatio = (double)minLen / maxLen;
-            double threshold = minLen >= LongLineWords
-                ? WordOverlapThresholdLong
-                : WordOverlapThreshold;
-
-            if (overlap >= threshold && lenRatio >= LengthRatioThreshold)
-                return "same";
+            return "same";
         }
 
-        // Gate 6: Paragraph-wrap prefix gate.
-        // When one PDF's column is wider, its extracted line contains the entire
-        // text of the narrower PDF's line PLUS the next wrapped continuation.
-        // If the shorter normalised line (≥ 40 chars) is a LEADING SUBSTRING of
-        // the longer one AND the shorter line does NOT end in a sentence-terminal
-        // character (proving it is a mid-sentence fragment, not a truncated
-        // sentence), treat this pair as identical — same text, different wrap.
+        // A longer extracted line may include a continuation from the next
+        // wrapped line. Require a word boundary so a partial-word edit is kept.
         string gn1 = Normalise(l1), gn2 = Normalise(l2);
         if (gn1.Length >= 40 && gn2.Length >= 40)
         {
@@ -1303,7 +1337,10 @@ public class LineComparatorService
             string longer  = gn1.Length <= gn2.Length ? gn2 : gn1;
             char   shortEnd = shorter[^1];
             bool   endsStop = shortEnd is '.' or '!' or '?';
-            if (!endsStop && longer.StartsWith(shorter, StringComparison.Ordinal))
+            bool   endsAtWordBoundary = shorter.Length < longer.Length &&
+                (char.IsWhiteSpace(longer[shorter.Length]) || char.IsPunctuation(longer[shorter.Length]));
+            if (!endsStop && endsAtWordBoundary &&
+                longer.StartsWith(shorter, StringComparison.Ordinal))
                 return "same";
         }
 
@@ -1311,7 +1348,7 @@ public class LineComparatorService
     }
 
     // Normalise: lowercase, collapse whitespace, strip pure page-number lines.
-    // internal static — also used by Gate 4 / Gate 5 in DetermineStatus.
+    // internal static — shared with snapshot matching.
     // v4.3.2 FIX: NFKD decomposition + \p{C} strip eliminates invisible Unicode
     // control chars (zero-width spaces, object-replacement chars, etc.) that
     // PdfPig embeds around hyperlinked words, causing false "changed" verdicts.
@@ -1338,6 +1375,13 @@ public class LineComparatorService
         // Normalise spacing around hyphens: "provisions  -  2025" → "provisions - 2025"
         t = Regex.Replace(t, @"\s*-\s*", " - ");
         t = Regex.Replace(t, @"^[-–—\s]*\d{1,4}[-–—\s]*$", "").Trim();
+        // #10 — Number-format normalization so that "R 1 234 567", "R1,234,567",
+        // and "1 234 567" compare as equal. Applied AFTER dash-normalization.
+        t = _rCurrencyRe.Replace(t, "");                    // strip "R" currency prefix
+        t = _saThousandsRe.Replace(t, "");                  // "1 234" → "1234"
+        t = _commaDecimalRe.Replace(t, "$1.$2");            // "12,5" → "12.5" (SA decimal comma)
+        t = Regex.Replace(t, @"(?<=\d),(?=\d{3})", "");    // "1,234" → "1234" (thousands comma)
+        t = Regex.Replace(t, @"\s+", " ").Trim();
         return t;
     }
 
@@ -1370,13 +1414,8 @@ public class LineComparatorService
     {
         string cleaned = _pageStampRe.Replace(text ?? "", "");
         var result     = new HashSet<string>();
-        var extendedPattern = new Regex(
-            @"\((\d{1,3}(?:[\s,]\d{3})*(?:\.\d+)?)\)" +
-            @"|\b(\d{1,3}(?:[,\.]?\d{3})*(?:\.\d+)?)\b" +
-            @"|\b(\d+\s\d{3}(?:\s\d{3})*(?:\.\d+)?)\b",
-            RegexOptions.Compiled);
 
-        foreach (Match m in extendedPattern.Matches(cleaned))
+        foreach (Match m in _extNumRe.Matches(cleaned))
         {
             string raw = m.Groups[1].Success ? m.Groups[1].Value
                 : m.Groups[2].Success ? m.Groups[2].Value

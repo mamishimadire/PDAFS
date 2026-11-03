@@ -273,6 +273,109 @@ body {
 .sb-nav-badge.is-pending { background: rgba(255,255,255,0.10); color: rgba(255,255,255,0.5); }
 
 /* ── Sidebar Footer ── */
+.boost-status-card {
+    padding: 12px 12px 11px;
+    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.18);
+    background: rgba(255,255,255,0.08);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+    transition: var(--trans);
+}
+
+.boost-status-card.is-active {
+    border-color: rgba(16,185,129,0.45);
+    background:
+        radial-gradient(circle at top right, rgba(16,185,129,0.24), transparent 48%),
+        rgba(16,185,129,0.13);
+}
+
+.boost-status-card.is-inactive {
+    border-color: rgba(239,68,68,0.45);
+    background:
+        radial-gradient(circle at top right, rgba(239,68,68,0.18), transparent 48%),
+        rgba(239,68,68,0.11);
+}
+
+.boost-status-label {
+    color: #ffd1d8;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+}
+
+.boost-status-value {
+    color: #ffffff;
+    font-size: 15px;
+    font-weight: 700;
+    line-height: 1.2;
+}
+
+.boost-status-card.is-active .boost-status-value {
+    color: #a7f3d0;
+}
+
+.boost-status-card.is-inactive .boost-status-value {
+    color: #fecaca;
+}
+
+.boost-status-summary {
+    margin-top: 4px;
+    color: rgba(255,255,255,0.74);
+    font-size: 11px;
+    line-height: 1.45;
+}
+
+.boost-status-lights {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.boost-model-light {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.08);
+    color: rgba(255,255,255,0.75);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+
+.boost-model-light-dot {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.2);
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.08);
+}
+
+.boost-model-light[data-key="gemini"].is-active .boost-model-light-dot {
+    background: #fbbf24;
+    box-shadow: 0 0 0 3px rgba(251,191,36,0.18);
+}
+
+.boost-model-light[data-key="groq"].is-active .boost-model-light-dot {
+    background: #fb7185;
+    box-shadow: 0 0 0 3px rgba(251,113,133,0.18);
+}
+
+.boost-model-light[data-key="openrouter"].is-active .boost-model-light-dot {
+    background: #93c5fd;
+    box-shadow: 0 0 0 3px rgba(147,197,253,0.18);
+}
+
+.boost-model-light.is-inactive {
+    color: rgba(255,255,255,0.45);
+    background: rgba(255,255,255,0.04);
+}
+
 .sb-footer {
     padding:        14px 16px 18px;
     border-top:     1px solid var(--sb-border);

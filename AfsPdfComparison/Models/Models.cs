@@ -136,9 +136,8 @@ public class PdfReport
     public string Filename    { get; set; } = string.Empty;
 
     /// <summary>
-    /// Extraction method: "digital" if pdfpig found selectable text,
-    /// "scanned" if text came from a rasterised image (OCR not implemented in
-    /// this C# version — scanned PDFs return empty pages with a warning).
+    /// Extraction method: "digital" if PdfPig found selectable text,
+    /// or an OCR-derived variant when text was recovered from a rasterised scan.
     /// </summary>
     public string DocType     { get; set; } = string.Empty;
 
@@ -398,6 +397,21 @@ public class ComparisonResult
     /// <summary>Result from Gemini directly reading and comparing both AFS documents (content-level AI).</summary>
     public AiContentReadResult? AiContentRead { get; set; }
 
+    /// <summary>Deterministic system-generated audit findings — no AI required.</summary>
+    public List<AutoReviewFinding>   AutoReview           { get; set; } = new();
+
+    /// <summary>Labeled financial figure changes extracted from table rows.</summary>
+    public List<LabeledNumberChange> LabeledNumberChanges { get; set; } = new();
+
+    /// <summary>#3 — Table cell-level diffs (row × col comparison).</summary>
+    public List<TableCellDiff> TableCellDiffs { get; set; } = new();
+
+    /// <summary>#4 — Prior-year comparative column mismatches (GRAP 3 / IAS 8).</summary>
+    public List<ComparativeMismatch> ComparativeMismatches { get; set; } = new();
+
+    /// <summary>#6 — Auditor-set materiality threshold in rands (default 0 = show all).</summary>
+    public decimal MaterialityThreshold { get; set; } = 0;
+
     // Convenience filtered views used by the Razor pages and export services
     // [JsonIgnore] prevents these computed views from being serialised to session
     // (the data is already in FullDiff, duplicating it would bloat session storage)
@@ -481,4 +495,83 @@ public class ExportViewModel
     public bool ExportText                { get; set; } = true;
     public List<string> SavedFiles        { get; set; } = new();
     public List<string> Errors            { get; set; } = new();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 9 · AUTO REVIEW FINDING
+// Deterministic system-generated finding — no AI required.
+// ─────────────────────────────────────────────────────────────────────────────
+public class AutoReviewFinding
+{
+    public string  Id           { get; set; } = Guid.NewGuid().ToString("N")[..8];
+    public string  Category     { get; set; } = "";   // numeric-change | section-added | section-removed | policy-change | director-change | sign-change | text-change | content-added | content-removed
+    public string  Title        { get; set; } = "";
+    public string  Description  { get; set; } = "";
+    public string  Severity     { get; set; } = "medium";   // high | medium | low
+    public int?    PageAfs1     { get; set; }
+    public int?    PageAfs2     { get; set; }
+    public int?    PairIndex    { get; set; }
+    public string? Before       { get; set; }
+    public string? After        { get; set; }
+    public double? PctChange    { get; set; }
+    public decimal? AbsChange   { get; set; }
+    // #7 — Confidence 0–100: how likely this is a genuine change (not a layout artefact)
+    public int     Confidence   { get; set; } = 80;
+    // #1 — Section group (e.g. "Note 12 — Provisions", "Statement of Financial Position")
+    public string  SectionGroup { get; set; } = "Other";
+    // #5 — Auditor sign-off: "" | "cleared" | "query" | "escalate"
+    public string  SignOff      { get; set; } = "";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 10 · LABELED NUMBER CHANGE
+// A financial figure with its label and the computed change.
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 10B · TABLE CELL DIFF  (#3 — table-aware comparison)
+// ─────────────────────────────────────────────────────────────────────────────
+public class TableCellDiff
+{
+    public int     Row        { get; set; }
+    public int     Col        { get; set; }
+    public string  Label      { get; set; } = "";  // row header label
+    public string  ColHeader  { get; set; } = "";  // column header
+    public string  ValueAfs1  { get; set; } = "";
+    public string  ValueAfs2  { get; set; } = "";
+    public string  Status     { get; set; } = "same";  // same | changed | added | removed
+    public double? PctChange  { get; set; }
+    public int?    PageAfs1   { get; set; }
+    public int?    PageAfs2   { get; set; }
+    public int?    PairIndex  { get; set; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 10C · COMPARATIVE COLUMN MISMATCH  (#4 — year-over-year validation)
+// ─────────────────────────────────────────────────────────────────────────────
+public class ComparativeMismatch
+{
+    public string  Label       { get; set; } = "";
+    public string  ValueAfs1   { get; set; } = "";   // current-year value in AFS 1
+    public string  ValueAfs2   { get; set; } = "";   // prior-year comparative in AFS 2 (should match ValueAfs1)
+    public double? PctDiff     { get; set; }
+    public string  Severity    { get; set; } = "high";
+    public int?    PageAfs1    { get; set; }
+    public int?    PageAfs2    { get; set; }
+    public int?    PairIndex   { get; set; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+public class LabeledNumberChange
+{
+    public string  Label       { get; set; } = "";
+    public string  RawBefore   { get; set; } = "";
+    public string  RawAfter    { get; set; } = "";
+    public decimal Before      { get; set; }
+    public decimal After       { get; set; }
+    public double  PctChange   { get; set; }
+    public decimal AbsChange   { get; set; }
+    public string  Severity    { get; set; } = "medium";
+    public int?    PageAfs1    { get; set; }
+    public int?    PageAfs2    { get; set; }
+    public int?    PairIndex   { get; set; }
+    public bool    SignChanged  { get; set; }   // positive→negative or vice versa
 }
