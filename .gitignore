@@ -3,3 +3,6 @@ build/
 obj/
 bin/
 *.user
+.env
+.env.*
+!.env.example

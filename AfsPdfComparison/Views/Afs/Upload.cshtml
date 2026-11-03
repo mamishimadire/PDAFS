@@ -76,7 +76,11 @@
                             <td><span class="sng-badge-purple">@r.Label</span></td>
                             <td class="font-mono">@r.Filename</td>
                             <td>
-                                @if (r.DocType?.Contains("scanned") == true)
+                                @if (r.DocType?.Contains("corrupted", StringComparison.OrdinalIgnoreCase) == true)
+                                {
+                                    <span class="sng-badge-danger">@r.DocType</span>
+                                }
+                                else if (r.DocType?.Contains("scanned", StringComparison.OrdinalIgnoreCase) == true)
                                 {
                                     <span class="sng-badge-warn">@r.DocType</span>
                                 }
@@ -118,9 +122,8 @@
     </div>
     <div class="sng-card-body">
         <p class="sng-hint mb-3">
-            Extraction uses <strong>PdfPig</strong> to reconstruct lines from word bounding boxes
-            (Y-coordinate binning). Scanned PDFs will be flagged but not OCR-processed.
-            — <em>Reference: Python <code>extract_pdf()</code> + pdfplumber</em>
+            Smart extraction reconstructs lines from word bounding boxes for accurate text comparison.
+            Scanned PDFs are automatically detected and processed with intelligent text recognition.
         </p>
 
         @if (extractMessages.Any())

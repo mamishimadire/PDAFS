@@ -17,10 +17,19 @@
 using AfsPdfComparison.Services;
 using QuestPDF.Infrastructure;
 
+DotEnvLoader.LoadIfPresent();
+
 var builder = WebApplication.CreateBuilder(args);
+
+builder.WebHost.ConfigureKestrel(opts =>
+{
+    opts.Limits.KeepAliveTimeout = TimeSpan.FromMinutes(5);
+    opts.Limits.RequestHeadersTimeout = TimeSpan.FromMinutes(5);
+});
 
 // SECTION 1 · MVC + RAZOR VIEWS
 builder.Services.AddControllersWithViews();
+builder.Services.AddHttpClient();
 
 // SECTION 2 · SESSION STATE
 // IDistributedMemoryCache backs the in-memory session store.
@@ -29,10 +38,11 @@ builder.Services.AddControllersWithViews();
 builder.Services.AddDistributedMemoryCache();
 builder.Services.AddSession(options =>
 {
-    options.IdleTimeout         = TimeSpan.FromHours(2);
+    options.IdleTimeout         = TimeSpan.FromMinutes(60); // session survives longer review cycles
     options.Cookie.HttpOnly     = true;
     options.Cookie.IsEssential  = true;
     options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+    options.Cookie.SameSite     = SameSiteMode.Strict;     // security: block cross-site access
 });
 
 // SECTION 3 · HTTP CONTEXT ACCESSOR
@@ -51,8 +61,20 @@ builder.Services.AddHttpContextAccessor();
 //   ExportService         → build_pdf_report(), build_word_report(), etc.
 //   SessionStateService   → STATE dict wrapper
 builder.Services.AddSingleton<PageExtractorService>();
+builder.Services.AddSingleton<AiVisionOcrService>();
 builder.Services.AddSingleton<PageAlignmentService>();
 builder.Services.AddSingleton<LineComparatorService>();
+builder.Services.AddSingleton<SmartComparisonOrchestrator>();
+builder.Services.AddSingleton<DocumentIntelligenceService>();
+builder.Services.AddSingleton<AiComparisonAssistantService>();
+builder.Services.AddSingleton<AiContentReaderService>();
+builder.Services.AddSingleton<OpenAiCompatibleAiService>();
+builder.Services.AddSingleton<AiBackendStatusService>();
+builder.Services.AddSingleton<MultiAiOrchestrator>();
+builder.Services.AddSingleton<ComparisonRuntimeStore>();
+builder.Services.AddSingleton<LabeledNumberExtractor>();
+builder.Services.AddSingleton<AutoReviewEngine>();
+builder.Services.AddSingleton<TableDiffService>();
 builder.Services.AddSingleton<ComparisonService>();
 builder.Services.AddSingleton<ExportService>();
 builder.Services.AddScoped<SessionStateService>();
@@ -83,8 +105,17 @@ app.UseRouting();
 app.UseSession();       // must come after UseRouting, before MapControllerRoute
 app.UseAuthorization();
 
-// SECTION 7 · UPLOADS DIRECTORY — create wwwroot/uploads at startup
-Directory.CreateDirectory(Path.Combine(app.Environment.WebRootPath, "uploads"));
+// SECTION 7 · UPLOADS DIRECTORY — create wwwroot/uploads and WIPE IT at every startup
+// Security: ensures no uploaded PDF files from a previous session remain on disk.
+// Every run starts completely fresh with no stored user data.
+var webRootPath = app.Environment.WebRootPath;
+if (string.IsNullOrWhiteSpace(webRootPath))
+    webRootPath = Path.Combine(app.Environment.ContentRootPath, "wwwroot");
+
+var uploadsDir = Path.Combine(webRootPath, "uploads");
+Directory.CreateDirectory(uploadsDir);
+foreach (var f in Directory.GetFiles(uploadsDir))
+    try { File.Delete(f); } catch { /* ignore locked files */ }
 
 // SECTION 8 · ROUTING
 app.MapControllerRoute(

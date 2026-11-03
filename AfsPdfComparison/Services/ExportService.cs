@@ -178,6 +178,9 @@ public class ExportService
 
                     // SECTION 8 · Consolidated Auditor Comments
                     PdfCommentsSection(col, comments);
+
+                    // SECTION 9 · Materiality Review Findings
+                    PdfAiFindingsSection(col, cmp, snapshots);
                 });
             });
         }).GeneratePdf(path);
@@ -281,7 +284,11 @@ public class ExportService
         Dictionary<string, string> comments,
         IReadOnlyList<(string? Left, string? Right)> snapshots)
     {
-        var paired = cmp.PageDiffs.Where(pd => pd.PageAfs2.HasValue).ToList();
+        var paired = cmp.PageDiffs.Where(pd =>
+            pd.PageAfs1.HasValue &&
+            pd.PageAfs2.HasValue &&
+            !pd.Unmatched &&
+            !pd.SecondaryMatch).ToList();
         col.Item().Column(c =>
         {
             PdfSectionHeading(c, "2  Page-by-Page Snapshot Review");
@@ -346,6 +353,137 @@ public class ExportService
                 // Auditor comment box
                 string existing = comments.TryGetValue(pairKey, out var cv) ? cv.Trim() : "";
                 PdfCommentBox(c, pairKey, pairLbl, existing);
+
+                // Review Findings — always shown below every snapshot
+                // Rule: System review findings are ALWAYS shown (deterministic, always available).
+                //       AI findings are shown in addition when AI analysis has completed.
+                {
+                    bool readReady = string.Equals(
+                        cmp.AiContentRead?.Status, "ready", StringComparison.OrdinalIgnoreCase);
+                    bool aiReady = string.Equals(
+                        cmp.AiAssist?.Status, "ready", StringComparison.OrdinalIgnoreCase);
+
+                    // System review findings for this page pair (always available)
+                    var sysFindings = (cmp.AutoReview ?? new())
+                        .Where(f => f.PairIndex == pd.PairIndex)
+                        .OrderBy(f => f.Severity == "high" ? 0 : f.Severity == "medium" ? 1 : 2)
+                        .ToList();
+
+                    // AI section diffs (match by PairIndex, fall back to page numbers)
+                    var pairSects = readReady
+                        ? (cmp.AiContentRead!.SectionDiffs ?? new())
+                            .Where(s =>
+                                (s.PairIndex.HasValue && s.PairIndex == pd.PairIndex) ||
+                                (!s.PairIndex.HasValue &&
+                                 ((s.PageAfs1.HasValue && s.PageAfs1 == pd.PageAfs1) ||
+                                  (s.PageAfs2.HasValue && s.PageAfs2 == pd.PageAfs2))))
+                            .ToList()
+                        : new();
+
+                    // AI auditor priority notes
+                    var pairFocus = aiReady
+                        ? (cmp.AiAssist?.PageFocus ?? new())
+                            .Where(f => f.PairIndex == pd.PairIndex).ToList()
+                        : new();
+
+                    bool hasAnything = sysFindings.Count > 0 || pairSects.Count > 0 || pairFocus.Count > 0;
+
+                    // Header — always rendered
+                    c.Item().PaddingTop(6).Background("#3D1A6E").Padding(5)
+                     .Text($"● Review Findings — {pairLbl}")
+                     .FontSize(8).Bold().FontColor(Colors.White);
+
+                    if (!hasAnything)
+                    {
+                        c.Item().Background("#ECFDF5").Padding(6)
+                         .Text("✓  No material changes identified for this page pair.")
+                         .FontSize(8).Bold().FontColor("#065F46");
+                    }
+                    else
+                    {
+                        // ── System Review findings (deterministic — always shown first) ──
+                        if (sysFindings.Count > 0)
+                        {
+                            c.Item().Background("#3D1A6E22").PaddingLeft(5).PaddingTop(4).PaddingBottom(2)
+                             .Text($"System Review  ({sysFindings.Count} finding(s))")
+                             .FontSize(7.5f).Bold().FontColor("#3D1A6E");
+
+                            foreach (var f in sysFindings)
+                            {
+                                string fc = (f.Severity?.ToLowerInvariant() ?? "low") switch
+                                { "high" => Red, "medium" => Amber, _ => "#10B981" };
+
+                                c.Item().BorderLeft(3).BorderColor(fc).PaddingLeft(6).PaddingTop(3).PaddingBottom(1)
+                                 .Text($"[{f.Severity?.ToUpperInvariant() ?? "LOW"}]  {f.Title}")
+                                 .FontSize(8).Bold().FontColor(fc);
+
+                                if (!string.IsNullOrWhiteSpace(f.Description))
+                                    c.Item().PaddingLeft(9).PaddingBottom(2)
+                                     .Text(f.Description).FontSize(7.5f).FontColor("#374151");
+
+                                if (!string.IsNullOrWhiteSpace(f.Before) || !string.IsNullOrWhiteSpace(f.After))
+                                {
+                                    c.Item().PaddingTop(2).PaddingLeft(6).Table(t =>
+                                    {
+                                        t.ColumnsDefinition(cd => { cd.RelativeColumn(); cd.RelativeColumn(); });
+                                        t.Cell().Background("#FEE2E2").Padding(3)
+                                         .Text("Before (AFS 1): " + (f.Before ?? "—")).FontSize(7).FontColor("#991B1B");
+                                        t.Cell().Background("#DCFCE7").Padding(3)
+                                         .Text("After (AFS 2): " + (f.After ?? "—")).FontSize(7).FontColor("#166534");
+                                    });
+                                }
+                                if (f.PctChange.HasValue && f.PctChange > 0)
+                                    c.Item().PaddingLeft(9).PaddingTop(1).PaddingBottom(3)
+                                     .Text($"Change: {f.PctChange:F1}%{(f.AbsChange.HasValue ? $"  |  Absolute: R {f.AbsChange:N0}" : "")}")
+                                     .FontSize(7).FontColor(Amber);
+                            }
+                        }
+
+                        // ── AI Review findings (shown when available, as supplementary) ──
+                        if (pairSects.Count > 0 || pairFocus.Count > 0)
+                        {
+                            c.Item().Background("#1E3A5F22").PaddingLeft(5).PaddingTop(6).PaddingBottom(2)
+                             .Text($"AI Review  ({pairSects.Count} section(s))")
+                             .FontSize(7.5f).Bold().FontColor("#1E3A5F");
+
+                            foreach (var s in pairSects)
+                            {
+                                string sc = (s.Severity?.ToLowerInvariant() ?? "low") switch
+                                { "high" => Red, "medium" => Amber, _ => "#10B981" };
+                                c.Item().Background(sc).Padding(4)
+                                 .Text(s.SectionName)
+                                 .FontSize(9).Bold().FontColor(Colors.White);
+                                c.Item().PaddingLeft(6)
+                                 .Text($"Change type: {s.ChangeType}   |   Severity: {s.Severity?.ToUpperInvariant()}")
+                                 .FontSize(7).Bold().FontColor(sc);
+                                if (!string.IsNullOrWhiteSpace(s.ChangeDescription))
+                                    c.Item().PaddingLeft(6).PaddingTop(2).Text(s.ChangeDescription).FontSize(8);
+                                if (!string.IsNullOrWhiteSpace(s.Afs1Summary) || !string.IsNullOrWhiteSpace(s.Afs2Summary))
+                                {
+                                    c.Item().PaddingTop(3).Table(t =>
+                                    {
+                                        t.ColumnsDefinition(cd => { cd.RelativeColumn(); cd.RelativeColumn(); });
+                                        t.Cell().Background(Dark).Padding(3).Text("AFS 1 — Before").FontSize(7).Bold().FontColor(Colors.White);
+                                        t.Cell().Background(Dark).Padding(3).Text("AFS 2 — After").FontSize(7).Bold().FontColor(Colors.White);
+                                        t.Cell().Background("#F8F9FA").Padding(4).Text(s.Afs1Summary ?? "—").FontSize(8);
+                                        t.Cell().Background("#F8F9FA").Padding(4).Text(s.Afs2Summary ?? "—").FontSize(8);
+                                    });
+                                }
+                                if (s.ChangedValues?.Count > 0)
+                                    c.Item().PaddingLeft(6).PaddingTop(2)
+                                     .Text("Changed values: " + string.Join("   |   ", s.ChangedValues))
+                                     .FontSize(7).FontColor(Amber);
+                                c.Item().PaddingBottom(4);
+                            }
+
+                            foreach (var pf in pairFocus.Where(f => !string.IsNullOrWhiteSpace(f.Why)))
+                                c.Item().PaddingLeft(6).PaddingTop(3)
+                                 .Text($"▸ Auditor Priority [{pf.Priority?.ToUpperInvariant()}]: {pf.Why}")
+                                 .FontSize(8).FontColor(Amber);
+                        }
+                    }
+                    c.Item().PaddingBottom(6);
+                }
             }
             c.Item().PageBreak();
         });
@@ -555,6 +693,177 @@ public class ExportService
             }
             c.Item().PaddingTop(8);
             PdfCommentBox(c, "overall", "Overall Audit Conclusion / Sign-off", "");
+        });
+    }
+
+    // ── §9 Materiality Review Findings ───────────────────────────────────────
+    private static void PdfAiFindingsSection(
+        ColumnDescriptor col,
+        ComparisonResult cmp,
+        IReadOnlyList<(string? Left, string? Right)>? snapshots)
+    {
+        var ai   = cmp.AiAssist;
+        var read = cmp.AiContentRead;
+        bool aiReady   = string.Equals(ai?.Status,   "ready", StringComparison.OrdinalIgnoreCase);
+        bool readReady = string.Equals(read?.Status, "ready", StringComparison.OrdinalIgnoreCase);
+
+        col.Item().Column(c =>
+        {
+            PdfSectionHeading(c, "9  Materiality Review Findings");
+
+            if (!aiReady && !readReady)
+            {
+                c.Item().Text(
+                    "The deep analysis was not available at export time. " +
+                    "Run the comparison, wait for analysis to complete, then export again.")
+                 .FontSize(9).FontColor("#6B7280").Italic();
+                return;
+            }
+
+            if (aiReady && !string.IsNullOrWhiteSpace(ai!.ExecutiveSummary))
+            {
+                c.Item().Background(Navy).Padding(6)
+                 .Text(ai.ExecutiveSummary).FontSize(9).FontColor(Colors.White);
+                c.Item().PaddingBottom(4);
+            }
+
+            if (aiReady && !string.IsNullOrWhiteSpace(ai!.OverallRisk))
+            {
+                string rc = ai.OverallRisk.ToLowerInvariant() switch
+                { "high" => Red, "medium" => Amber, _ => "#10B981" };
+                c.Item().Background(rc).Padding(5)
+                 .Text("OVERALL RISK LEVEL:  " + ai.OverallRisk.ToUpperInvariant())
+                 .FontSize(10).Bold().FontColor(Colors.White);
+                c.Item().PaddingBottom(6);
+            }
+
+            // Material findings with snapshots
+            int fNum = 0;
+            var paired = cmp.PageDiffs.Where(pd =>
+                pd.PageAfs1.HasValue && pd.PageAfs2.HasValue && !pd.Unmatched && !pd.SecondaryMatch)
+                .OrderBy(pd => pd.PairIndex).ToList();
+
+            foreach (var f in (ai?.MaterialFindings ?? new()))
+            {
+                fNum++;
+                string sev = f.Severity?.ToLowerInvariant() ?? "low";
+                string sc  = sev switch { "high" => Red, "medium" => Amber, _ => "#10B981" };
+
+                c.Item().PaddingTop(8).Background(sc).Padding(5).Text(
+                    $"Finding {fNum}: {f.Title}  [{f.Severity?.ToUpperInvariant()}]" +
+                    (f.PageAfs1.HasValue && f.PageAfs2.HasValue
+                        ? $"  —  AFS 1 p{f.PageAfs1} ↔ AFS 2 p{f.PageAfs2}" : ""))
+                 .FontSize(9).Bold().FontColor(Colors.White);
+
+                if (!string.IsNullOrWhiteSpace(f.AuditRationale))
+                    c.Item().PaddingTop(4).Text("Rationale: " + f.AuditRationale).FontSize(9);
+                if (!string.IsNullOrWhiteSpace(f.RecommendedProcedure))
+                    c.Item().Text("Recommended: " + f.RecommendedProcedure).FontSize(9);
+                if (f.ChangedNumbers?.Count > 0)
+                    c.Item().Text("Changed Values: " + string.Join("  |  ", f.ChangedNumbers))
+                     .FontSize(8).FontColor(Amber);
+
+                // Snapshot for this finding's page pair
+                if (f.PairIndex.HasValue && snapshots != null)
+                {
+                    int snapshotIdx = f.PairIndex.Value;
+                    if (snapshotIdx >= 0 && snapshotIdx < snapshots.Count)
+                    {
+                        var (b64L, b64R) = snapshots[snapshotIdx];
+                        c.Item().PaddingTop(4).Row(r =>
+                        {
+                            void Side(string? b64, string cap, string bg)
+                            {
+                                r.RelativeItem().Column(col2 =>
+                                {
+                                    col2.Item().Background(bg).Padding(3)
+                                        .Text(cap).FontSize(7).Bold().FontColor(Dark);
+                                    if (!string.IsNullOrEmpty(b64))
+                                    {
+                                        try { col2.Item().Image(Convert.FromBase64String(b64), ImageScaling.FitWidth); }
+                                        catch { col2.Item().Text("[Image unavailable]").FontSize(7).Italic(); }
+                                    }
+                                });
+                            }
+                            Side(b64L, $"AFS 1 — page {f.PageAfs1}", "#DBEAFE");
+                            r.ConstantItem(3);
+                            Side(b64R, $"AFS 2 — page {f.PageAfs2}", "#EDE9FE");
+                        });
+                    }
+                }
+                c.Item().PaddingBottom(6);
+            }
+
+            // Section diffs table
+            if (readReady && (read!.SectionDiffs?.Count ?? 0) > 0)
+            {
+                c.Item().PaddingTop(8).Text("Section-Level Changes:").FontSize(10).Bold().FontColor(Purple);
+                c.Item().Table(t =>
+                {
+                    t.ColumnsDefinition(cd =>
+                    {
+                        cd.RelativeColumn(3); cd.RelativeColumn(1.5f);
+                        cd.RelativeColumn(1.5f); cd.RelativeColumn(5);
+                    });
+                    foreach (var h in new[] { "Section", "Type", "Severity", "Description" })
+                        t.Cell().Background("#3D1A6E").Padding(4).Text(h).FontSize(8).Bold().FontColor(Colors.White);
+                    bool alt = false;
+                    foreach (var sd in read!.SectionDiffs.Take(30))
+                    {
+                        string bg = alt ? "#F5F3FF" : "#EDE9FE";
+                        t.Cell().Background(bg).Padding(4).Text(sd.SectionName ?? "").FontSize(8);
+                        t.Cell().Background(bg).Padding(4).Text(sd.ChangeType ?? "").FontSize(8);
+                        t.Cell().Background(bg).Padding(4).Text(sd.Severity ?? "").FontSize(8).Bold();
+                        t.Cell().Background(bg).Padding(4).Text(sd.ChangeDescription ?? "").FontSize(8);
+                        alt = !alt;
+                    }
+                });
+                c.Item().PaddingBottom(6);
+            }
+
+            // Line items table
+            if (readReady && (read!.LineItemChanges?.Count ?? 0) > 0)
+            {
+                c.Item().PaddingTop(4).Text("Line-Item Financial Changes:").FontSize(10).Bold().FontColor(Purple);
+                c.Item().Table(t =>
+                {
+                    t.ColumnsDefinition(cd =>
+                    {
+                        cd.RelativeColumn(4); cd.RelativeColumn(2); cd.RelativeColumn(2);
+                        cd.RelativeColumn(1.5f); cd.RelativeColumn(4);
+                    });
+                    foreach (var h in new[] { "Line Item", "AFS 1", "AFS 2", "Change %", "Note" })
+                        t.Cell().Background("#3D1A6E").Padding(4).Text(h).FontSize(8).Bold().FontColor(Colors.White);
+                    bool alt2 = false;
+                    foreach (var li in read!.LineItemChanges!.Take(50))
+                    {
+                        string bg = alt2 ? "#F5F3FF" : "#EDE9FE";
+                        t.Cell().Background(bg).Padding(4).Text(li.LineItem ?? "").FontSize(8);
+                        t.Cell().Background(bg).Padding(4).Text(li.ValueInAfs1 ?? "").FontSize(8);
+                        t.Cell().Background(bg).Padding(4).Text(li.ValueInAfs2 ?? "").FontSize(8);
+                        t.Cell().Background(bg).Padding(4).Text(li.PctChange ?? "").FontSize(8).Bold();
+                        t.Cell().Background(bg).Padding(4).Text(li.MaterialityNote ?? "").FontSize(8);
+                        alt2 = !alt2;
+                    }
+                });
+                c.Item().PaddingBottom(4);
+            }
+
+            if (readReady && !string.IsNullOrWhiteSpace(read!.AuditConclusion))
+            {
+                c.Item().Background(Navy).Padding(5)
+                 .Text("Audit Conclusion: " + read.AuditConclusion)
+                 .FontSize(9).FontColor(Colors.White);
+            }
+
+            var limits = (ai?.Limitations ?? new()).Concat(read?.Limitations ?? new()).Distinct().ToList();
+            if (limits.Count > 0)
+            {
+                c.Item().PaddingTop(4).Text("Limitations: " + string.Join(" • ", limits))
+                 .FontSize(8).FontColor("#6B7280").Italic();
+            }
+
+            c.Item().PageBreak();
         });
     }
 

@@ -6,11 +6,11 @@
 // ║  Line-diff engine using F23.StringSimilarity.NormalizedLevenshtein for      ║
 // ║  the matching score, paired with TextNormaliser for canonicalisation.        ║
 // ║                                                                              ║
-// ║  v4.3.2 FIX — Gate 5: Word-overlap line-wrap artefact gate                  ║
+// ║  Content-aware status checks distinguish edits from extraction formatting.  ║
 // ║  ROOT CAUSE: PDF text extraction wraps long paragraphs at different column  ║
 // ║  widths per file. The same sentence broken differently scores 0.87-0.91 —   ║
 // ║  above SIM_RELATED (matched) but below SIM_EXACT (flagged "changed").       ║
-// ║  Gate 5: word overlap ≥ 85% AND length ratio ≥ 55% → "same"                ║
+// ║  Wrap suppression requires an ordered prefix, not loose word overlap.       ║
 // ║                                                                              ║
 // ║  NOTE: This service is used by ComparisonController (MVC route).            ║
 // ║  The main pipeline uses LineComparatorService (Ratcliff-Obershelp).         ║
@@ -48,8 +48,6 @@ namespace AfsPdfComparison.Services
         private const double SIM_EXACT   = 0.94;
         private const double SIM_RELATED = 0.55;
 
-        // Gate 5 thresholds (word-overlap line-wrap artefact gate)
-        private const double WORD_OVERLAP_THRESHOLD = 0.85;
         private const double LENGTH_RATIO_THRESHOLD = 0.55;
 
         private readonly NormalizedLevenshtein _lev = new();
@@ -77,12 +75,51 @@ namespace AfsPdfComparison.Services
                 if (string.Equals(prev, curr, StringComparison.OrdinalIgnoreCase))
                     continue;
 
+                // Hyperlink sub-word dedup (adjacent pass, mirrors LineComparatorService):
+                // if a short line (≤ 3 words) already appears verbatim as a phrase
+                // inside the most recently merged line, it is a hyperlink annotation
+                // duplicate extracted by PdfPig → discard it.
+                if (curr.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length <= 3)
+                {
+                    string nm = TextNormaliser.Normalise(curr);
+                    string np = TextNormaliser.Normalise(prev);
+                    if (!string.IsNullOrEmpty(nm) && (" " + np + " ").Contains(" " + nm + " "))
+                        continue;
+                }
+
                 if (!prevEnds && currCont && prev.Length >= 15)
                     merged[^1] = prev + " " + curr;
                 else
                     merged.Add(curr);
             }
-            return merged;
+
+            // Second-pass hyperlink artefact dedup (order-independent).
+            // Catches the case where the orphan hyperlink word appears at a
+            // slightly different Y-band than the sentence, causing it to be
+            // emitted BEFORE the containing sentence in extraction order.
+            var deduped = new List<string>(merged.Count);
+            for (int k = 0; k < merged.Count; k++)
+            {
+                string line = merged[k];
+                int wc = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
+                if (wc > 0 && wc <= 3)
+                {
+                    string nm = TextNormaliser.Normalise(line);
+                    bool orphan = false;
+                    for (int j = 0; j < merged.Count; j++)
+                    {
+                        if (j == k) continue;
+                        if ((" " + TextNormaliser.Normalise(merged[j]) + " ").Contains(" " + nm + " "))
+                        {
+                            orphan = true;
+                            break;
+                        }
+                    }
+                    if (orphan) continue;
+                }
+                deduped.Add(line);
+            }
+            return deduped;
         }
 
         // Build inverted index: first-token and bigrams → set of line indices
@@ -132,84 +169,82 @@ namespace AfsPdfComparison.Services
         /// Determines whether two matched lines are "same" or "changed".
         ///
         /// Gate 1 — Canonical string equality
-        /// Gate 2 — Similarity score ≥ SIM_EXACT (0.94)
-        /// Gate 3 — All numbers identical AND score ≥ 0.80
-        /// Gate 4 — Normalised text equality (catches soft-hyphen / space variants)
-        /// Gate 5 — Word-overlap line-wrap artefact gate (v4.3.2)
+        /// Formatting normalization and a conservative ordered-prefix check
+        /// prevent layout-only differences without hiding changed disclosure text.
         ///
-        /// Gate 5 eliminates false highlights caused by PDF column-width differences.
-        /// Example: pdfplumber extracts the same paragraph as:
-        ///   AFS1: "...requirements of IAS 27 Consolidated"
-        ///   AFS2: "...requirements of IAS 27 Consolidated and Separate Financial..."
-        /// These score 0.87-0.91 and were falsely flagged as "changed".
-        /// Gate 5: if ≥85% of the shorter line's words appear in the longer
-        /// AND shorter ≥55% the length of longer → line-wrap artefact → "same".
+        /// Normalization suppresses formatting artifacts. Similarity scores pair
+        /// lines but do not prove their content is unchanged. A wrap is ignored
+        /// only when the shorter line is an ordered prefix of the longer one.
         /// </summary>
-        private static DiffStatus DetermineStatus(string l1, string l2, double rawScore)
+        private static DiffStatus DetermineStatus(string l1, string l2)
         {
             // Gate 0: Case- and whitespace-insensitive equality.
             // Lines that differ ONLY in capitalisation or spacing are NEVER flagged as
             // changes — this is an absolute requirement. E.g. "TOTAL ASSETS" == "Total Assets".
-            if (TextNormaliser.Normalise(l1) == TextNormaliser.Normalise(l2))
+            string normalized1 = TextNormaliser.Normalise(l1);
+            string normalized2 = TextNormaliser.Normalise(l2);
+            if (normalized1 == normalized2)
                 return DiffStatus.Same;
 
             // Gate 1: Canonical string equality (also strips punctuation)
-            if (TextNormaliser.Canonicalise(l1) == TextNormaliser.Canonicalise(l2))
+            if (TextNormaliser.Canonicalise(normalized1) == TextNormaliser.Canonicalise(normalized2))
                 return DiffStatus.Same;
 
-            // Gate 2: Similarity score above exact threshold
-            if (rawScore >= SIM_EXACT)
-                return DiffStatus.Same;
-
-            // Gate 3: Numbers identical at lower score
+            // Preserve the short reordered-label behavior without accepting a
+            // set match for longer text where word order carries meaning.
+            var ws1 = new HashSet<string>(
+                normalized1.Split(' ', StringSplitOptions.RemoveEmptyEntries),
+                StringComparer.OrdinalIgnoreCase);
+            var ws2 = new HashSet<string>(
+                normalized2.Split(' ', StringSplitOptions.RemoveEmptyEntries),
+                StringComparer.OrdinalIgnoreCase);
             var n1 = TextNormaliser.ExtractNumbers(l1);
             var n2 = TextNormaliser.ExtractNumbers(l2);
-            if (n1.SetEquals(n2) && rawScore >= 0.80)
+
+            if (ws1.Count is > 0 and <= 4 &&
+                ws2.Count is > 0 and <= 4 &&
+                ws1.SetEquals(ws2) &&
+                n1.SetEquals(n2))
                 return DiffStatus.Same;
 
-            // Gate 4: Normalised text equality (kept for safety; identical to Gate 0)
-            if (TextNormaliser.Normalise(l1) == TextNormaliser.Normalise(l2))
-                return DiffStatus.Same;
-
-            // Gate 5: Word-overlap line-wrap artefact gate
-            var w1 = new HashSet<string>(
-                TextNormaliser.Normalise(l1).Split(' ', StringSplitOptions.RemoveEmptyEntries),
-                StringComparer.OrdinalIgnoreCase);
-            var w2 = new HashSet<string>(
-                TextNormaliser.Normalise(l2).Split(' ', StringSplitOptions.RemoveEmptyEntries),
-                StringComparer.OrdinalIgnoreCase);
-
-            // Gate 5 is directional: only fires when l2 (AFS2) has at least as
-            // many words as l1 (AFS1) — i.e. AFS1 wraps earlier (AFS2 wider column).
-            // If l2 is shorter, the missing words are real content removals.
-            // NUMBER GUARD: if any numeric token differs between l1 and l2 (e.g.
-            // R217 vs R218) Gate 5 must NOT suppress the change.
-            // SHORT-LINE GUARD: 1–3 word lines must not be swallowed.
-            // n1/n2 already computed by Gate 3 above — reuse them.
+            // Treat a line as a wrap only when the shorter line's ordered words
+            // are an exact prefix of the longer line. Word overlap alone can hide
+            // a real one-word edit in a long disclosure.
             bool numOk = (n1.Count == 0 && n2.Count == 0) || n1.SetEquals(n2);
-            if (w1.Count > 0 && w2.Count > 0 && w2.Count >= w1.Count
-                && numOk
-                && w1.Count >= 4)
-            {
-                int    intersection = w1.Intersect(w2).Count();
-                int    minLen       = w1.Count;   // l1 is shorter or equal
-                int    maxLen       = w2.Count;   // l2 is longer or equal
-                double overlap      = (double)intersection / minLen;
-                double lenRatio     = (double)minLen / maxLen;
+            var orderedW1 = TextNormaliser.Canonicalise(normalized1)
+                .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            var orderedW2 = TextNormaliser.Canonicalise(normalized2)
+                .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            var shorterWords = orderedW1.Length <= orderedW2.Length ? orderedW1 : orderedW2;
+            var longerWords = orderedW1.Length <= orderedW2.Length ? orderedW2 : orderedW1;
+            string shorterText = orderedW1.Length <= orderedW2.Length
+                ? normalized1
+                : normalized2;
+            bool isOrderedPrefix = shorterWords.Length >= 4 &&
+                                   longerWords.Take(shorterWords.Length).SequenceEqual(
+                                       shorterWords,
+                                       StringComparer.OrdinalIgnoreCase);
+            bool endsWithSentenceStop = shorterText.Length > 0 &&
+                                        shorterText[^1] is '.' or '!' or '?';
+            double lengthRatio = longerWords.Length == 0
+                ? 0
+                : (double)shorterWords.Length / longerWords.Length;
+            if (numOk && isOrderedPrefix && !endsWithSentenceStop &&
+                lengthRatio >= LENGTH_RATIO_THRESHOLD)
+                return DiffStatus.Same;
 
-                if (overlap >= WORD_OVERLAP_THRESHOLD && lenRatio >= LENGTH_RATIO_THRESHOLD)
-                    return DiffStatus.Same;
-            }
-
-            // Gate 6: Paragraph-wrap prefix gate (same logic as LineComparatorService).
-            string gn1 = TextNormaliser.Normalise(l1), gn2 = TextNormaliser.Normalise(l2);
+            // Keep the longer-line wrap exception on a word boundary only.
+            string gn1 = normalized1, gn2 = normalized2;
             if (gn1.Length >= 40 && gn2.Length >= 40)
             {
                 string shorter  = gn1.Length <= gn2.Length ? gn1 : gn2;
                 string longer   = gn1.Length <= gn2.Length ? gn2 : gn1;
                 char   shortEnd = shorter[^1];
                 bool   endsStop = shortEnd is '.' or '!' or '?';
-                if (!endsStop && longer.StartsWith(shorter, StringComparison.Ordinal))
+                bool   endsAtWordBoundary = shorter.Length < longer.Length &&
+                    (char.IsWhiteSpace(longer[shorter.Length]) || char.IsPunctuation(longer[shorter.Length]));
+                if (!endsStop && endsAtWordBoundary &&
+                    longer.StartsWith(shorter, StringComparison.Ordinal))
                     return DiffStatus.Same;
             }
 
@@ -262,7 +297,7 @@ namespace AfsPdfComparison.Services
                 {
                     used1.Add(bestIdx); used2.Add(i2);
                     var l1     = lines1[bestIdx];
-                    var status = DetermineStatus(l1, l2, bestScore);
+                    var status = DetermineStatus(l1, l2);
                     var n1     = TextNormaliser.ExtractNumbers(l1);
                     var n2     = TextNormaliser.ExtractNumbers(l2);
                     var numDiff = status == DiffStatus.Changed
