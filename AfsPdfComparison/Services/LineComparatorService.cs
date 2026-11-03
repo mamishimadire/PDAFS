@@ -1268,6 +1268,13 @@ public class LineComparatorService
     /// </summary>
     private static string DetermineStatus(string l1, string l2)
     {
+        if (AuditTextNormalizer.HasDifferentMeaningfulMarkers(l1, l2) ||
+            !AuditTextNormalizer.ExtractNormalizedNumbers(l1)
+                .SetEquals(AuditTextNormalizer.ExtractNormalizedNumbers(l2)))
+        {
+            return "changed";
+        }
+
         // Gate 0: Case- and whitespace-insensitive equality.
         // Lines that differ ONLY in capitalisation, spacing, or Unicode whitespace variants
         // are NEVER flagged as changes — font size and spacing must not create diffs.
@@ -1382,7 +1389,9 @@ public class LineComparatorService
         t = _commaDecimalRe.Replace(t, "$1.$2");            // "12,5" → "12.5" (SA decimal comma)
         t = Regex.Replace(t, @"(?<=\d),(?=\d{3})", "");    // "1,234" → "1234" (thousands comma)
         t = Regex.Replace(t, @"\s+", " ").Trim();
-        return t;
+        t = AuditTextNormalizer.NormalizeDecimalFormatting(t);
+        return AuditTextNormalizer.NormalizeNamedDates(
+            AuditTextNormalizer.NormalizeCurrencyFormatting(t));
     }
 
     // Canonical: aggressive normalisation for the equality gates.

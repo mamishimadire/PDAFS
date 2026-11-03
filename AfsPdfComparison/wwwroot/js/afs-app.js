@@ -842,14 +842,18 @@ function renderComparison(data) {
         data.pageDiffs.forEach((p, k) => {
             const issues = p.changed + p.added + p.removed;
             const pct    = p.pctSame ?? 100;
-            const flag   = issues === 0        ? ' ✓'
+            const flag   = p.unmatched         ? ' ⚠ unmatched'
+                         : issues === 0        ? ' ✓'
                          : pct >= 98           ? ' ~ minor'
                          : issues > 5          ? ' !!'
                                                : ' !';
-            const changeLabel = issues === 0 ? 'no changes'
+            const changeLabel = p.unmatched ? 'review required'
+                              : issues === 0 ? 'no changes'
                               : issues === 1 ? '1 change'
                                              : `${issues} changes`;
-            const relation = p.secondaryMatch
+            const relation = p.unmatched
+                ? `Unmatched: AFS1 p${p.pageAfs1 ?? '—'} / AFS2 p${p.pageAfs2 ?? '—'}`
+                : p.secondaryMatch
                 ? `AFS1 p${p.pageAfs1 ?? '?'} ≈ AFS2 p${p.pageAfs2 ?? '?'}`
                 : `AFS1 p${p.pageAfs1} ↔ ${p.pageAfs2 ? 'AFS2 p'+p.pageAfs2 : 'NO MATCH'}`;
             const tag = p.secondaryMatch ? ' [cont.]' : '';
@@ -875,14 +879,18 @@ function renderComparison(data) {
         data.pageDiffs.forEach((p, k) => {
             const issues = p.changed + p.added + p.removed;
             const pct    = p.pctSame ?? 100;
-            const flag   = issues === 0        ? ' ✓'
+            const flag   = p.unmatched         ? ' ⚠ unmatched'
+                         : issues === 0        ? ' ✓'
                          : pct >= 98           ? ' ~ minor'
                          : issues > 5          ? ' !!'
                                                : ' !';
-            const changeLabel = issues === 0 ? 'no changes'
+            const changeLabel = p.unmatched ? 'review required'
+                              : issues === 0 ? 'no changes'
                               : issues === 1 ? '1 change'
                                              : `${issues} changes`;
-            const relation = p.secondaryMatch
+            const relation = p.unmatched
+                ? `Unmatched: AFS1 p${p.pageAfs1 ?? '—'} / AFS2 p${p.pageAfs2 ?? '—'}`
+                : p.secondaryMatch
                 ? `AFS1 p${p.pageAfs1 ?? '?'} ≈ AFS2 p${p.pageAfs2 ?? '?'}`
                 : `AFS1 p${p.pageAfs1} ↔ ${p.pageAfs2 ? 'AFS2 p'+p.pageAfs2 : 'NO MATCH'}`;
             const tag = p.secondaryMatch ? ' [cont.]' : '';
@@ -904,7 +912,7 @@ function renderComparison(data) {
     </div>`;
 
     // ── Tab: System Review (deterministic — no AI required) ──────────────
-    html += renderSystemReviewTab(autoReview);
+    html += renderSystemReviewTab(autoReview, data.pageDiffs);
 
     // ── Tab: Comments ─────────────────────────────────────────────────────
     html += renderAiReviewTab(ai, aiRead);
@@ -1071,7 +1079,7 @@ function jumpToPageSnapshot(pairIndex, afsNum) {
 // SYSTEM REVIEW TAB — Deterministic audit findings (no AI required)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function renderSystemReviewTab(findings) {
+function renderSystemReviewTab(findings, pageDiffs = []) {
     let html = `<div id="tab-sysreview" class="afs-tab-pane" style="display:none">`;
 
     // Header row with materiality control (#6)
@@ -1087,6 +1095,17 @@ function renderSystemReviewTab(findings) {
             <span style="color:#475569">R</span>
         </span>
     </div>`;
+
+    const unmatchedPages = (pageDiffs || []).filter(page => page.unmatched).length;
+    if (unmatchedPages > 0) {
+        html += `<div style="padding:24px;text-align:center;color:#FBBF24;font-size:13px;background:#0D1B2A;border-radius:8px;border:1px dashed #F59E0B">
+            ${unmatchedPages} unmatched page(s) require review. No conclusion that the documents are identical is available.
+        </div>`;
+        if (!findings || findings.length === 0) {
+            html += `</div>`;
+            return html;
+        }
+    }
 
     if (!findings || findings.length === 0) {
         html += `<div style="padding:24px;text-align:center;color:#64748B;font-size:13px;background:#0D1B2A;border-radius:8px;border:1px dashed #334155">
@@ -1783,9 +1802,12 @@ async function showPageDiff() {
         return;
     }
 
-    const pct  = p.pctSame;
-    const fc   = pct === 100 ? '#10B981' : pct >= 70 ? '#F59E0B' : '#EF4444';
-    const lbl  = `AFS1 p${p.pageAfs1} ↔ ${p.pageAfs2 ? 'AFS2 p'+p.pageAfs2 : 'UNMATCHED'}`;
+    const isUnmatched = Boolean(p.unmatched || !p.pageAfs1 || !p.pageAfs2);
+    const pct  = isUnmatched ? null : p.pctSame;
+    const fc   = isUnmatched ? '#FBBF24' : pct === 100 ? '#10B981' : pct >= 70 ? '#F59E0B' : '#EF4444';
+    const lbl  = isUnmatched
+        ? `UNMATCHED: AFS1 p${p.pageAfs1 ?? '—'} / AFS2 p${p.pageAfs2 ?? '—'}`
+        : `AFS1 p${p.pageAfs1} ↔ AFS2 p${p.pageAfs2}`;
 
     let html = `<div style="background:#111827;border-radius:7px;padding:8px 12px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:#CBD5E1;margin-bottom:8px">
         <b style="color:#A78BFA">Pair ${(p.k ?? k)+1}</b>  |
@@ -1794,7 +1816,7 @@ async function showPageDiff() {
         <span style="color:#F59E0B"> ~ ${p.changed} changed</span>
         <span style="color:#3B82F6"> + ${p.added} added</span>
         <span style="color:#EF4444"> − ${p.removed} removed</span>  |
-        <span style="color:${fc}">${pct}% same</span>  |
+        <span style="color:${fc}">${pct == null ? 'N/A' : pct + '% same'}</span>  |
         <span style="color:#64748B">align: ${p.alignSim.toFixed(3)}</span>
     </div>`;
 
@@ -1828,7 +1850,9 @@ async function showPageDiff() {
         });
         html += '</tbody></table>';
     } else {
-        html += '<p style="color:#10B981;font-size:12px">✓ No changes on this page pair.</p>';
+        html += isUnmatched
+            ? '<p style="color:#FBBF24;font-size:12px">⚠ Unmatched page/content — review required. No no-differences conclusion is available.</p>'
+            : '<p style="color:#10B981;font-size:12px">✓ No changes on this page pair.</p>';
     }
 
     // Page-pair comment box
@@ -1903,16 +1927,19 @@ async function showSnapshot() {
             return;
         }
 
-        const pct = r1.pctSame ?? r2.pctSame ?? 0;
-        const fc = pct === 100 ? '#10B981' : pct >= 70 ? '#F59E0B' : '#EF4444';
+        const rawPct = r1.pctSame ?? r2.pctSame ?? 0;
         const p = getPageDiffByRawIndex(window._cmpData, k);
         if (p) {
             await ensurePageDiffDetails(p);
         }
         const resolvedPairIndex = p?.k ?? r1.pairIndex ?? r2.pairIndex ?? k;
-        const pg1 = (r1.pageAfs1 ?? r2.pageAfs1 ?? 0) + 1;
+        const pg1Ref = r1.pageAfs1 ?? r2.pageAfs1;
+        const pg1 = pg1Ref != null ? pg1Ref + 1 : null;
         const pg2Ref = r1.pageAfs2 ?? r2.pageAfs2;
         const pg2 = pg2Ref != null ? pg2Ref + 1 : null;
+        const isUnmatched = Boolean(p?.unmatched || r1.unmatched || r2.unmatched || pg1 == null || pg2 == null);
+        const pct = isUnmatched ? null : rawPct;
+        const fc = isUnmatched ? '#FBBF24' : pct === 100 ? '#10B981' : pct >= 70 ? '#F59E0B' : '#EF4444';
         const relationLabel = p?.secondaryMatch ? 'continuation match' : 'content match';
         const cardStyle = 'background:#FFFFFF;border:1px solid rgba(148,163,184,0.28);border-radius:12px;padding:10px;box-shadow:0 10px 24px rgba(15,23,42,0.12);min-width:0;width:100%;overflow:hidden';
         const imgStyle = 'display:block;width:100%;max-width:100%;height:auto;background:#fff;border-radius:8px;border:1px solid rgba(148,163,184,0.24);image-rendering:auto;object-fit:contain;object-position:top center';
@@ -1926,12 +1953,12 @@ async function showSnapshot() {
         let html = `<div style="background:#111827;border-radius:7px;padding:8px 12px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:#CBD5E1;margin-bottom:8px;display:flex;align-items:center;flex-wrap:wrap;gap:10px">
             <div style="flex:1;min-width:0">
                 <b style="color:#A78BFA">Pair ${resolvedPairIndex + 1}</b>
-                &nbsp;|&nbsp; AFS 1 p${pg1} ↔ AFS 2 p${pg2 ?? '?'}
+                &nbsp;|&nbsp; AFS 1 p${pg1 ?? '?'} ↔ AFS 2 p${pg2 ?? '?'}
                 &nbsp;|&nbsp; <span style="color:#10B981">✓${r1.same ?? 0}</span>
                 <span style="color:#F59E0B"> ~${r1.changed ?? 0}</span>
                 <span style="color:#3B82F6"> +${r1.added ?? 0}</span>
                 <span style="color:#EF4444"> −${r1.removed ?? 0}</span>
-                &nbsp;|&nbsp; <span style="color:${fc}">${pct}% same</span>
+                &nbsp;|&nbsp; <span style="color:${fc}">${pct == null ? 'N/A' : pct + '% same'}</span>
                 &nbsp;|&nbsp; <span style="color:#475569">${curIdx2 + 1} / ${total2}</span>
             </div>
             <div style="display:flex;gap:6px;flex-shrink:0">
@@ -1956,12 +1983,14 @@ async function showSnapshot() {
 
         const issueCount = (r1.changed ?? 0) + (r1.added ?? 0) + (r1.removed ?? 0);
         const isMajor   = issueCount > 2 || pct < 95;
-        const diffNote  = issueCount === 0
+        const diffNote  = isUnmatched
+            ? '⚠ Unmatched page/content — review required; no “no differences” conclusion is available.'
+            : issueCount === 0
             ? '✓ No differences detected on this page pair.'
             : pct >= 98
                 ? `~ ${issueCount} minor difference${issueCount === 1 ? '' : 's'} detected (≥98% identical). May be whitespace or punctuation.`
                 : `${issueCount} difference${issueCount === 1 ? '' : 's'} detected. Pages are paired by ${relationLabel}.`;
-        const noteColor = issueCount === 0 ? '#10B981' : pct >= 98 ? '#F59E0B' : '#94A3B8';
+        const noteColor = isUnmatched ? '#FBBF24' : issueCount === 0 ? '#10B981' : pct >= 98 ? '#F59E0B' : '#94A3B8';
 
         html += `<div style="color:${noteColor};font-size:11px;font-family:'IBM Plex Mono',monospace;margin:0 0 10px">
             ${esc(diffNote)}
@@ -1974,7 +2003,7 @@ async function showSnapshot() {
             ? `<section style="${cardStyle}">
                 <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:10px;min-width:0">
                     <div style="min-width:0;flex:1 1 auto">
-                        <div style="font-size:12px;color:#0F172A;font-weight:700">AFS 1 - page ${pg1}</div>
+                        <div style="font-size:12px;color:#0F172A;font-weight:700">AFS 1 - page ${pg1 ?? '?'}</div>
                         <div style="font-size:10px;color:#F59E0B;font-family:'IBM Plex Mono',monospace">yellow = changed or removed content</div>
                     </div>
                     <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;flex:0 0 auto">
@@ -1984,7 +2013,7 @@ async function showSnapshot() {
                 </div>
                 <img src="data:image/png;base64,${r1.b64}" alt="AFS 1 page ${pg1}" style="${imgStyle}"/>
             </section>`
-            : `<section style="${cardStyle}"><div style="border:1px dashed #374151;border-radius:10px;padding:40px;text-align:center;color:#64748B">AFS 1 unavailable<br><small>${esc(r1.message || '')}</small></div></section>`;
+            : `<section style="${cardStyle}"><div style="border:1px dashed #374151;border-radius:10px;padding:40px;text-align:center;color:#64748B">${pg1 == null ? 'No matching page in AFS 1' : 'AFS 1 unavailable'}<br><small>${esc(r1.message || '')}</small></div></section>`;
 
         html += r2.success && r2.b64
             ? `<section style="${cardStyle}">
@@ -2000,7 +2029,7 @@ async function showSnapshot() {
                 </div>
                 <img src="data:image/png;base64,${r2.b64}" alt="AFS 2 page ${pg2 ?? '?'}" style="${imgStyle}"/>
             </section>`
-            : `<section style="${cardStyle}"><div style="border:1px dashed #7C2D12;border-radius:10px;padding:40px;text-align:center;color:#F59E0B;font-size:12px">Page has no match in AFS 2</div></section>`;
+            : `<section style="${cardStyle}"><div style="border:1px dashed #7C2D12;border-radius:10px;padding:40px;text-align:center;color:#F59E0B;font-size:12px">${pg2 == null ? 'No matching page in AFS 2' : esc(r2.message || 'AFS 2 unavailable')}</div></section>`;
 
         html += '</div></div>';
 

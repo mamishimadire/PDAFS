@@ -193,6 +193,75 @@ public class RegressionFixTests
         Assert.Equal("same", result);
     }
 
+    [Theory]
+    [InlineData("Total assets 1 500", "total assets 1,500.00", "same")]
+    [InlineData("Date: 06 October 1990", "Date: 6 October 1990", "same")]
+    [InlineData("Amount: R 150", "Amount: ZAR 150", "same")]
+    [InlineData("Amount: 150", "Amount: (150)", "changed")]
+    [InlineData("Rate: 10%", "Rate: 10", "changed")]
+    [InlineData("Rate: 10%", "Rate: 12%", "changed")]
+    [InlineData("Amount: R 150", "Amount: $150", "changed")]
+    [InlineData("Amount: 1.5", "Amount: 15", "changed")]
+    [InlineData("Rate: 5%", "Rate: 6%", "changed")]
+    [InlineData("Amount: 1 500,00", "Amount: 1500.00", "same")]
+    public void LineComparatorService_PreservesFinancialMeaning(
+        string first,
+        string second,
+        string expected)
+    {
+        var result = InvokePrivateStatic<string>(
+            typeof(LineComparatorService),
+            "DetermineStatus",
+            first,
+            second);
+
+        Assert.Equal(expected, result);
+    }
+
+    [Theory]
+    [InlineData("Total assets 1 500", "total assets 1,500.00", DiffStatus.Same)]
+    [InlineData("Date: 06 October 1990", "Date: 6 October 1990", DiffStatus.Same)]
+    [InlineData("Amount: R 150", "Amount: ZAR 150", DiffStatus.Same)]
+    [InlineData("Amount: 150", "Amount: (150)", DiffStatus.Changed)]
+    [InlineData("Rate: 10%", "Rate: 10", DiffStatus.Changed)]
+    [InlineData("Rate: 10%", "Rate: 12%", DiffStatus.Changed)]
+    [InlineData("Amount: R 150", "Amount: $150", DiffStatus.Changed)]
+    [InlineData("Amount: 1.5", "Amount: 15", DiffStatus.Changed)]
+    [InlineData("Rate: 5%", "Rate: 6%", DiffStatus.Changed)]
+    [InlineData("Amount: 1 500,00", "Amount: 1500.00", DiffStatus.Same)]
+    public void LineComparisonService_PreservesFinancialMeaning(
+        string first,
+        string second,
+        DiffStatus expected)
+    {
+        var result = InvokePrivateStatic<DiffStatus>(
+            typeof(LineComparisonService),
+            "DetermineStatus",
+            first,
+            second);
+
+        Assert.Equal(expected, result);
+    }
+
+    [Fact]
+    public void AuditTextNormalizer_EquatesEquivalentNumberSeparators()
+    {
+        var first = AuditTextNormalizer.ExtractNormalizedNumbers("Total assets 1 500");
+        var second = AuditTextNormalizer.ExtractNormalizedNumbers("total assets 1,500.00");
+
+        Assert.True(first.SetEquals(second), $"First: {string.Join(", ", first)}; second: {string.Join(", ", second)}");
+
+        var spacedCurrency = AuditTextNormalizer.ExtractNormalizedNumbers(
+            "Total assets were R 1 234 567 at year end");
+        var groupedCurrency = AuditTextNormalizer.ExtractNormalizedNumbers(
+            "Total assets were R1,234,567 at year end");
+        Assert.True(spacedCurrency.SetEquals(groupedCurrency),
+            $"Spaced: {string.Join(", ", spacedCurrency)}; grouped: {string.Join(", ", groupedCurrency)}");
+        Assert.False(AuditTextNormalizer.HasDifferentMeaningfulMarkers(
+            "Total assets were R 1 234 567 at year end",
+            "Total assets were R1,234,567 at year end"));
+    }
+
     [Fact]
     public void LineComparatorService_OrderedWrapExtension_IsSame()
     {

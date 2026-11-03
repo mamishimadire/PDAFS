@@ -255,14 +255,21 @@ public class AiContentReaderService
             "You are an expert financial auditor at SNG Grant Thornton. " +
             "You have extracted the text of two versions of an Annual Financial Statement (AFS). " +
             "The document text is prefixed with PAGE MARKERS in the format '=== PAGE N ===' so you know which page each section appears on. " +
-            "Read both documents carefully and perform a comprehensive comparison.\n\n" +
+            "Read both documents carefully and compare audit meaning, not page position, text coordinates, line breaks, font, or rendering.\n\n" +
+            "Comparison rules:\n" +
+            "- Match equivalent sections, tables, rows, columns, and note references by labels and meaning, even when pages or layout move.\n" +
+            "- Ignore capitalization, whitespace, line wrapping, punctuation style, and equivalent number/date formatting only when the underlying value is unchanged.\n" +
+            "- Preserve and verify signs, decimal values, percentages, currencies, dates, company/auditor names, registrations, legal citations, and note references. Do not equate 10% with 10, positive with negative, or different currencies.\n" +
+            "- Do not report a visual or extraction difference as substantive without evidence in the extracted content. Group paragraph rewrites into a concise change summary rather than listing isolated words.\n" +
+            "- Report exact old/new evidence and page locations where available. Do not infer missing values, materiality, or causal relationships; say when evidence is uncertain.\n" +
+            "- An unmatched page is a structural review item, not proof that there are no differences. Never conclude the documents are identical if any page or section is unmatched or unreadable.\n\n" +
             "Your job:\n" +
             "1. Identify every section (Balance Sheet, Income Statement, Cash Flow, Notes, Policies, Directors' Report, Auditors' Report, etc.)\n" +
             "2. For each section, summarise what changed between AFS 1 and AFS 2\n" +
             "3. For each section diff, provide pageAfs1 (the page number in AFS 1 where this section appears) and pageAfs2 (the page number in AFS 2)\n" +
             "4. List all numeric line item changes you can find (e.g. 'Revenue: R45.2M → R48.6M') with the page numbers they appear on\n" +
             "5. Flag accounting policy changes, new disclosures, and removed disclosures\n" +
-            "6. Provide an overall materiality assessment and audit conclusion\n\n" +
+            "6. Provide an overall materiality assessment and audit conclusion, keeping severity distinct from monetary materiality\n\n" +
             "IMPORTANT: Always set pageAfs1 and pageAfs2 on every sectionDiff and lineItemChange. Use the === PAGE N === markers to determine the correct page numbers.\n\n" +
             "Return ONLY valid JSON matching the provided schema. Do not include markdown or code fences.\n\n" +
             "=== AFS 1 — " + report1.Label + " (" + report1.Filename + ") ===\n" +

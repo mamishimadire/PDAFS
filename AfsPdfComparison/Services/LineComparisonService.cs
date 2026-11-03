@@ -178,6 +178,13 @@ namespace AfsPdfComparison.Services
         /// </summary>
         private static DiffStatus DetermineStatus(string l1, string l2)
         {
+            if (AuditTextNormalizer.HasDifferentMeaningfulMarkers(l1, l2) ||
+                !AuditTextNormalizer.ExtractNormalizedNumbers(l1)
+                    .SetEquals(AuditTextNormalizer.ExtractNormalizedNumbers(l2)))
+            {
+                return DiffStatus.Changed;
+            }
+
             // Gate 0: Case- and whitespace-insensitive equality.
             // Lines that differ ONLY in capitalisation or spacing are NEVER flagged as
             // changes — this is an absolute requirement. E.g. "TOTAL ASSETS" == "Total Assets".

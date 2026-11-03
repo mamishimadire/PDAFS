@@ -2002,6 +2002,7 @@ public class AfsController : Controller
                 added    = pageDiff.Added,
                 removed  = pageDiff.Removed,
                 same     = pageDiff.Same,
+                unmatched = pageDiff.Unmatched,
             });
         }
 
@@ -2051,6 +2052,7 @@ public class AfsController : Controller
                 added    = pageDiff.Added,
                 removed  = pageDiff.Removed,
                 same     = pageDiff.Same,
+                unmatched = pageDiff.Unmatched,
             });
         }
         catch (Exception ex)

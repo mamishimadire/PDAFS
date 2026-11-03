@@ -6,6 +6,7 @@
 // ║  producing precise changes per financial line item and column.                ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
+using System.Globalization;
 using System.Text.RegularExpressions;
 using AfsPdfComparison.Models;
 
@@ -17,11 +18,11 @@ public class TableDiffService
     // separated numeric columns (SA format: digits, spaces, commas, brackets, R).
     // e.g. "Property, plant and equipment  1 234 567  (987 654)"
     private static readonly Regex _tableRowRe = new(
-        @"^(.{2,60}?)\s{2,}([\d\s,()R.-]{2,}?)\s{2,}([\d\s,()R.-]{2,})\s*$",
-        RegexOptions.Compiled);
+        @"^(.{2,60}?)\s{2,}([\d\s,()A-Za-z$€£¥₹%.-]{2,}?)\s{2,}([\d\s,()A-Za-z$€£¥₹%.-]{2,})\s*$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private static readonly Regex _numCellRe = new(
-        @"^[\d\s,.()\-R]+$", RegexOptions.Compiled);
+        @"^(?=.*\d)[\d\s,.()\-A-Z$€£¥₹%]+$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     // ── Public entry point ────────────────────────────────────────────────────
 
@@ -147,12 +148,13 @@ public class TableDiffService
         string v1, string v2,
         int row, int col, PageDiffResult pd)
     {
-        string n1 = NormNum(v1);
-        string n2 = NormNum(v2);
-        if (n1 == n2) return null;
+        string n1 = AuditTextNormalizer.NormalizeFinancialValue(v1);
+        string n2 = AuditTextNormalizer.NormalizeFinancialValue(v2);
+        if (AuditTextNormalizer.FinancialValuesEquivalent(v1, v2)) return null;
 
         double? pct = null;
-        if (decimal.TryParse(n1, out decimal d1) && decimal.TryParse(n2, out decimal d2) && d1 != 0)
+        if (decimal.TryParse(n1.Split('|')[0].TrimStart('-'), NumberStyles.Number, CultureInfo.InvariantCulture, out decimal d1) &&
+            decimal.TryParse(n2.Split('|')[0].TrimStart('-'), NumberStyles.Number, CultureInfo.InvariantCulture, out decimal d2) && d1 != 0)
             pct = Math.Round((double)Math.Abs(d2 - d1) / (double)Math.Abs(d1) * 100, 1);
 
         return new TableCellDiff
@@ -179,9 +181,4 @@ public class TableDiffService
     private static string NormLabel(string s)
         => Regex.Replace(s.ToLowerInvariant().Trim(), @"\s+", " ");
 
-    private static string NormNum(string s)
-        => Regex.Replace(
-               s.Replace("(", "-").Replace(")", "")
-                .Replace("R", "").Replace(",", "").Replace(" ", ""),
-               @"[^\d.-]", "").Trim();
 }

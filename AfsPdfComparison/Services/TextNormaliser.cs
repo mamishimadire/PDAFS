@@ -82,11 +82,16 @@ namespace AfsPdfComparison.Services
             t = Regex.Replace(t, @"(?<=\d)\s*\.\s*(?=\d)", ".");
             // Normalise comma spacing inside numbers: "1 , 000" → "1,000".
             t = Regex.Replace(t, @"(?<=\d)\s*,\s*(?=\d)", ",");
+            // A comma followed by one or two terminal digits is a decimal mark,
+            // while three following digits indicate a thousands separator.
+            t = Regex.Replace(t, @"(?<=\d),(?=\d{1,2}(?!\d))", ".");
             // Normalise ALL dash variants → hyphen-minus so "provisions – 2025" == "provisions - 2025".
             // Word→PDF exports use en-dash/em-dash in headings; plain-text versions use hyphen.
             t = Regex.Replace(t, "[‐-―−﹘﹣－]", "-");
             t = Regex.Replace(t, @"^[-–—\s]*\d{1,4}[-–—\s]*$", "").Trim();
-            return t;
+            t = AuditTextNormalizer.NormalizeDecimalFormatting(t);
+            return AuditTextNormalizer.NormalizeNamedDates(
+                AuditTextNormalizer.NormalizeCurrencyFormatting(t));
         }
 
         /// <summary>
