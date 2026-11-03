@@ -97,25 +97,36 @@ Write-Host "Starting web server at $url ..." -ForegroundColor Cyan
 Write-Host "Press Ctrl+C in this window to stop the server." -ForegroundColor Yellow
 Write-Host ""
 
-# Wait for Kestrel to listen before opening the browser.
-$port = ([Uri]$url).Port
+# Wait for the application to return an HTTP response before opening the browser.
 $browserCmd = @'
+$url = "__URL__"
 $deadline = (Get-Date).AddSeconds(60)
 do {
-    $client = New-Object System.Net.Sockets.TcpClient
     try {
-        $client.Connect("127.0.0.1", __PORT__)
-        $client.Close()
-        Start-Process "__URL__"
-        exit 0
+        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 3
+        if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
+            Start-Process -FilePath $url -ErrorAction Stop
+            exit 0
+        }
     } catch {
-        $client.Dispose()
-        Start-Sleep -Seconds 1
+        # The app may still be starting; retry until the startup deadline.
     }
+    Start-Sleep -Seconds 1
 } while ((Get-Date) -lt $deadline)
+exit 2
 '@
-$browserCmd = $browserCmd.Replace("__PORT__", [string]$port).Replace("__URL__", $url)
-Start-Process powershell.exe -ArgumentList @("-NoProfile", "-WindowStyle", "Hidden", "-Command", $browserCmd) -WindowStyle Hidden
+$browserCmd = $browserCmd.Replace("__URL__", $url)
+$encodedBrowserCmd = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($browserCmd))
+try {
+    Start-Process powershell.exe `
+        -ArgumentList @("-NoProfile", "-WindowStyle", "Hidden", "-EncodedCommand", $encodedBrowserCmd) `
+        -WindowStyle Hidden `
+        -ErrorAction Stop | Out-Null
+    Write-Host "Browser will open automatically when the app responds at $url." -ForegroundColor DarkGray
+} catch {
+    Write-Host "Could not start the automatic browser opener: $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host "After the server starts, open $url manually." -ForegroundColor Yellow
+}
 
 # Launch app
 $env:ASPNETCORE_ENVIRONMENT = "Development"
