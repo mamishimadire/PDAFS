@@ -2047,7 +2047,7 @@ async function showSnapshot() {
                 <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:10px;min-width:0">
                     <div style="min-width:0;flex:1 1 auto">
                         <div style="font-size:12px;color:#0F172A;font-weight:700">AFS 1 - page ${pg1 ?? '?'}</div>
-                        <div style="font-size:10px;color:#F59E0B;font-family:'IBM Plex Mono',monospace">yellow = changed or removed content</div>
+                        <div style="font-size:10px;color:#F59E0B;font-family:'IBM Plex Mono',monospace">yellow = verified content or reference change</div>
                     </div>
                     <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;flex:0 0 auto">
                         ${r1.pdfUrl ? `<a href="${r1.pdfUrl}" target="_blank" rel="noopener" style="${linkStyle}">Open PDF</a>` : ''}
@@ -2063,7 +2063,7 @@ async function showSnapshot() {
                 <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:10px;min-width:0">
                     <div style="min-width:0;flex:1 1 auto">
                         <div style="font-size:12px;color:#0F172A;font-weight:700">AFS 2 - page ${pg2 ?? '?'}</div>
-                        <div style="font-size:10px;color:#F59E0B;font-family:'IBM Plex Mono',monospace">yellow = changed or added content</div>
+                        <div style="font-size:10px;color:#F59E0B;font-family:'IBM Plex Mono',monospace">yellow = verified content or reference change</div>
                     </div>
                     <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;flex:0 0 auto">
                         ${r2.pdfUrl ? `<a href="${r2.pdfUrl}" target="_blank" rel="noopener" style="${linkStyle}">Open PDF</a>` : ''}

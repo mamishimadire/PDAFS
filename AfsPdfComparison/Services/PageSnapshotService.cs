@@ -82,7 +82,7 @@ namespace AfsPdfComparison.Services
 
         private static bool ShouldMatchSnapshotSpec(string lineNorm, HighlightSpec spec)
         {
-            if (!spec.HighlightEligible || spec.Confidence < 0.62)
+            if ((!spec.HighlightEligible && !spec.StructuralHighlightEligible) || spec.Confidence < 0.62)
                 return false;
 
             var specNorm = SnapNorm((spec.LineText ?? "").Trim());
@@ -351,18 +351,24 @@ namespace AfsPdfComparison.Services
                         using var fillPaintHigh      = new SKPaint { Color = new SKColor(220, 30, 60, 115),  Style = SKPaintStyle.Fill };
                         using var lineFillHigh       = new SKPaint { Color = new SKColor(220, 30, 60, 50),   Style = SKPaintStyle.Fill };
                         using var borderPaintHigh    = new SKPaint { Color = new SKColor(200, 16, 46, 240),  Style = SKPaintStyle.Stroke, StrokeWidth = 2f };
+                        // Structural references remain visible without implying a substantive content change.
+                        using var fillPaintStructural   = new SKPaint { Color = new SKColor(255, 220, 0, 90), Style = SKPaintStyle.Fill };
+                        using var lineFillStructural    = new SKPaint { Color = new SKColor(255, 220, 0, 42), Style = SKPaintStyle.Fill };
+                        using var borderPaintStructural = new SKPaint { Color = new SKColor(255, 160, 0, 220), Style = SKPaintStyle.Stroke, StrokeWidth = 1f };
 
-                        var verifiedSpecs = specs.Where(spec => spec.HighlightEligible && spec.Confidence >= 0.62).ToList();
+                        var verifiedSpecs = specs.Where(spec => (spec.HighlightEligible || spec.StructuralHighlightEligible) && spec.Confidence >= 0.62).ToList();
                         if (verifiedSpecs.Count > 0 && verifiedSpecs.All(spec => spec.SourceCoordinates.Count > 0))
                         {
                             foreach (var spec in verifiedSpecs)
                             {
-                                var (fillPaint, _, borderPaint) = spec.Severity switch
-                                {
-                                    AiHighlightSeverity.High => (fillPaintHigh, lineFillHigh, borderPaintHigh),
-                                    AiHighlightSeverity.Medium => (fillPaintMedium, lineFillMedium, borderPaintMedium),
-                                    _ => (fillPaintNormal, lineFillNormal, borderPaintNormal),
-                                };
+                                var (fillPaint, borderPaint) = spec.StructuralHighlightEligible
+                                    ? (fillPaintStructural, borderPaintStructural)
+                                    : spec.Severity switch
+                                    {
+                                        AiHighlightSeverity.High => (fillPaintHigh, borderPaintHigh),
+                                        AiHighlightSeverity.Medium => (fillPaintMedium, borderPaintMedium),
+                                        _ => (fillPaintNormal, borderPaintNormal),
+                                    };
                                 foreach (var coordinates in spec.SourceCoordinates.Where(rect => rect.PageNumber == pageIndex + 1))
                                 {
                                     var rectangle = new SKRect(
@@ -386,7 +392,7 @@ namespace AfsPdfComparison.Services
                             var lineNorm = renderLine.NormalizedText;
 
                             HighlightSpec? matchedSpec = null;
-                            foreach (var spec in specs.Where(spec => spec.HighlightEligible && spec.Confidence >= 0.62))
+                            foreach (var spec in specs.Where(spec => (spec.HighlightEligible || spec.StructuralHighlightEligible) && spec.Confidence >= 0.62))
                             {
                                 if (ShouldMatchSnapshotSpec(lineNorm, spec))
                                 {
@@ -398,12 +404,14 @@ namespace AfsPdfComparison.Services
                             if (matchedSpec == null) continue;
 
                             // Choose paint set based on AI severity
-                            var (fillPaint, lineFillPaint, borderPaint) = matchedSpec.Severity switch
-                            {
-                                AiHighlightSeverity.High   => (fillPaintHigh,   lineFillHigh,   borderPaintHigh),
-                                AiHighlightSeverity.Medium => (fillPaintMedium, lineFillMedium, borderPaintMedium),
-                                _                          => (fillPaintNormal, lineFillNormal, borderPaintNormal),
-                            };
+                            var (fillPaint, lineFillPaint, borderPaint) = matchedSpec.StructuralHighlightEligible
+                                ? (fillPaintStructural, lineFillStructural, borderPaintStructural)
+                                : matchedSpec.Severity switch
+                                {
+                                    AiHighlightSeverity.High   => (fillPaintHigh,   lineFillHigh,   borderPaintHigh),
+                                    AiHighlightSeverity.Medium => (fillPaintMedium, lineFillMedium, borderPaintMedium),
+                                    _                          => (fillPaintNormal, lineFillNormal, borderPaintNormal),
+                                };
 
                             if (matchedSpec.ChangedWords.Count == 0)
                             {

@@ -78,12 +78,16 @@ public class HighlightSpec
     public bool WholeLineMode { get; set; } = false;
     /// <summary>Only findings explicitly approved by the comparison pipeline may be rendered.</summary>
     public bool HighlightEligible { get; set; } = true;
+    /// <summary>Approved structural findings that may be shown with a non-substantive marker.</summary>
+    public bool StructuralHighlightEligible { get; set; }
     /// <summary>Confidence assigned by the comparison engine, before coordinate lookup.</summary>
     public double Confidence { get; set; } = 1.0;
     /// <summary>True when only the changed tokens should be painted, without a row-wide band.</summary>
     public bool ExactRegion { get; set; }
     /// <summary>Semantic finding category used for review and audit traceability.</summary>
     public string DifferenceType { get; set; } = "text";
+    /// <summary>Structural relationship used to distinguish pagination and relocation markers.</summary>
+    public string StructuralChangeType { get; set; } = "none";
     public string OriginalDocumentId { get; set; } = string.Empty;
     public string RevisedDocumentId { get; set; } = string.Empty;
     public int? OriginalPageNumber { get; set; }

@@ -232,7 +232,101 @@ public class FinancialComparisonEngineTests
         Assert.Equal(finding.FindingId, spec.FindingId);
         Assert.True(spec.HighlightEligible);
         Assert.True(spec.ExactRegion);
-        Assert.Contains("842,765", spec.ChangedWords);
+        Assert.Empty(spec.ChangedWords);
+        Assert.Contains("842,765", spec.ChangedPhrases);
+    }
+
+    [Fact]
+    public void PaginationReferenceRemainsStructuralButCanReceiveAReviewMarker()
+    {
+        var finding = new TableCellDiff
+        {
+            FindingId = "structural-reference",
+            Label = "Governance oversight",
+            ValueAfs1 = "8",
+            ValueAfs2 = "9",
+            SourceTextAfs1 = "Governance oversight    8",
+            SourceTextAfs2 = "Governance oversight    9",
+            Status = "changed",
+            DifferenceType = "pagination-reference",
+            StructuralChangeType = "pagination-shift",
+            SemanticClassification = "structural-change",
+            HighlightEligible = false,
+            Confidence = 0.95,
+        };
+
+        var spec = InvokePrivateStatic<HighlightSpec>(
+            typeof(AfsController), "BuildFinancialCellHighlightSpec", finding, 2);
+
+        Assert.False(spec.HighlightEligible);
+        Assert.True(spec.StructuralHighlightEligible);
+        Assert.Equal("structural-change", finding.SemanticClassification);
+        Assert.Equal("pagination-shift", spec.StructuralChangeType);
+    }
+
+    [Fact]
+    public async Task NumericCellHighlightDoesNotCaptureMatchingNoteReference()
+    {
+        QuestPDF.Settings.License = LicenseType.Community;
+        byte[] originalPdf = CreateFinancialPdfWithNoteColumn("11 296");
+        byte[] revisedPdf = CreateFinancialPdfWithNoteColumn("11 295");
+        string originalPath = Path.Combine(Path.GetTempPath(), $"afs-note-original-{Guid.NewGuid():N}.pdf");
+        string revisedPath = Path.Combine(Path.GetTempPath(), $"afs-note-revised-{Guid.NewGuid():N}.pdf");
+
+        try
+        {
+            await File.WriteAllBytesAsync(originalPath, originalPdf);
+            await File.WriteAllBytesAsync(revisedPath, revisedPdf);
+            var comparison = CompareTable(ExtractPageText(originalPdf), ExtractPageText(revisedPdf));
+            var finding = Assert.Single(comparison.TableCellDiffs.Where(cell => cell.Status == "changed"));
+            var pagePair = new PageDiffResult { PairIndex = 0, PageAfs1 = 1, PageAfs2 = 1 };
+            var revisedSpec = InvokePrivateStatic<HighlightSpec>(
+                typeof(AfsController), "BuildFinancialCellHighlightSpec", finding, 2);
+            revisedSpec.OriginalValue = finding.ValueAfs1;
+            revisedSpec.RevisedValue = finding.ValueAfs2;
+            revisedSpec.TableId = finding.TableId;
+            revisedSpec.ColumnId = finding.ColumnId;
+            revisedSpec.SourceCoordinates = ResolveCoordinates(revisedPath, pagePair, revisedSpec, 2);
+
+            Assert.NotEmpty(revisedSpec.SourceCoordinates);
+            using var document = PdfDocument.Open(revisedPdf);
+            var page = document.GetPage(1);
+            var rowWords = page.GetWords()
+                .Where(word => revisedSpec.SourceCoordinates.Any(rect =>
+                    Math.Abs(rect.Y - (page.Height - word.BoundingBox.Top)) < 5 &&
+                    Math.Abs(rect.Y + rect.Height - (page.Height - word.BoundingBox.Bottom)) < 5))
+                .OrderBy(word => word.BoundingBox.Left)
+                .ToList();
+            var noteReference = rowWords.FirstOrDefault(word => word.Text.Trim() == "11");
+            Assert.NotNull(noteReference);
+            Assert.DoesNotContain(revisedSpec.SourceCoordinates, rect =>
+                rect.X <= noteReference!.BoundingBox.Right && rect.X + rect.Width >= noteReference.BoundingBox.Left);
+        }
+        finally
+        {
+            File.Delete(originalPath);
+            File.Delete(revisedPath);
+        }
+    }
+
+    [Fact]
+    public void MultipleChangedRowsAndTheirReportedTotalsRemainCellFindings()
+    {
+        var comparison = CompareTable(
+            "Reporting periods 2025 2024\nPrimary inflows 6    5 372 097  5 085 031\nSupplemental inflows 7    1 204 575  1 445 942\nOperating outflows 8    (6 705 724)  (6 635 514)\nOperating result    (129 052)  (104 541)\nFinance income 11    11 296  26 584\nPeriod result    (117 756)  (77 957)\nComprehensive result    (117 756)  (77 957)",
+            "Reporting periods 2025 2024\nPrimary inflows 6    5 372 098  5 085 031\nSupplemental inflows 7    1 204 576  1 445 942\nOperating outflows 8    (6 705 726)  (6 635 514)\nOperating result    (129 052)  (104 541)\nFinance income 11    11 295  26 584\nPeriod result    (117 757)  (77 957)\nComprehensive result    (117 757)  (77 957)");
+
+        var changedLabels = comparison.TableCellDiffs
+            .Where(finding => finding.Status == "changed")
+            .Select(finding => finding.Label)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        Assert.Contains("Primary inflows 6", changedLabels);
+        Assert.Contains("Supplemental inflows 7", changedLabels);
+        Assert.Contains("Operating outflows 8", changedLabels);
+        Assert.Contains("Finance income 11", changedLabels);
+        Assert.Contains("Period result", changedLabels);
+        Assert.Contains("Comprehensive result", changedLabels);
+        Assert.Equal(6, changedLabels.Count);
     }
 
     [Fact]
@@ -269,14 +363,32 @@ public class FinancialComparisonEngineTests
             string revisedPlain = await renderer.RenderPageToBase64(revisedPdf, 0, new List<string>());
             string originalHighlighted = await renderer.RenderPageToBase64(originalPdf, 0, new List<HighlightSpec> { originalSpec });
             string revisedHighlighted = await renderer.RenderPageToBase64(revisedPdf, 0, new List<HighlightSpec> { revisedSpec });
+            var structuralSpec = new HighlightSpec
+            {
+                FindingId = finding.FindingId,
+                LineText = revisedSpec.LineText,
+                ChangedWords = revisedSpec.ChangedWords,
+                AnchorWords = revisedSpec.AnchorWords,
+                ChangedPhrases = revisedSpec.ChangedPhrases,
+                Confidence = revisedSpec.Confidence,
+                HighlightEligible = false,
+                StructuralHighlightEligible = true,
+                StructuralChangeType = "pagination-shift",
+                DifferenceType = "pagination-reference",
+                ExactRegion = true,
+                SourceCoordinates = revisedSpec.SourceCoordinates,
+            };
+            string revisedStructural = await renderer.RenderPageToBase64(revisedPdf, 0, new List<HighlightSpec> { structuralSpec });
             using var originalBase = SKBitmap.Decode(Convert.FromBase64String(originalPlain));
             using var revisedBase = SKBitmap.Decode(Convert.FromBase64String(revisedPlain));
             using var originalMarked = SKBitmap.Decode(Convert.FromBase64String(originalHighlighted));
             using var revisedMarked = SKBitmap.Decode(Convert.FromBase64String(revisedHighlighted));
+            using var revisedStructuralMarked = SKBitmap.Decode(Convert.FromBase64String(revisedStructural));
             Assert.NotNull(originalBase);
             Assert.NotNull(revisedBase);
             Assert.NotNull(originalMarked);
             Assert.NotNull(revisedMarked);
+            Assert.NotNull(revisedStructuralMarked);
             using var originalPdfDocument = PdfDocument.Open(originalPdf);
             using var revisedPdfDocument = PdfDocument.Open(revisedPdf);
             var originalPdfPage = originalPdfDocument.GetPage(1);
@@ -287,6 +399,8 @@ public class FinancialComparisonEngineTests
                 revisedPdfPage.Width, revisedPdfPage.Height) > 0);
             Assert.True(ChangedPixelsInCoordinates(originalBase!, originalMarked!, originalSpec.SourceCoordinates) > 20);
             Assert.True(ChangedPixelsInCoordinates(revisedBase!, revisedMarked!, revisedSpec.SourceCoordinates) > 20);
+            Assert.True(ChangedPixelsInCoordinates(revisedBase!, revisedStructuralMarked!, structuralSpec.SourceCoordinates) > 20);
+            Assert.True(YellowTintPixelsInCoordinates(revisedStructuralMarked!, structuralSpec.SourceCoordinates) > 0);
 
             using var sideBySide = new SKBitmap(originalMarked!.Width + revisedMarked!.Width,
                 Math.Max(originalMarked.Height, revisedMarked.Height));
@@ -452,6 +566,36 @@ public class FinancialComparisonEngineTests
             });
         })).GeneratePdf();
 
+    private static byte[] CreateFinancialPdfWithNoteColumn(string amount) => Document.Create(document =>
+        document.Page(page =>
+        {
+            page.Size(PageSizes.A4);
+            page.Margin(40);
+            page.DefaultTextStyle(style => style.FontSize(12));
+            page.Content().Table(table =>
+            {
+                table.ColumnsDefinition(columns =>
+                {
+                    columns.RelativeColumn(4);
+                    columns.RelativeColumn(1);
+                    columns.RelativeColumn(2);
+                    columns.RelativeColumn(2);
+                });
+
+                table.Header(header =>
+                {
+                    header.Cell().Padding(4).Text("Description");
+                    header.Cell().Padding(4).AlignRight().Text("Note");
+                    header.Cell().Padding(4).AlignRight().Text("2025");
+                    header.Cell().Padding(4).AlignRight().Text("2024");
+                });
+                table.Cell().Padding(4).Text("Finance income");
+                table.Cell().Padding(4).AlignRight().Text("11");
+                table.Cell().Padding(4).AlignRight().Text(amount);
+                table.Cell().Padding(4).AlignRight().Text("26 584");
+            });
+        })).GeneratePdf();
+
     private static byte[] CreateTextPdf(string text) => Document.Create(document =>
         document.Page(page =>
         {
@@ -526,6 +670,29 @@ public class FinancialComparisonEngineTests
             }
         }
         return changed;
+    }
+
+    private static int YellowTintPixelsInCoordinates(
+        SKBitmap image,
+        IReadOnlyList<PdfSourceCoordinates> coordinates)
+    {
+        int yellowPixels = 0;
+        foreach (var rect in coordinates)
+        {
+            int left = Math.Clamp((int)(rect.X * image.Width / 595.0), 0, image.Width - 1);
+            int top = Math.Clamp((int)(rect.Y * image.Height / 842.0), 0, image.Height - 1);
+            int right = Math.Clamp((int)((rect.X + rect.Width) * image.Width / 595.0) + 1, left + 1, image.Width);
+            int bottom = Math.Clamp((int)((rect.Y + rect.Height) * image.Height / 842.0) + 1, top + 1, image.Height);
+            for (int y = top; y < bottom; y++)
+            for (int x = left; x < right; x++)
+            {
+                SKColor color = image.GetPixel(x, y);
+                if (color.Red > color.Blue + 20 && color.Green > color.Blue + 8)
+                    yellowPixels++;
+            }
+        }
+
+        return yellowPixels;
     }
 
     private static int DarkPixelsInCoordinates(

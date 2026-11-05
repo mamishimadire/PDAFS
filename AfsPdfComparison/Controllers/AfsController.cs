@@ -1468,12 +1468,12 @@ public class AfsController : Controller
             .ToList();
 
         var cellSpecs = cmp.TableCellDiffs
-            .Where(cell => cell.HighlightEligible && cell.Confidence >= 0.82 &&
+            .Where(cell => (cell.HighlightEligible || IsStructuralPaginationFinding(cell)) && cell.Confidence >= 0.82 &&
                            cell.PairIndex == pageDiff.PairIndex &&
                            (afs1 ? cell.PageAfs1 == pageDiff.PageAfs1 : cell.PageAfs2 == pageDiff.PageAfs2) &&
                            (cell.Status == "changed" || (afs1 ? cell.Status == "removed" : cell.Status == "added")))
             .Select(cell => BuildFinancialCellHighlightSpec(cell, afsNum))
-            .Where(spec => spec.HighlightEligible && spec.LineText.Length >= 4)
+            .Where(spec => (spec.HighlightEligible || spec.StructuralHighlightEligible) && spec.LineText.Length >= 4)
             .ToList();
 
         var specs = lineSpecs.Concat(cellSpecs)
@@ -1520,8 +1520,15 @@ public class AfsController : Controller
                 spec.HighlightEligible = false;
         }
 
-        return specs.Where(spec => spec.HighlightEligible && spec.SourceCoordinates.Count > 0).ToList();
+        return specs.Where(spec => (spec.HighlightEligible || spec.StructuralHighlightEligible) &&
+                                   spec.SourceCoordinates.Count > 0).ToList();
     }
+
+    private static bool IsStructuralPaginationFinding(TableCellDiff finding) =>
+        finding.Status == "changed" &&
+        finding.DifferenceType == "pagination-reference" &&
+        finding.SemanticClassification == "structural-change" &&
+        finding.StructuralChangeType is "pagination-shift" or "reference-renumbering";
 
     private static HighlightSpec BuildFinancialCellHighlightSpec(TableCellDiff finding, int afsNum)
     {
@@ -1535,7 +1542,13 @@ public class AfsController : Controller
             RowId = finding.RowId,
             ColumnId = finding.ColumnId,
             LineText = afs1 ? finding.SourceTextAfs1 : finding.SourceTextAfs2,
-            ChangedWords = wholeRow ? new List<string>() : TableDiffService.GetVisualTokens(value),
+            // Numeric cell tokens are matched as a complete value group by the coordinate resolver.
+            // Splitting "11 295" into "11" and "295" can otherwise capture an adjacent note ref "11".
+            ChangedWords = wholeRow
+                ? new List<string>()
+                : TableDiffService.GetVisualTokens(value)
+                    .Where(token => AuditTextNormalizer.ExtractNormalizedNumbers(token).Count == 0)
+                    .ToList(),
             AnchorWords = Regex.Matches(finding.Label ?? "", @"[\p{L}\p{N}]+")
                 .Select(match => match.Value)
                 .Where(word => word.Length >= 3)
@@ -1544,9 +1557,11 @@ public class AfsController : Controller
             ChangedPhrases = wholeRow ? new List<string> { finding.Label ?? "" } : new List<string> { value },
             WholeLineMode = wholeRow,
             HighlightEligible = finding.HighlightEligible,
+            StructuralHighlightEligible = IsStructuralPaginationFinding(finding),
             Confidence = finding.Confidence,
             ExactRegion = !wholeRow,
             DifferenceType = finding.DifferenceType,
+            StructuralChangeType = finding.StructuralChangeType,
         };
         return spec;
     }
@@ -1573,6 +1588,15 @@ public class AfsController : Controller
             var page = document.GetPage(pageNumber.Value);
             var renderLines = BuildSnapshotLines(page, page.Height);
             string specNorm = SnapNorm(spec.LineText);
+
+            if (!string.IsNullOrWhiteSpace(spec.TableId) && !spec.WholeLineMode)
+            {
+                string activeCellValue = afsNum == 1 ? spec.OriginalValue : spec.RevisedValue;
+                var cellCoordinates = ResolveFinancialCellCoordinates(
+                    renderLines, page, pageNumber.Value, spec, activeCellValue, specNorm);
+                return cellCoordinates;
+            }
+
             var candidates = new List<(SnapshotRenderLine Line, double Score)>();
             foreach (var line in renderLines)
             {
@@ -1610,16 +1634,30 @@ public class AfsController : Controller
             var words = ordered[0].Line.Words;
             bool wholeLineWithoutNumericTarget = spec.ChangedWords.Count == 0 && !spec.WholeLineMode ||
                                                  spec.WholeLineMode && changedNumbers.Count == 0;
-            var changedWords = wholeLineWithoutNumericTarget
-                ? words
-                : words.Where(word =>
+            List<UglyToad.PdfPig.Content.Word> changedWords;
+            if (!string.IsNullOrWhiteSpace(spec.TableId) && !spec.WholeLineMode && financialValueChanged)
+            {
+                changedWords = FindFinancialValueWords(words, activeValue, spec.ColumnId, page);
+                if (changedWords.Count == 0)
+                {
+                    // Non-numeric markers such as currency and percent signs can still be highlighted,
+                    // but a numeric cell is left for review when its full value cannot be located.
+                    changedWords = words.Where(word => changedTokens.Contains(SnapTokenNormRaw(word.Text ?? ""))).ToList();
+                }
+            }
+            else
+            {
+                changedWords = wholeLineWithoutNumericTarget
+                    ? words
+                    : words.Where(word =>
                 {
                     string token = SnapTokenNormRaw(word.Text ?? "");
                     return changedTokens.Contains(token) ||
                            (changedNumbers.Count > 0 &&
                             AuditTextNormalizer.ExtractNormalizedNumbers(word.Text ?? "")
                                 .Overlaps(changedNumbers));
-                }).ToList();
+                    }).ToList();
+            }
             if (changedWords.Count == 0)
                 return new();
 
@@ -1637,6 +1675,143 @@ public class AfsController : Controller
         {
             return new();
         }
+    }
+
+    private static List<PdfSourceCoordinates> ResolveFinancialCellCoordinates(
+        IReadOnlyList<SnapshotRenderLine> renderLines,
+        UglyToad.PdfPig.Content.Page page,
+        int pageNumber,
+        HighlightSpec spec,
+        string activeValue,
+        string sourceLineNorm)
+    {
+        if (AuditTextNormalizer.ExtractNormalizedNumbers(activeValue).Count != 1)
+            return new();
+
+        var anchors = spec.AnchorWords
+            .Select(SnapTokenNormRaw)
+            .Where(token => token.Length >= 3)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var candidates = new List<(List<UglyToad.PdfPig.Content.Word> Words, double Score)>();
+
+        foreach (var line in renderLines)
+        {
+            var valueWords = FindFinancialValueWords(line.Words, activeValue, spec.ColumnId, page);
+            if (valueWords.Count == 0)
+                continue;
+
+            var lineTokens = line.Words
+                .Select(word => SnapTokenNormRaw(word.Text ?? ""))
+                .Where(token => token.Length > 0)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            int anchorHits = anchors.Count(lineTokens.Contains);
+            if (anchors.Count > 0 && anchorHits < Math.Min(2, anchors.Count))
+                continue;
+
+            double anchorCoverage = anchors.Count == 0 ? 1.0 : (double)anchorHits / anchors.Count;
+            double lineScore = sourceLineNorm.Length == 0
+                ? 0.0
+                : SnapshotLineMatchScore(line.NormalizedText, sourceLineNorm);
+            double phraseScore = SnapshotPhraseMatchScore(line, spec.ChangedPhrases);
+            double score = (0.55 * anchorCoverage) + (0.25 * lineScore) + (0.20 * phraseScore);
+            candidates.Add((valueWords, score));
+        }
+
+        var ordered = candidates.OrderByDescending(candidate => candidate.Score).ToList();
+        if (ordered.Count == 0 || ordered[0].Score < 0.45 ||
+            (ordered.Count > 1 && ordered[0].Score - ordered[1].Score < 0.05))
+            return new();
+
+        return ordered[0].Words.Select(word => new PdfSourceCoordinates
+        {
+            PageNumber = pageNumber,
+            X = word.BoundingBox.Left,
+            Y = page.Height - word.BoundingBox.Top,
+            Width = Math.Max(0, word.BoundingBox.Right - word.BoundingBox.Left),
+            Height = Math.Max(0, word.BoundingBox.Top - word.BoundingBox.Bottom),
+        }).ToList();
+    }
+
+    private static List<UglyToad.PdfPig.Content.Word> FindFinancialValueWords(
+        IReadOnlyList<UglyToad.PdfPig.Content.Word> rowWords,
+        string activeValue,
+        string columnId,
+        UglyToad.PdfPig.Content.Page page)
+    {
+        var expectedNumbers = AuditTextNormalizer.ExtractNormalizedNumbers(activeValue);
+        if (expectedNumbers.Count != 1)
+            return new();
+
+        static bool IsValueFragment(string text) =>
+            Regex.IsMatch(text ?? "", @"^[\d\s.,()%+\-−–—/$€£¥₹]*$", RegexOptions.CultureInvariant) ||
+            Regex.IsMatch(text ?? "", @"^(?:ZAR|USD|EUR|GBP|AUD|CAD|JPY|CHF|R)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+        var orderedWords = rowWords.OrderBy(word => word.BoundingBox.Left).ToList();
+        var matches = new List<(List<UglyToad.PdfPig.Content.Word> Words, double CenterX)>();
+        for (int start = 0; start < orderedWords.Count; start++)
+        {
+            if (!IsValueFragment(orderedWords[start].Text ?? ""))
+                continue;
+
+            string candidateText = "";
+            var run = new List<UglyToad.PdfPig.Content.Word>();
+            for (int end = start; end < Math.Min(orderedWords.Count, start + 6); end++)
+            {
+                var word = orderedWords[end];
+                if (!IsValueFragment(word.Text ?? ""))
+                    break;
+                if (end > start)
+                {
+                    double gap = word.BoundingBox.Left - orderedWords[end - 1].BoundingBox.Right;
+                    double wordHeight = Math.Max(
+                        orderedWords[end - 1].BoundingBox.Top - orderedWords[end - 1].BoundingBox.Bottom,
+                        word.BoundingBox.Top - word.BoundingBox.Bottom);
+                    if (gap > Math.Max(2.5, wordHeight * 0.7))
+                        break;
+                }
+
+                candidateText = candidateText.Length == 0 ? word.Text ?? "" : candidateText + " " + word.Text;
+                run.Add(word);
+                if (AuditTextNormalizer.FinancialValuesEquivalent(candidateText, activeValue))
+                {
+                    double center = (run[0].BoundingBox.Left + run[^1].BoundingBox.Right) / 2.0;
+                    matches.Add((run.ToList(), center));
+                    break;
+                }
+
+                if (AuditTextNormalizer.ExtractNormalizedNumbers(candidateText).Count > 1)
+                    break;
+            }
+        }
+
+        if (matches.Count == 0)
+            return new();
+
+        string normalizedColumn = SnapTokenNormRaw(columnId ?? "");
+        if (normalizedColumn.Length > 0 && !normalizedColumn.StartsWith("column", StringComparison.OrdinalIgnoreCase))
+        {
+            var rowY = rowWords.Count == 0 ? 0 : rowWords.Average(word => word.BoundingBox.Bottom);
+            var header = page.GetWords()
+                .Where(word => string.Equals(SnapTokenNormRaw(word.Text ?? ""), normalizedColumn, StringComparison.OrdinalIgnoreCase))
+                .Select(word => new
+                {
+                    Word = word,
+                    VerticalDistance = word.BoundingBox.Bottom - rowY,
+                })
+                .Where(item => item.VerticalDistance >= 0)
+                .OrderBy(item => item.VerticalDistance)
+                .FirstOrDefault();
+            if (header != null)
+            {
+                return matches
+                    .OrderBy(match => Math.Abs(match.CenterX - (header.Word.BoundingBox.Left + header.Word.BoundingBox.Right) / 2.0))
+                    .First()
+                    .Words;
+            }
+        }
+
+        return matches.OrderBy(match => match.Words.Count).First().Words;
     }
 
     private static bool IsCoveredByFinancialCell(
@@ -3204,23 +3379,27 @@ public class AfsController : Controller
             using var fillBrush  = new SolidBrush(Color.FromArgb(100, 255, 220, 0));
             using var outlinePen = new Pen(Color.FromArgb(220, 200, 140, 0), 1.2f);
 
-            var verifiedSpecs = specs.Where(spec => spec.HighlightEligible && spec.Confidence >= 0.62).ToList();
+            var verifiedSpecs = specs.Where(spec => (spec.HighlightEligible || spec.StructuralHighlightEligible) && spec.Confidence >= 0.62).ToList();
             if (verifiedSpecs.Count > 0 && verifiedSpecs.All(spec => spec.SourceCoordinates.Count > 0))
             {
                 foreach (var spec in verifiedSpecs)
                 {
-                    Color fillColor = spec.Severity switch
-                    {
-                        AiHighlightSeverity.High => Color.FromArgb(115, 220, 30, 60),
-                        AiHighlightSeverity.Medium => Color.FromArgb(105, 255, 140, 0),
-                        _ => Color.FromArgb(100, 255, 220, 0),
-                    };
-                    Color borderColor = spec.Severity switch
-                    {
-                        AiHighlightSeverity.High => Color.FromArgb(240, 200, 16, 46),
-                        AiHighlightSeverity.Medium => Color.FromArgb(230, 230, 100, 0),
-                        _ => Color.FromArgb(220, 200, 140, 0),
-                    };
+                    Color fillColor = spec.StructuralHighlightEligible
+                        ? Color.FromArgb(100, 255, 220, 0)
+                        : spec.Severity switch
+                        {
+                            AiHighlightSeverity.High => Color.FromArgb(115, 220, 30, 60),
+                            AiHighlightSeverity.Medium => Color.FromArgb(105, 255, 140, 0),
+                            _ => Color.FromArgb(100, 255, 220, 0),
+                        };
+                    Color borderColor = spec.StructuralHighlightEligible
+                        ? Color.FromArgb(220, 200, 140, 0)
+                        : spec.Severity switch
+                        {
+                            AiHighlightSeverity.High => Color.FromArgb(240, 200, 16, 46),
+                            AiHighlightSeverity.Medium => Color.FromArgb(230, 230, 100, 0),
+                            _ => Color.FromArgb(220, 200, 140, 0),
+                        };
                     using var sourceBrush = new SolidBrush(fillColor);
                     using var sourcePen = new Pen(borderColor, 1.2f);
                     foreach (var coordinates in spec.SourceCoordinates.Where(rect => rect.PageNumber == pageIndex + 1))
@@ -3241,7 +3420,7 @@ public class AfsController : Controller
             }
 
             var lineAssignments = new Dictionary<int, List<HighlightSpec>>();
-            foreach (var spec in specs.Where(spec => spec.HighlightEligible && spec.Confidence >= 0.62))
+            foreach (var spec in specs.Where(spec => (spec.HighlightEligible || spec.StructuralHighlightEligible) && spec.Confidence >= 0.62))
             {
                 string specNorm = SnapNorm((spec.LineText ?? "").Trim());
                 if (specNorm.Length < 3)
