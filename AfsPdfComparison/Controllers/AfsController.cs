@@ -122,6 +122,8 @@ public class AfsController : Controller
                 PageAfs1 = pd.PageAfs1,
                 PageAfs2 = pd.PageAfs2,
                 AlignSim = pd.AlignSim,
+                StructuralChangeType = pd.StructuralChangeType,
+                MatchConfidence = pd.MatchConfidence,
                 PctSame = pd.PctSame,
                 Same = pd.Same,
                 Changed = pd.Changed,
@@ -137,6 +139,7 @@ public class AfsController : Controller
                 I1 = a.I1,
                 I2 = a.I2,
                 Sim = a.Sim,
+                MatchType = a.MatchType,
             }).ToList(),
             ComparedAt = result.ComparedAt,
         };
@@ -838,6 +841,8 @@ public class AfsController : Controller
                 pageAfs1  = p.PageAfs1,
                 pageAfs2  = p.PageAfs2,
                 alignSim  = p.AlignSim,
+                structuralChangeType = p.StructuralChangeType,
+                matchConfidence = p.MatchConfidence,
                 pctSame   = p.PctSame,
                 same      = p.Same,
                 changed   = p.Changed,
@@ -976,10 +981,18 @@ public class AfsController : Controller
                 }).ToList(),
                 tableCellDiffs = result.TableCellDiffs.Select(t => new
                 {
+                    t.FindingId, t.TableId, t.RowId, t.ColumnId,
+                    t.OriginalDocumentId, t.RevisedDocumentId,
                     t.Row, t.Col, t.Label, t.ColHeader,
                     t.ValueAfs1, t.ValueAfs2, t.Status, t.PctChange,
+                    t.SourceTextAfs1, t.SourceTextAfs2,
+                    t.SourceCoordinatesAfs1, t.SourceCoordinatesAfs2,
+                    t.Confidence, t.HighlightEligible, t.DifferenceType,
+                    t.SemanticClassification, t.RootFindingId, t.DependencyFindingIds,
+                    t.CalculationValidated, t.CalculationConfidence,
                     t.PageAfs1, t.PageAfs2, t.PairIndex,
                 }).ToList(),
+                calculationRelationships = result.CalculationRelationships,
                 labeledNumberChanges = result.LabeledNumberChanges.Select(n => new
                 {
                     label       = n.Label,
@@ -1204,13 +1217,47 @@ public class AfsController : Controller
             .Take(200)
             .Select(d => new
             {
+                findingId = d.FindingId,
                 status = d.Status,
                 line1 = d.Line1,
                 line2 = d.Line2,
                 numDiff = d.NumDiff,
+                confidence = d.Confidence,
+                semanticClassification = d.SemanticClassification,
+                differenceType = d.DifferenceType,
+                highlightEligible = d.HighlightEligible,
+                structuralChangeType = d.StructuralChangeType,
                 crossPageNote = d.CrossPageNote,
                 wordDiff = d.WordDiff.Select(w => new { w = w.Word, t = w.Tag }).ToList(),
             })
+            .ToList();
+
+        var cellFindings = cmp.TableCellDiffs
+            .Where(finding => finding.PairIndex == pageDiff.PairIndex)
+            .Select(finding => new
+            {
+                finding.FindingId,
+                finding.TableId,
+                finding.RowId,
+                finding.ColumnId,
+                finding.Label,
+                finding.ColHeader,
+                finding.ValueAfs1,
+                finding.ValueAfs2,
+                finding.Status,
+                finding.SemanticClassification,
+                finding.Confidence,
+                finding.HighlightEligible,
+                finding.RootFindingId,
+                finding.DependencyFindingIds,
+                finding.PageAfs1,
+                finding.PageAfs2,
+            })
+            .ToList();
+
+        var calculationRelationships = cmp.CalculationRelationships
+            .Where(relationship => relationship.TableId.Length > 0 &&
+                                   cellFindings.Any(finding => finding.TableId == relationship.TableId))
             .ToList();
 
         return Json(new
@@ -1218,6 +1265,10 @@ public class AfsController : Controller
             success = true,
             pairIndex = resolvedPairIndex,
             diffs,
+            cellFindings,
+            calculationRelationships,
+            structuralChangeType = pageDiff.StructuralChangeType,
+            matchConfidence = pageDiff.MatchConfidence,
         });
     }
 
@@ -1369,6 +1420,8 @@ public class AfsController : Controller
             .Where(d => afs1
                 ? d.Status == "changed" || d.Status == "removed"
                 : d.Status == "changed" || d.Status == "added")
+            .Where(d => d.HighlightEligible && d.Confidence >= 0.62)
+            .Where(d => !IsCoveredByFinancialCell(d, cmp, pageDiff, afsNum))
             .ToList();
 
         var issueOrdinals = issueDiffs
@@ -1378,7 +1431,7 @@ public class AfsController : Controller
         var aiSeverityByOrd  = GetAiSnapshotSeverityByOrdinal(cmp, pageDiff);
         var aiProtectedOrdinals = GetAiProtectedSnapshotOrdinals(aiFocusScores, aiSeverityByOrd);
 
-        return relevantDiffs
+        var lineSpecs = relevantDiffs
             .Where((d, idx) => !ShouldSuppressSnapshotDiff(
                 d,
                 issueDiffs,
@@ -1396,15 +1449,237 @@ public class AfsController : Controller
             .Select(d =>
             {
                 var spec = BuildHighlightSpec(d, afsNum);
+                spec.FindingId = string.IsNullOrWhiteSpace(d.FindingId)
+                    ? BuildLineFindingId(pageDiff.PairIndex, d)
+                    : d.FindingId;
+                spec.HighlightEligible = IsConfirmedLineFinding(d, pageDiff);
+                spec.Confidence = d.Confidence;
+                spec.DifferenceType = d.DifferenceType;
                 if (issueOrdinals.TryGetValue(d, out int ord) &&
                     aiSeverityByOrd.TryGetValue(ord, out var sev))
                     spec.Severity = sev;
                 return spec;
             })
-            .Where(s => s.LineText.Length >= 4)
+            .Where(s => s.HighlightEligible && s.LineText.Length >= 4)
             .Take(50)
             .ToList();
+
+        var cellSpecs = cmp.TableCellDiffs
+            .Where(cell => cell.HighlightEligible && cell.Confidence >= 0.82 &&
+                           cell.PairIndex == pageDiff.PairIndex &&
+                           (afs1 ? cell.PageAfs1 == pageDiff.PageAfs1 : cell.PageAfs2 == pageDiff.PageAfs2) &&
+                           (cell.Status == "changed" || (afs1 ? cell.Status == "removed" : cell.Status == "added")))
+            .Select(cell => BuildFinancialCellHighlightSpec(cell, afsNum))
+            .Where(spec => spec.HighlightEligible && spec.LineText.Length >= 4)
+            .ToList();
+
+        var specs = lineSpecs.Concat(cellSpecs)
+            .GroupBy(spec => spec.FindingId, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .ToList();
+
+        foreach (var spec in specs)
+        {
+            var lineFinding = pageDiff.Diffs.FirstOrDefault(diff => diff.FindingId == spec.FindingId);
+            var cellFinding = cmp.TableCellDiffs.FirstOrDefault(finding => finding.FindingId == spec.FindingId);
+            spec.OriginalDocumentId = cmp.Report1.Filename;
+            spec.RevisedDocumentId = cmp.Report2.Filename;
+            spec.OriginalPageNumber = pageDiff.PageAfs1;
+            spec.RevisedPageNumber = pageDiff.PageAfs2;
+            spec.MatchedSectionId = cellFinding?.TableId ?? $"pair-{pageDiff.PairIndex}";
+            spec.OriginalValue = cellFinding?.ValueAfs1 ?? lineFinding?.Line1 ?? "";
+            spec.RevisedValue = cellFinding?.ValueAfs2 ?? lineFinding?.Line2 ?? "";
+            spec.TableId = cellFinding?.TableId ?? "";
+            spec.RowId = cellFinding?.RowId ?? "";
+            spec.ColumnId = cellFinding?.ColumnId ?? "";
+            spec.DocumentSide = afsNum;
+
+            var coordinates = ResolveHighlightCoordinates(ownReport.PdfPath, pageDiff, spec, afsNum);
+            spec.SourceCoordinates = coordinates;
+            if (afs1)
+            {
+                spec.OriginalSourceCoordinates = coordinates;
+                if (lineFinding != null)
+                    lineFinding.OriginalSourceCoordinates = coordinates;
+                if (cellFinding != null)
+                    cellFinding.SourceCoordinatesAfs1 = coordinates;
+            }
+            else
+            {
+                spec.RevisedSourceCoordinates = coordinates;
+                if (lineFinding != null)
+                    lineFinding.RevisedSourceCoordinates = coordinates;
+                if (cellFinding != null)
+                    cellFinding.SourceCoordinatesAfs2 = coordinates;
+            }
+
+            if (coordinates.Count == 0)
+                spec.HighlightEligible = false;
+        }
+
+        return specs.Where(spec => spec.HighlightEligible && spec.SourceCoordinates.Count > 0).ToList();
     }
+
+    private static HighlightSpec BuildFinancialCellHighlightSpec(TableCellDiff finding, int afsNum)
+    {
+        bool afs1 = afsNum == 1;
+        string value = afs1 ? finding.ValueAfs1 : finding.ValueAfs2;
+        bool wholeRow = finding.Status is "added" or "removed";
+        var spec = new HighlightSpec
+        {
+            FindingId = finding.FindingId,
+            TableId = finding.TableId,
+            RowId = finding.RowId,
+            ColumnId = finding.ColumnId,
+            LineText = afs1 ? finding.SourceTextAfs1 : finding.SourceTextAfs2,
+            ChangedWords = wholeRow ? new List<string>() : TableDiffService.GetVisualTokens(value),
+            AnchorWords = Regex.Matches(finding.Label ?? "", @"[\p{L}\p{N}]+")
+                .Select(match => match.Value)
+                .Where(word => word.Length >= 3)
+                .Take(8)
+                .ToList(),
+            ChangedPhrases = wholeRow ? new List<string> { finding.Label } : new List<string> { value },
+            WholeLineMode = wholeRow,
+            HighlightEligible = finding.HighlightEligible,
+            Confidence = finding.Confidence,
+            ExactRegion = !wholeRow,
+            DifferenceType = finding.DifferenceType,
+        };
+        return spec;
+    }
+
+    private static List<PdfSourceCoordinates> ResolveHighlightCoordinates(
+        string pdfPath,
+        PageDiffResult pageDiff,
+        HighlightSpec spec,
+        int afsNum)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(pdfPath) || !System.IO.File.Exists(pdfPath))
+                return new();
+
+            int? pageNumber = afsNum == 1 ? pageDiff.PageAfs1 : pageDiff.PageAfs2;
+            if (!pageNumber.HasValue || pageNumber.Value < 1)
+                return new();
+
+            using var document = PdfDocument.Open(pdfPath);
+            if (pageNumber.Value > document.NumberOfPages)
+                return new();
+
+            var page = document.GetPage(pageNumber.Value);
+            var renderLines = BuildSnapshotLines(page, page.Height);
+            string specNorm = SnapNorm(spec.LineText);
+            var candidates = new List<(SnapshotRenderLine Line, double Score)>();
+            foreach (var line in renderLines)
+            {
+                var tokens = line.Words.Select(word => SnapTokenNormRaw(word.Text ?? ""))
+                    .Where(token => token.Length > 0)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                double phraseScore = SnapshotPhraseMatchScore(line, spec.ChangedPhrases);
+                if (!HasStrongSnapshotLineMatch(line.NormalizedText, specNorm, spec, tokens, phraseScore))
+                    continue;
+
+                double score = line.NormalizedText == specNorm
+                    ? 1.0
+                    : Math.Max(SnapshotLineMatchScore(line.NormalizedText, specNorm), phraseScore);
+                candidates.Add((line, score));
+            }
+
+            var ordered = candidates.OrderByDescending(candidate => candidate.Score).ToList();
+            if (ordered.Count == 0 || ordered[0].Score < 0.40 ||
+                (ordered.Count > 1 && ordered[0].Score - ordered[1].Score < 0.04))
+                return new();
+
+            var changedTokens = spec.ChangedWords
+                .Select(SnapTokenNormRaw)
+                .Where(token => token.Length > 0)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            string activeValue = afsNum == 1 ? spec.OriginalValue : spec.RevisedValue;
+            var changedNumbers = AuditTextNormalizer.ExtractNormalizedNumbers(activeValue);
+            var words = ordered[0].Line.Words;
+            var changedWords = spec.ChangedWords.Count == 0 || spec.WholeLineMode
+                ? words
+                : words.Where(word =>
+                {
+                    string token = SnapTokenNormRaw(word.Text ?? "");
+                    return changedTokens.Contains(token) ||
+                           AuditTextNormalizer.ExtractNormalizedNumbers(word.Text ?? "")
+                               .Overlaps(changedNumbers);
+                }).ToList();
+            if (changedWords.Count == 0)
+                return new();
+
+            return changedWords.Select(word => new PdfSourceCoordinates
+                {
+                    PageNumber = pageNumber.Value,
+                    X = word.BoundingBox.Left,
+                    Y = page.Height - word.BoundingBox.Top,
+                    Width = Math.Max(0, word.BoundingBox.Right - word.BoundingBox.Left),
+                    Height = Math.Max(0, word.BoundingBox.Top - word.BoundingBox.Bottom),
+                })
+                .ToList();
+        }
+        catch
+        {
+            return new();
+        }
+    }
+
+    private static bool IsCoveredByFinancialCell(
+        LineDiffResult diff,
+        ComparisonResult comparison,
+        PageDiffResult pageDiff,
+        int afsNum)
+    {
+        string line = afsNum == 1 ? diff.Line1 : diff.Line2;
+        string normalized = SnapshotComparisonLineNorm(line);
+        if (normalized.Length == 0)
+            return false;
+
+        return comparison.TableCellDiffs.Any(cell =>
+            cell.PairIndex == pageDiff.PairIndex &&
+            (afsNum == 1 ? cell.PageAfs1 == pageDiff.PageAfs1 : cell.PageAfs2 == pageDiff.PageAfs2) &&
+            (afsNum == 1 ? cell.SourceTextAfs1 : cell.SourceTextAfs2) is string source &&
+            SnapshotComparisonLineNorm(source) == normalized);
+    }
+
+    private static bool IsReferenceOnlyChange(LineDiffResult diff)
+    {
+        if (!string.Equals(diff.Status, "changed", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        string first = diff.Line1 ?? "";
+        string second = diff.Line2 ?? "";
+        bool hasPageReference = Regex.IsMatch(first + " " + second,
+            @"\bpages?\b|\bsee\s+page\b|\.{2,}|(?:\.\s){2,}", RegexOptions.IgnoreCase);
+        if (!hasPageReference)
+            return false;
+
+        string firstShape = Regex.Replace(first, @"\d+(?:\s*[-–—]\s*\d+)?", "#");
+        string secondShape = Regex.Replace(second, @"\d+(?:\s*[-–—]\s*\d+)?", "#");
+        return string.Equals(SnapshotComparisonLineNorm(firstShape), SnapshotComparisonLineNorm(secondShape),
+            StringComparison.OrdinalIgnoreCase) &&
+               !AuditTextNormalizer.ExtractNormalizedNumbers(first).SetEquals(
+                   AuditTextNormalizer.ExtractNormalizedNumbers(second));
+    }
+
+    private static bool IsConfirmedLineFinding(LineDiffResult diff, PageDiffResult pageDiff)
+    {
+        return diff.HighlightEligible && diff.Confidence >= 0.62;
+    }
+
+    private static string BuildLineFindingId(int pairIndex, LineDiffResult diff)
+    {
+        string source = $"{pairIndex}|{diff.Line1}|{diff.Line2}";
+        string hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(source)))[..16];
+        return $"line-{hash}";
+    }
+
+    private static string SnapshotComparisonLineNorm(string text) => Regex.Replace(
+        Regex.Replace((text ?? "").ToLowerInvariant(), @"[^\p{L}\p{N}]+", " "),
+        @"\s+", " ").Trim();
 
     private static Dictionary<int, int> GetAiSnapshotFocusScores(
         ComparisonResult cmp,
@@ -2922,8 +3197,44 @@ public class AfsController : Controller
             using var fillBrush  = new SolidBrush(Color.FromArgb(100, 255, 220, 0));
             using var outlinePen = new Pen(Color.FromArgb(220, 200, 140, 0), 1.2f);
 
+            var verifiedSpecs = specs.Where(spec => spec.HighlightEligible && spec.Confidence >= 0.62).ToList();
+            if (verifiedSpecs.Count > 0 && verifiedSpecs.All(spec => spec.SourceCoordinates.Count > 0))
+            {
+                foreach (var spec in verifiedSpecs)
+                {
+                    Color fillColor = spec.Severity switch
+                    {
+                        AiHighlightSeverity.High => Color.FromArgb(115, 220, 30, 60),
+                        AiHighlightSeverity.Medium => Color.FromArgb(105, 255, 140, 0),
+                        _ => Color.FromArgb(100, 255, 220, 0),
+                    };
+                    Color borderColor = spec.Severity switch
+                    {
+                        AiHighlightSeverity.High => Color.FromArgb(240, 200, 16, 46),
+                        AiHighlightSeverity.Medium => Color.FromArgb(230, 230, 100, 0),
+                        _ => Color.FromArgb(220, 200, 140, 0),
+                    };
+                    using var sourceBrush = new SolidBrush(fillColor);
+                    using var sourcePen = new Pen(borderColor, 1.2f);
+                    foreach (var coordinates in spec.SourceCoordinates.Where(rect => rect.PageNumber == pageIndex + 1))
+                    {
+                        var rectangle = new RectangleF(
+                            (float)(coordinates.X * sx) - 1f,
+                            (float)(coordinates.Y * sy) - 1f,
+                            (float)(coordinates.Width * sx) + 2f,
+                            (float)(coordinates.Height * sy) + 2f);
+                        g.FillRectangle(sourceBrush, rectangle);
+                        g.DrawRectangle(sourcePen, rectangle.X, rectangle.Y, rectangle.Width, rectangle.Height);
+                    }
+                }
+
+                using var verifiedStream = new System.IO.MemoryStream();
+                result.Save(verifiedStream, ImageFormat.Png);
+                return Convert.ToBase64String(verifiedStream.ToArray());
+            }
+
             var lineAssignments = new Dictionary<int, List<HighlightSpec>>();
-            foreach (var spec in specs)
+            foreach (var spec in specs.Where(spec => spec.HighlightEligible && spec.Confidence >= 0.62))
             {
                 string specNorm = SnapNorm((spec.LineText ?? "").Trim());
                 if (specNorm.Length < 3)
@@ -3053,6 +3364,7 @@ public class AfsController : Controller
 
                 var wordRects = new List<RectangleF>();
                 bool highlightWholeLine = matchedSpecs.Any(spec => spec.ChangedWords.Count == 0) || changedSet.Count == 0;
+                bool exactOnly = matchedSpecs.All(spec => spec.ExactRegion);
                 bool numericOnlyChangedSet = changedSet.Count > 0 &&
                     changedSet.All(token => IsNumericLikeToken(token) || IsConnectorToken(token));
 
@@ -3094,7 +3406,9 @@ public class AfsController : Controller
 
                             foreach (int wordIndex in sorted)
                             {
-                                expandedRanges.Add(ExpandSnapshotHighlightCluster(lineWords, wordIndex));
+                                expandedRanges.Add(exactOnly
+                                    ? (wordIndex, wordIndex)
+                                    : ExpandSnapshotHighlightCluster(lineWords, wordIndex));
                             }
                         }
 
@@ -3126,7 +3440,7 @@ public class AfsController : Controller
                         }
                     }
 
-                    if (wordRects.Count == 0 && !numericOnlyChangedSet)
+                    if (wordRects.Count == 0 && !numericOnlyChangedSet && !exactOnly)
                     {
                         var phraseSpans = FindSnapshotPhraseSpans(
                             lineWords,
@@ -3136,7 +3450,7 @@ public class AfsController : Controller
                             AddSnapshotWordSpanRect(lineWords, start, end, sx, sy, pageHeight, wordRects);
                     }
 
-                    if (wordRects.Count == 0)
+                    if (wordRects.Count == 0 && !exactOnly)
                     {
                         double left = lineWords.Min(w => w.BoundingBox.Left);
                         double right = lineWords.Max(w => w.BoundingBox.Right);

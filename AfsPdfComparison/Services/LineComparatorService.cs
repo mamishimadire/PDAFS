@@ -430,6 +430,8 @@ public class LineComparatorService
                 PageAfs1   = i1 + 1,
                 PageAfs2   = i2 + 1,
                 AlignSim   = entry.Sim,
+                MatchConfidence = entry.Sim,
+                StructuralChangeType = entry.MatchType == "relocated" ? "section-relocation" : "none",
                 Same       = same,
                 Changed    = chg,
                 Added      = add,
@@ -442,6 +444,7 @@ public class LineComparatorService
 
         // Preserve AFS 1 page order and assign sequential pair indices.
         var results = matchedResults.OrderBy(r => r.PageAfs1).ToList();
+        MarkSystematicPaginationShift(results);
         int pairIndex = 0;
         foreach (var r in results) r.PairIndex = pairIndex++;
 
@@ -486,6 +489,30 @@ public class LineComparatorService
         }
 
         return results;
+    }
+
+    private static void MarkSystematicPaginationShift(List<PageDiffResult> matchedPages)
+    {
+        var offsets = matchedPages
+            .Where(page => page.PageAfs1.HasValue && page.PageAfs2.HasValue &&
+                           page.StructuralChangeType == "none")
+            .GroupBy(page => page.PageAfs2!.Value - page.PageAfs1!.Value)
+            .Select(group => new { Offset = group.Key, Count = group.Count() })
+            .OrderByDescending(group => group.Count)
+            .ThenBy(group => Math.Abs(group.Offset))
+            .FirstOrDefault();
+
+        if (offsets == null || offsets.Offset == 0 || offsets.Count < 2 ||
+            offsets.Count < Math.Ceiling(matchedPages.Count * 0.60))
+            return;
+
+        foreach (var page in matchedPages.Where(page =>
+                     page.PageAfs1.HasValue && page.PageAfs2.HasValue &&
+                     page.StructuralChangeType == "none" &&
+                     page.PageAfs2.Value - page.PageAfs1.Value == offsets.Offset))
+        {
+            page.StructuralChangeType = "pagination-shift";
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

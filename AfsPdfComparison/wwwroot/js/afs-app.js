@@ -1779,6 +1779,10 @@ async function ensurePageDiffDetails(p) {
     }
 
     p.diffs = Array.isArray(res.diffs) ? res.diffs : [];
+    p.cellFindings = Array.isArray(res.cellFindings) ? res.cellFindings : [];
+    p.calculationRelationships = Array.isArray(res.calculationRelationships) ? res.calculationRelationships : [];
+    p.structuralChangeType = res.structuralChangeType || p.structuralChangeType || 'none';
+    p.matchConfidence = Number.isFinite(res.matchConfidence) ? res.matchConfidence : p.matchConfidence;
     if (typeof res.pairIndex === 'number') {
         p.k = res.pairIndex;
     }
@@ -1817,7 +1821,11 @@ async function showPageDiff() {
         <span style="color:#3B82F6"> + ${p.added} added</span>
         <span style="color:#EF4444"> − ${p.removed} removed</span>  |
         <span style="color:${fc}">${pct == null ? 'N/A' : pct + '% same'}</span>  |
-        <span style="color:#64748B">align: ${p.alignSim.toFixed(3)}</span>
+        <span style="color:#64748B">align: ${Number(p.alignSim || 0).toFixed(3)}</span>
+        ${p.structuralChangeType && p.structuralChangeType !== 'none'
+            ? `<span style="color:#FBBF24">${esc(p.structuralChangeType.replaceAll('-', ' '))}</span>` : ''}
+        ${Number.isFinite(p.matchConfidence)
+            ? `<span style="color:#94A3B8">match confidence: ${Math.round(p.matchConfidence * 100)}%</span>` : ''}
     </div>`;
 
     const aiFocus = getAiPageFocus(data.aiAssist, p.pairIndex ?? (p.k ?? k));
@@ -1835,6 +1843,7 @@ async function showPageDiff() {
             <th style="${thStyle};width:32px"></th>
             <th style="${thStyle}">DIFF (red=removed, blue=added in AFS2)</th>
             <th style="${thStyle};width:100px">NUM</th>
+            <th style="${thStyle};width:190px">CLASSIFICATION / CONFIDENCE</th>
         </tr></thead><tbody>`;
         p.diffs.forEach((d, j) => {
             const sym = (d.status === 'changed' ? '~' : d.status === 'added' ? '+' : '−') + (j+1);
@@ -1842,10 +1851,14 @@ async function showPageDiff() {
             const symCol = d.status === 'changed' ? '#F59E0B' : d.status === 'added' ? '#3B82F6' : '#EF4444';
             const content = renderDiffLine(d);
             const nd = d.numDiff && d.numDiff.length ? esc(d.numDiff.join(', ')) : '—';
+            const classification = (d.semanticClassification || (d.highlightEligible ? 'confirmed-change' : 'possible-change')).replaceAll('-', ' ');
+            const classColor = d.semanticClassification === 'extraction-error' ? '#FCA5A5'
+                : d.highlightEligible ? '#6EE7B7' : '#FBBF24';
             html += `<tr style="background:${bgr};vertical-align:top">
                 <td style="${tdStyle};color:${symCol};font-family:'IBM Plex Mono',monospace;white-space:nowrap">${sym}</td>
                 <td style="${tdStyle};font-family:'IBM Plex Mono',monospace;font-size:11px">${content}</td>
                 <td style="${tdStyle};color:#FBBF24;font-family:'IBM Plex Mono',monospace">${nd}</td>
+                <td style="${tdStyle};color:${classColor};font-size:10px">${esc(classification)} · ${Math.round((d.confidence || 0) * 100)}%${d.highlightEligible ? ' · highlight approved' : ' · review only'}</td>
             </tr>`;
         });
         html += '</tbody></table>';
@@ -1853,6 +1866,34 @@ async function showPageDiff() {
         html += isUnmatched
             ? '<p style="color:#FBBF24;font-size:12px">⚠ Unmatched page/content — review required. No no-differences conclusion is available.</p>'
             : '<p style="color:#10B981;font-size:12px">✓ No changes on this page pair.</p>';
+    }
+
+    if (Array.isArray(p.cellFindings) && p.cellFindings.length) {
+        html += `<div style="margin:14px 0 4px;color:#FBBF24;font-weight:700;font-size:12px">FINANCIAL CELL FINDINGS</div>
+            <table style="width:100%;border-collapse:collapse">
+            <thead><tr style="background:#1E2F5A">
+                <th style="${thStyle}">ROW</th><th style="${thStyle}">COLUMN</th>
+                <th style="${thStyle}">ORIGINAL</th><th style="${thStyle}">REVISED</th>
+                <th style="${thStyle}">REVIEW</th>
+            </tr></thead><tbody>`;
+        p.cellFindings.forEach(cell => {
+            const confidenceColor = cell.highlightEligible ? '#6EE7B7' : '#FBBF24';
+            const root = cell.rootFindingId ? ` · root ${esc(cell.rootFindingId)}` : '';
+            html += `<tr style="background:#0D1B2A;vertical-align:top">
+                <td style="${tdStyle}">${esc(cell.label || '')}</td>
+                <td style="${tdStyle};color:#A78BFA">${esc(cell.colHeader || cell.columnId || '')}</td>
+                <td style="${tdStyle};font-family:'IBM Plex Mono',monospace;color:#FCA5A5">${esc(cell.valueAfs1 || '—')}</td>
+                <td style="${tdStyle};font-family:'IBM Plex Mono',monospace;color:#6EE7B7">${esc(cell.valueAfs2 || '—')}</td>
+                <td style="${tdStyle};font-size:10px;color:${confidenceColor}">${esc(cell.semanticClassification || cell.status)} · ${Math.round((cell.confidence || 0) * 100)}%${root}</td>
+            </tr>`;
+        });
+        html += '</tbody></table>';
+    }
+
+    if (Array.isArray(p.calculationRelationships) && p.calculationRelationships.length) {
+        const validated = p.calculationRelationships.filter(item => !item.requiresReview).length;
+        const review = p.calculationRelationships.length - validated;
+        html += `<div style="margin-top:7px;color:#94A3B8;font-size:10px">Calculation links: ${validated} validated${review ? `, ${review} require review` : ''}.</div>`;
     }
 
     // Page-pair comment box

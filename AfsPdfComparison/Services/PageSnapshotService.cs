@@ -82,6 +82,9 @@ namespace AfsPdfComparison.Services
 
         private static bool ShouldMatchSnapshotSpec(string lineNorm, HighlightSpec spec)
         {
+            if (!spec.HighlightEligible || spec.Confidence < 0.62)
+                return false;
+
             var specNorm = SnapNorm((spec.LineText ?? "").Trim());
             if (specNorm.Length < 4)
                 return false;
@@ -349,13 +352,41 @@ namespace AfsPdfComparison.Services
                         using var lineFillHigh       = new SKPaint { Color = new SKColor(220, 30, 60, 50),   Style = SKPaintStyle.Fill };
                         using var borderPaintHigh    = new SKPaint { Color = new SKColor(200, 16, 46, 240),  Style = SKPaintStyle.Stroke, StrokeWidth = 2f };
 
+                        var verifiedSpecs = specs.Where(spec => spec.HighlightEligible && spec.Confidence >= 0.62).ToList();
+                        if (verifiedSpecs.Count > 0 && verifiedSpecs.All(spec => spec.SourceCoordinates.Count > 0))
+                        {
+                            foreach (var spec in verifiedSpecs)
+                            {
+                                var (fillPaint, _, borderPaint) = spec.Severity switch
+                                {
+                                    AiHighlightSeverity.High => (fillPaintHigh, lineFillHigh, borderPaintHigh),
+                                    AiHighlightSeverity.Medium => (fillPaintMedium, lineFillMedium, borderPaintMedium),
+                                    _ => (fillPaintNormal, lineFillNormal, borderPaintNormal),
+                                };
+                                foreach (var coordinates in spec.SourceCoordinates.Where(rect => rect.PageNumber == pageIndex + 1))
+                                {
+                                    var rectangle = new SKRect(
+                                        (float)(coordinates.X * sx) - 1f,
+                                        (float)(coordinates.Y * sy) - 1f,
+                                        (float)((coordinates.X + coordinates.Width) * sx) + 1f,
+                                        (float)((coordinates.Y + coordinates.Height) * sy) + 1f);
+                                    canvas.DrawRect(rectangle, fillPaint);
+                                    canvas.DrawRect(rectangle, borderPaint);
+                                }
+                            }
+
+                            using var verifiedImage = SKImage.FromBitmap(bmp);
+                            using var verifiedData = verifiedImage.Encode(SKEncodedImageFormat.Png, 90);
+                            return Convert.ToBase64String(verifiedData.ToArray());
+                        }
+
                         foreach (var renderLine in renderLines)
                         {
                             var lineWords = renderLine.Words;
                             var lineNorm = renderLine.NormalizedText;
 
                             HighlightSpec? matchedSpec = null;
-                            foreach (var spec in specs)
+                            foreach (var spec in specs.Where(spec => spec.HighlightEligible && spec.Confidence >= 0.62))
                             {
                                 if (ShouldMatchSnapshotSpec(lineNorm, spec))
                                 {
@@ -393,21 +424,21 @@ namespace AfsPdfComparison.Services
                             }
                             else
                             {
-                                // For changed lines, keep a faint whole-line band so the
-                                // user can see the affected row even when the changed
-                                // token is just a short number or note marker.
-                                double pdfX0   = lineWords.Min(w => w.BoundingBox.Left);
-                                double pdfX1   = lineWords.Max(w => w.BoundingBox.Right);
-                                double pdfTop  = lineWords.Min(w => pageHeight - w.BoundingBox.Top);
-                                double pdfBot  = lineWords.Max(w => pageHeight - w.BoundingBox.Bottom);
+                                if (!matchedSpec.ExactRegion)
+                                {
+                                    double pdfX0   = lineWords.Min(w => w.BoundingBox.Left);
+                                    double pdfX1   = lineWords.Max(w => w.BoundingBox.Right);
+                                    double pdfTop  = lineWords.Min(w => pageHeight - w.BoundingBox.Top);
+                                    double pdfBot  = lineWords.Max(w => pageHeight - w.BoundingBox.Bottom);
 
-                                float pixX0 = (float)(pdfX0 * sx) - 2f;
-                                float pixX1 = (float)(pdfX1 * sx) + 2f;
-                                float pixY0 = (float)(pdfTop * sy) - 2f;
-                                float pixY1 = (float)(pdfBot * sy) + 2f;
+                                    float pixX0 = (float)(pdfX0 * sx) - 2f;
+                                    float pixX1 = (float)(pdfX1 * sx) + 2f;
+                                    float pixY0 = (float)(pdfTop * sy) - 2f;
+                                    float pixY1 = (float)(pdfBot * sy) + 2f;
 
-                                var lineRect = new SKRect(pixX0, pixY0, pixX1, pixY1);
-                                canvas.DrawRect(lineRect, lineFillPaint);
+                                    var lineRect = new SKRect(pixX0, pixY0, pixX1, pixY1);
+                                    canvas.DrawRect(lineRect, lineFillPaint);
+                                }
 
                                 // Per-word highlight: emphasize the specific changed tokens
                                 var changedSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -458,8 +489,19 @@ namespace AfsPdfComparison.Services
                                     canvas.DrawRect(wr, borderPaint);
                                 }
 
-                                if (!anyWordHit)
+                                if (!anyWordHit && !matchedSpec.ExactRegion)
+                                {
+                                    double pdfX0 = lineWords.Min(w => w.BoundingBox.Left);
+                                    double pdfX1 = lineWords.Max(w => w.BoundingBox.Right);
+                                    double pdfTop = lineWords.Min(w => pageHeight - w.BoundingBox.Top);
+                                    double pdfBot = lineWords.Max(w => pageHeight - w.BoundingBox.Bottom);
+                                    var lineRect = new SKRect(
+                                        (float)(pdfX0 * sx) - 2f,
+                                        (float)(pdfTop * sy) - 2f,
+                                        (float)(pdfX1 * sx) + 2f,
+                                        (float)(pdfBot * sy) + 2f);
                                     canvas.DrawRect(lineRect, borderPaint);
+                                }
                             }
                         }
                     }

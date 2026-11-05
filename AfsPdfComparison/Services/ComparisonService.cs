@@ -159,6 +159,8 @@ public class ComparisonService
             ComparedAt = DateTime.UtcNow,
         };
 
+        FindingClassificationService.Classify(result);
+
         // ── 4.6  Auto-review engine (deterministic — no AI required) ───────
         try
         {

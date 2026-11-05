@@ -1,184 +1,686 @@
-// ╔══════════════════════════════════════════════════════════════════════════════╗
-// ║  SERVICE — TableDiffService  (#3)                                            ║
-// ║  Detects financial tables in AFS page text and diffs them cell-by-cell.      ║
-// ║  Line-level diff treats whole rows as text units, causing misalignment when  ║
-// ║  a column shifts. This service parses rows×cols and compares each cell,      ║
-// ║  producing precise changes per financial line item and column.                ║
-// ╚══════════════════════════════════════════════════════════════════════════════╝
-
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 using AfsPdfComparison.Models;
 
 namespace AfsPdfComparison.Services;
 
+/// <summary>
+/// Reconstructs table-like rows from extracted page text, matches rows by label
+/// meaning and maps columns by period headers when available. The resulting cell
+/// findings are consumed by the same snapshot renderer as paragraph findings.
+/// </summary>
 public class TableDiffService
 {
-    // Matches a financial table row: a text label followed by ≥2 whitespace-
-    // separated numeric columns (SA format: digits, spaces, commas, brackets, R).
-    // e.g. "Property, plant and equipment  1 234 567  (987 654)"
-    private static readonly Regex _tableRowRe = new(
-        @"^(.{2,60}?)\s{2,}([\d\s,()A-Za-z$€£¥₹%.-]{2,}?)\s{2,}([\d\s,()A-Za-z$€£¥₹%.-]{2,})\s*$",
+    private static readonly Regex ColumnSeparator = new(@"\s{2,}", RegexOptions.Compiled);
+    private static readonly Regex FinancialToken = new(
+        @"(?<![\p{L}\p{N}])(?:\(?\s*(?:ZAR|USD|EUR|GBP|AUD|CAD|JPY|CHF|R|[$€£¥₹])\s*)?[-−+]?\s*\d+(?:[ ,]\d{3})*(?:[.,]\d+)?\s*%?\)?(?![\p{L}\p{N}])",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex YearToken = new(@"\b(?:19|20)\d{2}\b", RegexOptions.Compiled);
+    private static readonly Regex AggregateLabel = new(
+        @"\b(?:total|subtotal|net|balance)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex CurrencyToken = new(
+        @"\b(?:ZAR|USD|EUR|GBP|AUD|CAD|JPY|CHF)\b|[$€£¥₹]|(?<![\p{L}])R(?=\s*[-−(\d])",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex WordToken = new(@"[\p{L}\p{N}]+", RegexOptions.Compiled);
 
-    private static readonly Regex _numCellRe = new(
-        @"^(?=.*\d)[\d\s,.()\-A-Z$€£¥₹%]+$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private sealed record TableRow(
+        string Label,
+        IReadOnlyList<string> Values,
+        IReadOnlyList<string> ColumnHeaders,
+        string SourceText,
+        int SourceRow,
+        string Heading,
+        double ExtractionConfidence);
 
-    // ── Public entry point ────────────────────────────────────────────────────
+    private sealed record RowMatch(TableRow? First, TableRow? Second, double Confidence);
 
-    /// <summary>
-    /// For each matched page pair, extracts tables and diffs them cell-by-cell.
-    /// Returns a flat list of <see cref="TableCellDiff"/> covering every changed cell.
-    /// </summary>
+    private sealed record TablePagePair(
+        string TableId,
+        string Heading,
+        PageDiffResult PagePair,
+        IReadOnlyList<TableRow> FirstRows,
+        IReadOnlyList<TableRow> SecondRows,
+        IReadOnlyList<RowMatch> RowMatches);
+
     public List<TableCellDiff> Diff(ComparisonResult cmp)
     {
         var results = new List<TableCellDiff>();
+        var tablePairs = new List<TablePagePair>();
 
-        foreach (var pd in cmp.PageDiffs.Where(p => !p.Unmatched && p.PageAfs1.HasValue && p.PageAfs2.HasValue))
+        foreach (var pagePair in cmp.PageDiffs.Where(page =>
+                     !page.Unmatched && page.PageAfs1.HasValue && page.PageAfs2.HasValue))
         {
-            string page1 = SafePage(cmp.Report1.Pages, pd.PageAfs1!.Value - 1);
-            string page2 = SafePage(cmp.Report2.Pages, pd.PageAfs2!.Value - 1);
+            string firstText = SafePage(cmp.Report1.Pages, pagePair.PageAfs1!.Value - 1);
+            string secondText = SafePage(cmp.Report2.Pages, pagePair.PageAfs2!.Value - 1);
+            var firstRows = ExtractRows(firstText);
+            var secondRows = ExtractRows(secondText);
+            if (firstRows.Count == 0 && secondRows.Count == 0)
+                continue;
 
-            var table1 = ExtractTable(page1);
-            var table2 = ExtractTable(page2);
-            if (table1.Count == 0 && table2.Count == 0) continue;
-
-            results.AddRange(DiffTables(table1, table2, pd));
+            string heading = firstRows.FirstOrDefault()?.Heading ?? secondRows.FirstOrDefault()?.Heading ?? "";
+            string tableId = BuildTableId(pagePair.PairIndex, heading);
+            var rowMatches = MatchRows(firstRows, secondRows);
+            tablePairs.Add(new TablePagePair(tableId, heading, pagePair, firstRows, secondRows, rowMatches));
+            results.AddRange(DiffRows(tableId, rowMatches, pagePair));
         }
 
+        cmp.CalculationRelationships = ValidateCalculations(tablePairs, results);
+        foreach (var finding in results)
+        {
+            finding.OriginalDocumentId = cmp.Report1.Filename;
+            finding.RevisedDocumentId = cmp.Report2.Filename;
+        }
         return results;
     }
 
-    // ── Table extraction ──────────────────────────────────────────────────────
-
-    private record TableRow(string Label, string Col1, string Col2);
-
-    private static List<TableRow> ExtractTable(string pageText)
+    private static List<TableRow> ExtractRows(string pageText)
     {
-        var rows = new List<TableRow>();
-        foreach (var line in pageText.Split('\n'))
+        string[] lines = (pageText ?? "").Split('\n');
+        var candidates = new List<(TableRow Row, bool Strong)>();
+        string heading = "";
+
+        for (int lineIndex = 0; lineIndex < lines.Length; lineIndex++)
         {
-            var m = _tableRowRe.Match(line.Trim());
-            if (!m.Success) continue;
+            string source = lines[lineIndex].Trim();
+            if (source.Length == 0)
+                continue;
 
-            string label = m.Groups[1].Value.Trim();
-            string c1    = m.Groups[2].Value.Trim();
-            string c2    = m.Groups[3].Value.Trim();
-
-            // Both numeric columns must look like numbers
-            if (!_numCellRe.IsMatch(c1) || !_numCellRe.IsMatch(c2)) continue;
-            if (label.Length < 3 || label.Length > 60) continue;
-
-            rows.Add(new TableRow(label, c1, c2));
-        }
-        return rows;
-    }
-
-    // ── Table diff ────────────────────────────────────────────────────────────
-
-    private static List<TableCellDiff> DiffTables(
-        List<TableRow> table1, List<TableRow> table2, PageDiffResult pd)
-    {
-        var diffs = new List<TableCellDiff>();
-
-        // Index table2 rows by label for O(1) lookup
-        var idx2 = new Dictionary<string, TableRow>(StringComparer.OrdinalIgnoreCase);
-        foreach (var r in table2) idx2.TryAdd(NormLabel(r.Label), r);
-
-        int row = 0;
-        foreach (var r1 in table1)
-        {
-            row++;
-            string normLabel = NormLabel(r1.Label);
-
-            if (!idx2.TryGetValue(normLabel, out var r2))
+            if (IsLikelyPeriodHeader(source))
             {
-                // Entire row removed
-                diffs.Add(new TableCellDiff
-                {
-                    Row      = row,
-                    Col      = 1,
-                    Label    = r1.Label,
-                    ColHeader = "Current Year",
-                    ValueAfs1 = r1.Col1,
-                    ValueAfs2 = "",
-                    Status   = "removed",
-                    PageAfs1 = pd.PageAfs1,
-                    PageAfs2 = pd.PageAfs2,
-                    PairIndex = pd.PairIndex,
-                });
+                heading = source;
                 continue;
             }
 
-            // Compare column 1 (current year)
-            var d1 = CellDiff(r1.Label, "Current Year", r1.Col1, r2.Col1, row, 1, pd);
-            if (d1 != null) diffs.Add(d1);
-
-            // Compare column 2 (prior year / comparative)
-            var d2 = CellDiff(r1.Label, "Prior Year", r1.Col2, r2.Col2, row, 2, pd);
-            if (d2 != null) diffs.Add(d2);
-        }
-
-        // Rows only in table2 = added
-        var seen = new HashSet<string>(table1.Select(r => NormLabel(r.Label)), StringComparer.OrdinalIgnoreCase);
-        int addRow = row;
-        foreach (var r2 in table2.Where(r => !seen.Contains(NormLabel(r.Label))))
-        {
-            addRow++;
-            diffs.Add(new TableCellDiff
+            if (TryExtractSpacedRow(source, lineIndex + 1, heading, lines, out var spacedRow))
             {
-                Row       = addRow,
-                Col       = 1,
-                Label     = r2.Label,
-                ColHeader = "Current Year",
-                ValueAfs1 = "",
-                ValueAfs2 = r2.Col1,
-                Status    = "added",
-                PageAfs1  = pd.PageAfs1,
-                PageAfs2  = pd.PageAfs2,
-                PairIndex = pd.PairIndex,
-            });
+                candidates.Add((spacedRow, true));
+                continue;
+            }
+
+            if (TryExtractTrailingValues(source, lineIndex + 1, heading, lines, out var row, out bool strong))
+            {
+                candidates.Add((row, strong));
+                continue;
+            }
+
+            if (LooksLikeHeading(source))
+                heading = source;
         }
 
-        return diffs;
+        // Single-number lines can also be narrative sentences. Retain them when
+        // the extraction has clear column spacing/formatting or they are part of
+        // a run of adjacent financial rows.
+        var retained = new HashSet<TableRow>();
+        foreach (var (row, strong) in candidates.Where(candidate => candidate.Strong))
+            retained.Add(row);
+
+        for (int i = 0; i < candidates.Count;)
+        {
+            int end = i + 1;
+            while (end < candidates.Count && candidates[end].Row.SourceRow - candidates[end - 1].Row.SourceRow <= 2)
+                end++;
+
+            if (end - i >= 2)
+            {
+                for (int j = i; j < end; j++)
+                    retained.Add(candidates[j].Row);
+            }
+
+            i = end;
+        }
+
+        return candidates.Select(candidate => candidate.Row)
+            .Where(retained.Contains)
+            .ToList();
     }
 
-    private static TableCellDiff? CellDiff(
-        string label, string colHeader,
-        string v1, string v2,
-        int row, int col, PageDiffResult pd)
+    private static bool TryExtractSpacedRow(
+        string source,
+        int sourceRow,
+        string heading,
+        string[] lines,
+        out TableRow row)
     {
-        string n1 = AuditTextNormalizer.NormalizeFinancialValue(v1);
-        string n2 = AuditTextNormalizer.NormalizeFinancialValue(v2);
-        if (AuditTextNormalizer.FinancialValuesEquivalent(v1, v2)) return null;
+        row = null!;
+        string[] fields = ColumnSeparator.Split(source)
+            .Select(field => field.Trim())
+            .Where(field => field.Length > 0)
+            .ToArray();
+        if (fields.Length < 2)
+            return false;
 
-        double? pct = null;
-        if (decimal.TryParse(n1.Split('|')[0].TrimStart('-'), NumberStyles.Number, CultureInfo.InvariantCulture, out decimal d1) &&
-            decimal.TryParse(n2.Split('|')[0].TrimStart('-'), NumberStyles.Number, CultureInfo.InvariantCulture, out decimal d2) && d1 != 0)
-            pct = Math.Round((double)Math.Abs(d2 - d1) / (double)Math.Abs(d1) * 100, 1);
+        int valueStart = fields.Length;
+        while (valueStart > 1 && IsSingleFinancialCell(fields[valueStart - 1]))
+            valueStart--;
+        if (valueStart == fields.Length)
+            return false;
+
+        string label = string.Join(" ", fields.Take(valueStart));
+        var values = fields.Skip(valueStart).ToList();
+        if (!IsPlausibleRowLabel(label) || values.Any(value => !IsSingleFinancialCell(value)))
+            return false;
+
+        row = new TableRow(label, values, FindColumnHeaders(lines, sourceRow - 1, values.Count),
+            source, sourceRow, heading, 0.99);
+        return true;
+    }
+
+    private static bool TryExtractTrailingValues(
+        string source,
+        int sourceRow,
+        string heading,
+        string[] lines,
+        out TableRow row,
+        out bool strong)
+    {
+        row = null!;
+        strong = false;
+        string scanText = Regex.Replace(source,
+            @"\b(?:note|ref(?:erence)?)\s+\d+(?:\.\d+)*\b",
+            match => new string(' ', match.Length),
+            RegexOptions.IgnoreCase);
+        var matches = FinancialToken.Matches(scanText).Cast<Match>().ToList();
+        if (matches.Count == 0)
+            return false;
+
+        int firstValue = matches.Count - 1;
+        int end = source.Length;
+        while (firstValue >= 0)
+        {
+            Match match = matches[firstValue];
+            string between = source[(match.Index + match.Length)..end];
+            if (between.Any(char.IsLetter) || AuditTextNormalizer.ExtractNormalizedNumbers(match.Value).Count != 1)
+                break;
+
+            end = match.Index;
+            firstValue--;
+        }
+        firstValue++;
+        if (firstValue >= matches.Count)
+            return false;
+
+        string label = source[..matches[firstValue].Index].Trim();
+        var values = matches.Skip(firstValue)
+            .Select(match => source.Substring(match.Index, match.Length).Trim())
+            .ToList();
+        if (!IsPlausibleRowLabel(label))
+            return false;
+
+        strong = values.Count >= 2 ||
+                 values.Any(value => value.Any(ch => ch is ',' or '(' or ')' or '%' or '$' or '€' or '£' or '¥' or '₹')) ||
+                 Regex.IsMatch(source, @"\s{2,}");
+        row = new TableRow(label, values, FindColumnHeaders(lines, sourceRow - 1, values.Count),
+            source, sourceRow, heading, 0.92);
+        return true;
+    }
+
+    private static IReadOnlyList<string> FindColumnHeaders(string[] lines, int rowIndex, int valueCount)
+    {
+        if (valueCount < 2)
+            return Array.Empty<string>();
+
+        for (int index = Math.Min(rowIndex - 1, lines.Length - 1); index >= Math.Max(0, rowIndex - 8); index--)
+        {
+            var years = YearToken.Matches(lines[index]).Select(match => match.Value).ToList();
+            if (years.Count == valueCount && years.Distinct(StringComparer.Ordinal).Count() == valueCount)
+                return years;
+        }
+
+        return Array.Empty<string>();
+    }
+
+    private static List<RowMatch> MatchRows(IReadOnlyList<TableRow> firstRows, IReadOnlyList<TableRow> secondRows)
+    {
+        var matches = new List<RowMatch>();
+        var usedSecond = new HashSet<int>();
+        var firstUnmatched = new List<int>();
+
+        for (int firstIndex = 0; firstIndex < firstRows.Count; firstIndex++)
+        {
+            string key = NormalizeLabel(firstRows[firstIndex].Label);
+            int exact = Enumerable.Range(0, secondRows.Count)
+                .FirstOrDefault(index => !usedSecond.Contains(index) && NormalizeLabel(secondRows[index].Label) == key, -1);
+            if (exact >= 0)
+            {
+                usedSecond.Add(exact);
+                matches.Add(new RowMatch(firstRows[firstIndex], secondRows[exact], 1.0));
+            }
+            else
+            {
+                firstUnmatched.Add(firstIndex);
+            }
+        }
+
+        var candidates = (from firstIndex in firstUnmatched
+                          from secondIndex in Enumerable.Range(0, secondRows.Count).Where(index => !usedSecond.Contains(index))
+                          let score = RowSimilarity(firstRows[firstIndex], secondRows[secondIndex])
+                          where score >= 0.72
+                          select (First: firstIndex, Second: secondIndex, Score: score))
+            .ToList();
+
+        var confident = candidates.Where(candidate =>
+            candidate.Score - candidates.Where(other => other.First == candidate.First && other.Second != candidate.Second)
+                .Select(other => other.Score).DefaultIfEmpty(0).Max() >= 0.06 &&
+            candidate.Score - candidates.Where(other => other.Second == candidate.Second && other.First != candidate.First)
+                .Select(other => other.Score).DefaultIfEmpty(0).Max() >= 0.06)
+            .OrderByDescending(candidate => candidate.Score)
+            .ToList();
+
+        var usedFirstFuzzy = new HashSet<int>();
+        foreach (var candidate in confident)
+        {
+            if (usedFirstFuzzy.Contains(candidate.First) || usedSecond.Contains(candidate.Second))
+                continue;
+            usedFirstFuzzy.Add(candidate.First);
+            usedSecond.Add(candidate.Second);
+            matches.Add(new RowMatch(firstRows[candidate.First], secondRows[candidate.Second], candidate.Score));
+        }
+
+        foreach (int index in firstUnmatched.Where(index => !usedFirstFuzzy.Contains(index)))
+            matches.Add(new RowMatch(firstRows[index], null, firstRows[index].ExtractionConfidence));
+        foreach (int index in Enumerable.Range(0, secondRows.Count).Where(index => !usedSecond.Contains(index)))
+            matches.Add(new RowMatch(null, secondRows[index], secondRows[index].ExtractionConfidence));
+
+        return matches.OrderBy(match => match.First?.SourceRow ?? int.MaxValue)
+            .ThenBy(match => match.Second?.SourceRow ?? int.MaxValue)
+            .ToList();
+    }
+
+    private static double RowSimilarity(TableRow first, TableRow second)
+    {
+        var firstTokens = LabelTokens(first.Label);
+        var secondTokens = LabelTokens(second.Label);
+        if (firstTokens.Count == 0 || secondTokens.Count == 0)
+            return 0;
+
+        int intersection = firstTokens.Intersect(secondTokens, StringComparer.OrdinalIgnoreCase).Count();
+        double jaccard = (double)intersection / firstTokens.Union(secondTokens, StringComparer.OrdinalIgnoreCase).Count();
+        double containment = (double)intersection / Math.Min(firstTokens.Count, secondTokens.Count);
+        double text = PageAlignmentService.SequenceSimilarity(NormalizeLabel(first.Label), NormalizeLabel(second.Label));
+        double valueOverlap = 0;
+        if (first.Values.Count > 0 && second.Values.Count > 0)
+        {
+            int shared = first.Values.Select(AuditTextNormalizer.NormalizeFinancialValue)
+                .Intersect(second.Values.Select(AuditTextNormalizer.NormalizeFinancialValue), StringComparer.Ordinal)
+                .Count();
+            valueOverlap = (double)shared / Math.Max(first.Values.Count, second.Values.Count);
+        }
+
+        return (0.40 * jaccard) + (0.25 * containment) + (0.25 * text) + (0.10 * valueOverlap);
+    }
+
+    private static IEnumerable<TableCellDiff> DiffRows(
+        string tableId,
+        IReadOnlyList<RowMatch> rowMatches,
+        PageDiffResult pagePair)
+    {
+        foreach (var match in rowMatches)
+        {
+            var first = match.First;
+            var second = match.Second;
+            if (first == null || second == null)
+            {
+                var row = first ?? second!;
+                for (int index = 0; index < row.Values.Count; index++)
+                {
+                    yield return CreateCellFinding(tableId, match, index, first == null ? "" : row.Values[index],
+                        second == null ? "" : row.Values[index], first == null ? "added" : "removed", pagePair);
+                }
+                continue;
+            }
+
+            var columnPairs = MatchColumns(first, second);
+            foreach (var column in columnPairs)
+            {
+                string firstValue = column.FirstIndex.HasValue ? first.Values[column.FirstIndex.Value] : "";
+                string secondValue = column.SecondIndex.HasValue ? second.Values[column.SecondIndex.Value] : "";
+                if (firstValue.Length > 0 && secondValue.Length > 0 &&
+                    AuditTextNormalizer.FinancialValuesEquivalent(firstValue, secondValue))
+                    continue;
+
+                string status = firstValue.Length == 0 ? "added" : secondValue.Length == 0 ? "removed" : "changed";
+                yield return CreateCellFinding(tableId, match, column.Index, firstValue, secondValue, status, pagePair,
+                    column.Identity);
+            }
+        }
+    }
+
+    private sealed record ColumnMatch(int Index, int? FirstIndex, int? SecondIndex, string Identity);
+
+    private static List<ColumnMatch> MatchColumns(TableRow first, TableRow second)
+    {
+        var firstKeys = ColumnKeys(first);
+        var secondKeys = ColumnKeys(second);
+        if (firstKeys.Count > 0 && secondKeys.Count > 0 &&
+            firstKeys.All(key => !key.StartsWith("column:", StringComparison.Ordinal)) &&
+            secondKeys.All(key => !key.StartsWith("column:", StringComparison.Ordinal)))
+        {
+            var keys = firstKeys.Concat(secondKeys).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            return keys.Select((key, index) => new ColumnMatch(index + 1,
+                firstKeys.FindIndex(item => string.Equals(item, key, StringComparison.OrdinalIgnoreCase)) is var i1 && i1 >= 0 ? i1 : null,
+                secondKeys.FindIndex(item => string.Equals(item, key, StringComparison.OrdinalIgnoreCase)) is var i2 && i2 >= 0 ? i2 : null,
+                key)).ToList();
+        }
+
+        return Enumerable.Range(0, Math.Max(first.Values.Count, second.Values.Count))
+            .Select(index => new ColumnMatch(index + 1,
+                index < first.Values.Count ? index : null,
+                index < second.Values.Count ? index : null,
+                $"column:{index + 1}"))
+            .ToList();
+    }
+
+    private static List<string> ColumnKeys(TableRow row) => row.Values
+        .Select((_, index) => index < row.ColumnHeaders.Count ? row.ColumnHeaders[index] : $"column:{index + 1}")
+        .ToList();
+
+    private static TableCellDiff CreateCellFinding(
+        string tableId,
+        RowMatch match,
+        int columnIndex,
+        string firstValue,
+        string secondValue,
+        string status,
+        PageDiffResult pagePair,
+        string? columnIdentity = null)
+    {
+        var firstRow = match.First;
+        var secondRow = match.Second;
+        var row = firstRow ?? secondRow!;
+        string normalizedLabel = NormalizeLabel(row.Label);
+        string columnId = columnIdentity ?? $"column:{columnIndex + 1}";
+        string findingId = BuildFindingId(pagePair.PairIndex, firstRow?.SourceRow ?? 0,
+            secondRow?.SourceRow ?? 0, columnId, normalizedLabel);
+        var valueMetadata = GetValueMetadata(firstValue.Length > 0 ? firstValue : secondValue);
 
         return new TableCellDiff
         {
-            Row       = row,
-            Col       = col,
-            Label     = label,
-            ColHeader = colHeader,
-            ValueAfs1 = v1,
-            ValueAfs2 = v2,
-            Status    = "changed",
-            PctChange = pct,
-            PageAfs1  = pd.PageAfs1,
-            PageAfs2  = pd.PageAfs2,
-            PairIndex = pd.PairIndex,
+            FindingId = findingId,
+            TableId = tableId,
+            RowId = BuildStableId("row", normalizedLabel),
+            ColumnId = columnId,
+            Row = firstRow?.SourceRow ?? secondRow?.SourceRow ?? 0,
+            Col = columnIndex + 1,
+            SourceRowAfs1 = firstRow?.SourceRow ?? 0,
+            SourceRowAfs2 = secondRow?.SourceRow ?? 0,
+            Label = row.Label,
+            ColHeader = columnIdentity ?? $"Column {columnIndex + 1}",
+            ValueAfs1 = firstValue,
+            ValueAfs2 = secondValue,
+            SourceTextAfs1 = firstRow?.SourceText ?? "",
+            SourceTextAfs2 = secondRow?.SourceText ?? "",
+            Currency = valueMetadata.Currency,
+            Unit = valueMetadata.Unit,
+            DifferenceType = status == "changed" ? "financial-cell" : $"financial-row-{status}",
+            SemanticClassification = match.Confidence >= 0.82 ? "confirmed-change" : "possible-change",
+            Status = status,
+            Confidence = Math.Min(match.Confidence, row.ExtractionConfidence),
+            HighlightEligible = match.Confidence >= 0.82 && row.ExtractionConfidence >= 0.85,
+            PctChange = CalculatePercentageChange(firstValue, secondValue),
+            PageAfs1 = pagePair.PageAfs1,
+            PageAfs2 = pagePair.PageAfs2,
+            PairIndex = pagePair.PairIndex,
         };
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    private static List<FinancialCalculationRelationship> ValidateCalculations(
+        IReadOnlyList<TablePagePair> tables,
+        List<TableCellDiff> findings)
+    {
+        var relationships = new List<FinancialCalculationRelationship>();
+        foreach (var table in tables)
+        {
+            var orderedRows = table.RowMatches.Where(match => match.First != null && match.Second != null)
+                .OrderBy(match => match.First!.SourceRow)
+                .ToList();
 
-    private static string SafePage(List<string> pages, int idx)
-        => idx >= 0 && idx < pages.Count ? pages[idx] : "";
+            for (int targetIndex = 0; targetIndex < orderedRows.Count; targetIndex++)
+            {
+                var target = orderedRows[targetIndex];
+                if (!AggregateLabel.IsMatch(target.First!.Label) || !AggregateLabel.IsMatch(target.Second!.Label))
+                    continue;
 
-    private static string NormLabel(string s)
-        => Regex.Replace(s.ToLowerInvariant().Trim(), @"\s+", " ");
+                int start = targetIndex - 1;
+                while (start >= 0 && !AggregateLabel.IsMatch(orderedRows[start].First!.Label))
+                    start--;
+                var componentCandidates = new List<List<RowMatch>>
+                {
+                    orderedRows.Skip(start + 1).Take(targetIndex - start - 1).ToList(),
+                };
+                if (start >= 0)
+                    componentCandidates.Add(orderedRows.Skip(start).Take(targetIndex - start).ToList());
 
+                if (componentCandidates.All(candidate => candidate.Count == 0))
+                    continue;
+
+                foreach (var targetColumn in MatchColumns(target.First, target.Second))
+                {
+                    if (!targetColumn.FirstIndex.HasValue || !targetColumn.SecondIndex.HasValue)
+                        continue;
+                    if (!TryParseAmount(target.First.Values[targetColumn.FirstIndex.Value], out decimal targetOld) ||
+                        !TryParseAmount(target.Second.Values[targetColumn.SecondIndex.Value], out decimal targetNew))
+                        continue;
+
+                    List<RowMatch>? components = null;
+                    decimal sumOld = 0;
+                    decimal sumNew = 0;
+                    List<TableCellDiff> componentChanges = new();
+                    decimal reviewSumOld = 0;
+                    decimal reviewSumNew = 0;
+                    List<TableCellDiff> reviewComponentChanges = new();
+                    bool hasReviewCandidate = false;
+                    foreach (var candidateComponents in componentCandidates.Where(candidate => candidate.Count > 0))
+                    {
+                        decimal candidateOld = 0;
+                        decimal candidateNew = 0;
+                        var candidateChanges = new List<TableCellDiff>();
+                        bool valid = true;
+                        foreach (var component in candidateComponents)
+                        {
+                            var column = MatchColumns(component.First!, component.Second!)
+                                .FirstOrDefault(item => string.Equals(item.Identity, targetColumn.Identity, StringComparison.OrdinalIgnoreCase));
+                            if (column?.FirstIndex is not int oldIndex || column.SecondIndex is not int newIndex ||
+                                !TryParseAmount(component.First!.Values[oldIndex], out decimal oldValue) ||
+                                !TryParseAmount(component.Second!.Values[newIndex], out decimal newValue))
+                            {
+                                valid = false;
+                                break;
+                            }
+
+                            candidateOld += oldValue;
+                            candidateNew += newValue;
+                            var componentFinding = findings.FirstOrDefault(finding =>
+                                finding.TableId == table.TableId &&
+                                finding.SourceRowAfs1 == component.First.SourceRow &&
+                                finding.SourceRowAfs2 == component.Second.SourceRow &&
+                                string.Equals(finding.ColumnId, column.Identity, StringComparison.OrdinalIgnoreCase));
+                            if (componentFinding != null)
+                                candidateChanges.Add(componentFinding);
+                        }
+
+                        if (valid && !hasReviewCandidate)
+                        {
+                            hasReviewCandidate = true;
+                            reviewSumOld = candidateOld;
+                            reviewSumNew = candidateNew;
+                            reviewComponentChanges = candidateChanges;
+                        }
+
+                        if (valid && candidateOld == targetOld && candidateNew == targetNew)
+                        {
+                            components = candidateComponents;
+                            sumOld = candidateOld;
+                            sumNew = candidateNew;
+                            componentChanges = candidateChanges;
+                            break;
+                        }
+                    }
+
+                    var targetFinding = findings.FirstOrDefault(finding =>
+                        finding.TableId == table.TableId &&
+                        finding.SourceRowAfs1 == target.First.SourceRow &&
+                        finding.SourceRowAfs2 == target.Second.SourceRow &&
+                        string.Equals(finding.ColumnId, targetColumn.Identity, StringComparison.OrdinalIgnoreCase));
+
+                    if (components == null)
+                    {
+                        if (!hasReviewCandidate || (targetFinding == null && reviewComponentChanges.Count == 0))
+                            continue;
+
+                        string reviewRoot = reviewComponentChanges.FirstOrDefault()?.FindingId ?? targetFinding?.FindingId ?? "";
+                        var reviewRelationship = new FinancialCalculationRelationship
+                        {
+                            Id = BuildStableId("calc-review", $"{table.TableId}|{target.First.SourceRow}|{targetColumn.Identity}"),
+                            TableId = table.TableId,
+                            TargetFindingId = targetFinding?.FindingId ?? "",
+                            ComponentFindingIds = reviewComponentChanges.Select(change => change.FindingId).ToList(),
+                            Relationship = "unverified-additive",
+                            OriginalCalculatedValue = reviewSumOld,
+                            RevisedCalculatedValue = reviewSumNew,
+                            Confidence = 0.45,
+                            RequiresReview = true,
+                        };
+                        relationships.Add(reviewRelationship);
+                        if (targetFinding != null)
+                        {
+                            targetFinding.CalculationConfidence = reviewRelationship.Confidence;
+                            targetFinding.DependencyFindingIds = reviewRelationship.ComponentFindingIds;
+                            targetFinding.RootFindingId = reviewRoot;
+                        }
+                        foreach (var componentFinding in reviewComponentChanges)
+                        {
+                            componentFinding.RootFindingId = reviewRoot;
+                            if (targetFinding != null)
+                                componentFinding.DependencyFindingIds = new List<string> { targetFinding.FindingId };
+                        }
+                        continue;
+                    }
+
+                    if (targetFinding == null && componentChanges.Count == 0)
+                        continue;
+
+                    string rootFindingId = componentChanges.FirstOrDefault()?.FindingId ?? targetFinding?.FindingId ?? "";
+                    var relationship = new FinancialCalculationRelationship
+                    {
+                        Id = BuildStableId("calc", $"{table.TableId}|{target.First.SourceRow}|{targetColumn.Identity}"),
+                        TableId = table.TableId,
+                        TargetFindingId = targetFinding?.FindingId ?? "",
+                        ComponentFindingIds = componentChanges.Select(change => change.FindingId).ToList(),
+                        Relationship = "sum",
+                        OriginalCalculatedValue = sumOld,
+                        RevisedCalculatedValue = sumNew,
+                        Confidence = 0.92,
+                    };
+                    relationships.Add(relationship);
+
+                    if (targetFinding != null)
+                    {
+                        targetFinding.CalculationValidated = true;
+                        targetFinding.CalculationConfidence = relationship.Confidence;
+                        targetFinding.RootFindingId = rootFindingId;
+                        targetFinding.DependencyFindingIds = relationship.ComponentFindingIds;
+                    }
+
+                    foreach (var componentFinding in componentChanges)
+                    {
+                        componentFinding.RootFindingId = rootFindingId;
+                        if (targetFinding != null)
+                            componentFinding.DependencyFindingIds = new List<string> { targetFinding.FindingId };
+                    }
+                }
+            }
+        }
+
+        return relationships;
+    }
+
+    private static bool IsSingleFinancialCell(string value) =>
+        FinancialToken.IsMatch(value) && AuditTextNormalizer.ExtractNormalizedNumbers(value).Count == 1;
+
+    private static bool IsPlausibleRowLabel(string label)
+    {
+        string normalized = label.Trim();
+        return normalized.Length >= 2 && normalized.Length <= 180 && normalized.Any(char.IsLetter);
+    }
+
+    private static bool LooksLikeHeading(string line) =>
+        line.Length is >= 3 and <= 140 && line.Any(char.IsLetter) &&
+        AuditTextNormalizer.ExtractNormalizedNumbers(line).Count == 0;
+
+    private static bool IsLikelyPeriodHeader(string line)
+    {
+        var years = YearToken.Matches(line);
+        if (years.Count == 0)
+            return false;
+
+        return years.Count >= 2 ||
+               Regex.IsMatch(line, @"\b(?:reporting|financial)\s+(?:year|period)|\b(?:year|period)\s+ended\b",
+                   RegexOptions.IgnoreCase);
+    }
+
+    private static HashSet<string> LabelTokens(string label) => WordToken.Matches(NormalizeLabel(label))
+        .Select(match => match.Value)
+        .Where(token => token.Length > 1)
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    private static string NormalizeLabel(string label) => Regex.Replace(
+        Regex.Replace(label.ToLowerInvariant(), @"\b(?:note|ref(?:erence)?)\s+\d+(?:\.\d+)*\b", " "),
+        @"[^\p{L}\p{N}]+", " ").Trim();
+
+    private static string BuildTableId(int pairIndex, string heading) =>
+        BuildStableId("table", $"{pairIndex}|{NormalizeLabel(heading)}");
+
+    private static string BuildFindingId(int pairIndex, int firstRow, int secondRow, string column, string label) =>
+        BuildStableId("cell", $"{pairIndex}|{firstRow}|{secondRow}|{column}|{label}");
+
+    private static string BuildStableId(string prefix, string key)
+    {
+        string hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key)))[..16];
+        return $"{prefix}-{hash}";
+    }
+
+    private static (string Currency, string Unit) GetValueMetadata(string value)
+    {
+        string currency = CurrencyToken.Match(value ?? "").Value.ToUpperInvariant();
+        string unit = (value ?? "").Contains('%') ? "percent" : "amount";
+        return (currency, unit);
+    }
+
+    private static double? CalculatePercentageChange(string first, string second)
+    {
+        if (!TryParseAmount(first, out decimal oldValue) || !TryParseAmount(second, out decimal newValue) || oldValue == 0)
+            return null;
+        return Math.Round((double)Math.Abs(newValue - oldValue) / (double)Math.Abs(oldValue) * 100, 1);
+    }
+
+    private static bool TryParseAmount(string value, out decimal amount)
+    {
+        var numbers = AuditTextNormalizer.ExtractNormalizedNumbers(value);
+        if (numbers.Count != 1 || numbers.Single().StartsWith("date:", StringComparison.Ordinal))
+        {
+            amount = 0;
+            return false;
+        }
+
+        if (!decimal.TryParse(numbers.Single(), NumberStyles.Number, CultureInfo.InvariantCulture, out amount))
+            return false;
+        if (value.Contains('(') || Regex.IsMatch(value, @"[-−]\s*\d"))
+            amount = -Math.Abs(amount);
+        return true;
+    }
+
+    private static List<string> ExtractCellVisualTokens(string value) =>
+        Regex.Matches(value ?? "", @"\d+(?:[.,]\d+)?|[%$€£¥₹]|\b(?:ZAR|USD|EUR|GBP|AUD|CAD|JPY|CHF)\b",
+                RegexOptions.IgnoreCase)
+            .Select(match => match.Value)
+            .ToList();
+
+    private static string SafePage(List<string> pages, int index) =>
+        index >= 0 && index < pages.Count ? pages[index] : "";
+
+    // Exposed internally to the controller so cell findings can use the exact
+    // source row and value tokens without asking the renderer to infer a diff.
+    internal static List<string> GetVisualTokens(string value) => ExtractCellVisualTokens(value);
 }

@@ -896,10 +896,31 @@ public class PageExtractorService
             {
                 var words = lineGroup
                     .OrderBy(w => w.BoundingBox.Left)
-                    .Select(w => StripInvisible(w.Text ?? string.Empty).Trim())
-                    .Where(w => w.Length > 0);
+                    .Where(w => StripInvisible(w.Text ?? string.Empty).Trim().Length > 0)
+                    .ToList();
+                if (words.Count == 0)
+                    continue;
 
-                string line = string.Join(" ", words).Trim();
+                double typicalWordHeight = words
+                    .Select(word => Math.Abs(word.BoundingBox.Top - word.BoundingBox.Bottom))
+                    .Where(height => height > 0)
+                    .DefaultIfEmpty(0)
+                    .OrderBy(height => height)
+                    .ElementAtOrDefault(Math.Max(0, words.Count / 2));
+                double columnGap = Math.Max(8.0, typicalWordHeight * 1.35);
+                var lineBuilder = new StringBuilder();
+                for (int i = 0; i < words.Count; i++)
+                {
+                    if (i > 0)
+                    {
+                        double gap = words[i].BoundingBox.Left - words[i - 1].BoundingBox.Right;
+                        lineBuilder.Append(gap >= columnGap ? "  " : " ");
+                    }
+
+                    lineBuilder.Append(StripInvisible(words[i].Text ?? string.Empty).Trim());
+                }
+
+                string line = lineBuilder.ToString().Trim();
                 if (line.Length > 0)
                     rawLines.Add(line);
             }

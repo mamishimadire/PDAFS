@@ -30,6 +30,8 @@ public class PageAlignmentService
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private const double MinSim = 0.30;
+    private const double MinRelocationSim = 0.58;
+    private const double MinRelocationMargin = 0.07;
 
     public List<AlignmentEntry> BuildAlignment(List<string> pages1, List<string> pages2)
     {
@@ -37,12 +39,14 @@ public class PageAlignmentService
         var (content2, idx2) = CollapseStubs(pages2);
 
         var rawAlignment = AlignContentPages(content1, content2);
+        MatchConfidentRelocations(content1, content2, rawAlignment);
 
         var remapped = rawAlignment.Select(a => new AlignmentEntry
         {
             I1 = a.I1 >= 0 && a.I1 < idx1.Count ? idx1[a.I1] : -1,
             I2 = a.I2 >= 0 && a.I2 < idx2.Count ? idx2[a.I2] : -1,
             Sim = a.Sim,
+            MatchType = a.MatchType,
         }).ToList();
 
         var byI1 = remapped.Where(a => a.I1 >= 0).ToDictionary(a => a.I1);
@@ -55,6 +59,86 @@ public class PageAlignmentService
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// The ordered page alignment handles insertions and pagination shifts well, but a
+    /// relocated section can cross another section and therefore be left unmatched.
+    /// Reconcile only the unmatched pages using the same semantic fingerprint score;
+    /// ambiguous candidates stay unmatched for review.
+    /// </summary>
+    private void MatchConfidentRelocations(
+        List<string> pages1,
+        List<string> pages2,
+        List<AlignmentEntry> alignment)
+    {
+        if (pages1.Count == 0 || pages2.Count == 0)
+            return;
+
+        var fingerprints1 = pages1.Select(PageFingerprint).ToList();
+        var fingerprints2 = pages2.Select(PageFingerprint).ToList();
+        var candidates = new List<(int I1, int I2, double Score)>();
+
+        for (int i1 = 0; i1 < pages1.Count; i1++)
+        for (int i2 = 0; i2 < pages2.Count; i2++)
+        {
+            double score = PageSim(fingerprints1[i1], fingerprints2[i2]);
+            if (score >= MinRelocationSim)
+                candidates.Add((i1, i2, score));
+        }
+
+        var uniqueCandidates = candidates
+            .Where(candidate =>
+            {
+                double bestForFirst = candidates.Where(other => other.I1 == candidate.I1)
+                    .Select(other => other.Score).DefaultIfEmpty(0).Max();
+                double bestForSecond = candidates.Where(other => other.I2 == candidate.I2)
+                    .Select(other => other.Score).DefaultIfEmpty(0).Max();
+                double nextForFirst = candidates.Where(other => other.I1 == candidate.I1 && other.I2 != candidate.I2)
+                    .Select(other => other.Score).DefaultIfEmpty(0).Max();
+                double nextForSecond = candidates.Where(other => other.I2 == candidate.I2 && other.I1 != candidate.I1)
+                    .Select(other => other.Score).DefaultIfEmpty(0).Max();
+
+                return candidate.Score == bestForFirst && candidate.Score == bestForSecond &&
+                       candidate.Score - nextForFirst >= MinRelocationMargin &&
+                       candidate.Score - nextForSecond >= MinRelocationMargin;
+            })
+            .OrderByDescending(candidate => candidate.Score)
+            .ToList();
+
+        var byFirst = alignment.ToDictionary(entry => entry.I1);
+        var bestByFirst = uniqueCandidates.ToDictionary(candidate => candidate.I1);
+        foreach (var candidate in uniqueCandidates)
+        {
+            var current = byFirst[candidate.I1];
+            if (current.I2 == candidate.I2)
+                continue;
+
+            if (current.I2 >= 0 && candidate.Score - current.Sim < MinRelocationMargin)
+                continue;
+
+            var previousOwner = alignment.FirstOrDefault(entry => entry.I2 == candidate.I2);
+            if (previousOwner != null && previousOwner.I1 != candidate.I1)
+            {
+                if (!bestByFirst.TryGetValue(previousOwner.I1, out var replacement) ||
+                    replacement.I2 == candidate.I2 ||
+                    (previousOwner.I2 >= 0 && replacement.Score - previousOwner.Sim < MinRelocationMargin))
+                    continue;
+
+                var replacementOwner = alignment.FirstOrDefault(entry => entry.I2 == replacement.I2);
+                if (replacementOwner != null && replacementOwner.I1 != previousOwner.I1 &&
+                    replacementOwner.I1 != candidate.I1)
+                    continue;
+
+                previousOwner.I2 = replacement.I2;
+                previousOwner.Sim = Math.Round(replacement.Score, 3);
+                previousOwner.MatchType = "relocated";
+            }
+
+            current.I2 = candidate.I2;
+            current.Sim = Math.Round(candidate.Score, 3);
+            current.MatchType = "relocated";
+        }
     }
 
     private static (List<string> Pages, List<int> OriginalIndices) CollapseStubs(List<string> pages)

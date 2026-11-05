@@ -33,12 +33,23 @@ public class WordDiffToken
     public string Tag  { get; set; } = string.Empty;
 }
 
+/// <summary>Source rectangle in PDF points, with a top-left origin.</summary>
+public class PdfSourceCoordinates
+{
+    public int PageNumber { get; set; }
+    public double X { get; set; }
+    public double Y { get; set; }
+    public double Width { get; set; }
+    public double Height { get; set; }
+}
+
 /// <summary>One entry in the page alignment map (replaces the (I1, I2, Sim) value tuple).</summary>
 public class AlignmentEntry
 {
     public int    I1  { get; set; }
     public int    I2  { get; set; }
     public double Sim { get; set; }
+    public string MatchType { get; set; } = "sequence";
 }
 
 /// <summary>AI-assigned highlight severity — drives the highlight colour in snapshots.</summary>
@@ -47,6 +58,8 @@ public enum AiHighlightSeverity { Normal, Medium, High }
 /// <summary>Specifies a line to locate in a PDF snapshot and which words to highlight.</summary>
 public class HighlightSpec
 {
+    /// <summary>Stable identifier of the comparison finding authorizing this highlight.</summary>
+    public string FindingId { get; set; } = string.Empty;
     /// <summary>Full line text used to locate the physical PDF Y-band.</summary>
     public string LineText { get; set; } = string.Empty;
     /// <summary>Specific changed words to highlight. Empty list = highlight entire line band.</summary>
@@ -63,6 +76,30 @@ public class HighlightSpec
     /// a trailing number differs (e.g. TOC page references).
     /// </summary>
     public bool WholeLineMode { get; set; } = false;
+    /// <summary>Only findings explicitly approved by the comparison pipeline may be rendered.</summary>
+    public bool HighlightEligible { get; set; } = true;
+    /// <summary>Confidence assigned by the comparison engine, before coordinate lookup.</summary>
+    public double Confidence { get; set; } = 1.0;
+    /// <summary>True when only the changed tokens should be painted, without a row-wide band.</summary>
+    public bool ExactRegion { get; set; }
+    /// <summary>Semantic finding category used for review and audit traceability.</summary>
+    public string DifferenceType { get; set; } = "text";
+    public string OriginalDocumentId { get; set; } = string.Empty;
+    public string RevisedDocumentId { get; set; } = string.Empty;
+    public int? OriginalPageNumber { get; set; }
+    public int? RevisedPageNumber { get; set; }
+    public string MatchedSectionId { get; set; } = string.Empty;
+    public string TableId { get; set; } = string.Empty;
+    public string RowId { get; set; } = string.Empty;
+    public string ColumnId { get; set; } = string.Empty;
+    public string OriginalValue { get; set; } = string.Empty;
+    public string RevisedValue { get; set; } = string.Empty;
+    public List<PdfSourceCoordinates> OriginalSourceCoordinates { get; set; } = new();
+    public List<PdfSourceCoordinates> RevisedSourceCoordinates { get; set; } = new();
+    /// <summary>Active document side for this rendering request (1 = original, 2 = revised).</summary>
+    public int DocumentSide { get; set; }
+    /// <summary>Coordinates resolved against the PDF being rendered.</summary>
+    public List<PdfSourceCoordinates> SourceCoordinates { get; set; } = new();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -193,6 +230,33 @@ public class LineDiffResult
     /// <summary>Comparison outcome: same | changed | added | removed.</summary>
     public string Status      { get; set; } = "same";
 
+    /// <summary>Stable identifier for this verified or reviewable change.</summary>
+    public string FindingId { get; set; } = string.Empty;
+
+    /// <summary>Semantic confidence assigned by comparison and extraction checks.</summary>
+    public double Confidence { get; set; } = 1.0;
+
+    /// <summary>Confirmed change, possible change, structural reference, or extraction error.</summary>
+    public string SemanticClassification { get; set; } = "confirmed-change";
+
+    /// <summary>Difference category consumed by the snapshot renderer and review UI.</summary>
+    public string DifferenceType { get; set; } = "text";
+
+    /// <summary>The renderer must ignore findings that did not pass semantic checks.</summary>
+    public bool HighlightEligible { get; set; } = true;
+
+    /// <summary>Optional structural interpretation for page and note reference changes.</summary>
+    public string? StructuralChangeType { get; set; }
+    public string OriginalDocumentId { get; set; } = string.Empty;
+    public string RevisedDocumentId { get; set; } = string.Empty;
+    public int? OriginalPageNumber { get; set; }
+    public int? RevisedPageNumber { get; set; }
+    public string MatchedSectionId { get; set; } = string.Empty;
+    public string OriginalValue { get; set; } = string.Empty;
+    public string RevisedValue { get; set; } = string.Empty;
+    public List<PdfSourceCoordinates> OriginalSourceCoordinates { get; set; } = new();
+    public List<PdfSourceCoordinates> RevisedSourceCoordinates { get; set; } = new();
+
     /// <summary>Original line text from AFS 1 (empty for "added" lines).</summary>
     public string Line1       { get; set; } = string.Empty;
 
@@ -255,6 +319,12 @@ public class PageDiffResult
     /// the two pages.  0.0 means the page is unmatched.
     /// </summary>
     public double AlignSim    { get; set; }
+
+    /// <summary>Structural relationship inferred from matched content and page positions.</summary>
+    public string StructuralChangeType { get; set; } = "none";
+
+    /// <summary>Confidence of the semantic page match used for this comparison.</summary>
+    public double MatchConfidence { get; set; }
 
     /// <summary>Number of unchanged lines on this page pair.</summary>
     public int Same           { get; set; }
@@ -406,6 +476,9 @@ public class ComparisonResult
     /// <summary>#3 — Table cell-level diffs (row × col comparison).</summary>
     public List<TableCellDiff> TableCellDiffs { get; set; } = new();
 
+    /// <summary>Arithmetic dependencies inferred and validated from matched financial rows.</summary>
+    public List<FinancialCalculationRelationship> CalculationRelationships { get; set; } = new();
+
     /// <summary>#4 — Prior-year comparative column mismatches (GRAP 3 / IAS 8).</summary>
     public List<ComparativeMismatch> ComparativeMismatches { get; set; } = new();
 
@@ -531,17 +604,53 @@ public class AutoReviewFinding
 // ─────────────────────────────────────────────────────────────────────────────
 public class TableCellDiff
 {
+    public string  FindingId  { get; set; } = "";
+    public string  OriginalDocumentId { get; set; } = "";
+    public string  RevisedDocumentId { get; set; } = "";
+    public string  TableId    { get; set; } = "";
+    public string  RowId      { get; set; } = "";
+    public string  ColumnId   { get; set; } = "";
     public int     Row        { get; set; }
     public int     Col        { get; set; }
+    public int     SourceRowAfs1 { get; set; }
+    public int     SourceRowAfs2 { get; set; }
     public string  Label      { get; set; } = "";  // row header label
-    public string  ColHeader  { get; set; } = "";  // column header
+    public string  ColHeader  { get; set; } = "";  // inferred table column label
     public string  ValueAfs1  { get; set; } = "";
     public string  ValueAfs2  { get; set; } = "";
+    public string  SourceTextAfs1 { get; set; } = "";
+    public string  SourceTextAfs2 { get; set; } = "";
+    public string  Currency { get; set; } = "";
+    public string  Unit { get; set; } = "";
+    public string  DifferenceType { get; set; } = "financial-cell";
+    public string  SemanticClassification { get; set; } = "confirmed-change";
+    public List<PdfSourceCoordinates> SourceCoordinatesAfs1 { get; set; } = new();
+    public List<PdfSourceCoordinates> SourceCoordinatesAfs2 { get; set; } = new();
+    public string? RootFindingId { get; set; }
+    public List<string> DependencyFindingIds { get; set; } = new();
     public string  Status     { get; set; } = "same";  // same | changed | added | removed
+    public double  Confidence { get; set; } = 1.0;
+    public bool    HighlightEligible { get; set; } = true;
+    public bool    CalculationValidated { get; set; }
+    public double? CalculationConfidence { get; set; }
     public double? PctChange  { get; set; }
     public int?    PageAfs1   { get; set; }
     public int?    PageAfs2   { get; set; }
     public int?    PairIndex  { get; set; }
+}
+
+/// <summary>A confidently inferred arithmetic relationship within a matched financial table.</summary>
+public class FinancialCalculationRelationship
+{
+    public string Id { get; set; } = "";
+    public string TableId { get; set; } = "";
+    public string TargetFindingId { get; set; } = "";
+    public List<string> ComponentFindingIds { get; set; } = new();
+    public string Relationship { get; set; } = "sum";
+    public decimal? OriginalCalculatedValue { get; set; }
+    public decimal? RevisedCalculatedValue { get; set; }
+    public double Confidence { get; set; }
+    public bool RequiresReview { get; set; }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
