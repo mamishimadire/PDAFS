@@ -1392,6 +1392,9 @@ public class LineComparatorService
         // 1. NFKD decomposition: normalises typographic variants (ligatures,
         //    fancy quotes, etc.) to their base forms.
         string t = (s ?? "").Normalize(NormalizationForm.FormKD).Trim().ToLowerInvariant();
+        // Parenthetical optional plurals (for example, "Note(s)") are a
+        // presentation convention and compare as the unmarked base word.
+        t = Regex.Replace(t, @"\b([\p{L}\p{N}]+)\s*\(\s*s\s*\)", "$1", RegexOptions.IgnoreCase);
         // 2. Strip invisible Unicode control chars including zero-width spaces,
         //    soft-hyphens, object-replacement chars that PdfPig injects around
         //    hyperlinked words.  \uFFFD (REPLACEMENT CHARACTER, category So) is
@@ -1475,6 +1478,7 @@ public class LineComparatorService
             .Normalize(NormalizationForm.FormKD)
             .ToLowerInvariant()
             .Trim();
+        t = Regex.Replace(t, @"\b([\p{L}\p{N}]+)\s*\(\s*s\s*\)", "$1", RegexOptions.IgnoreCase);
         t = Regex.Replace(t, @"[\p{C}\u00AD\u200B-\u200F\uFEFF\uFFF0-\uFFFD]", "");
         t = Regex.Replace(t, @"r\s+(?=\d)",            "r");
         t = Regex.Replace(t, @"(?<=\d)\s*\.\s*(?=\d)", ".");

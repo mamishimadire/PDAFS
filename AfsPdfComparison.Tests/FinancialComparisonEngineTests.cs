@@ -94,6 +94,22 @@ public class FinancialComparisonEngineTests
     }
 
     [Fact]
+    public void UnlabeledSubtotalMatchesFinancialColumnsWhenRowsAlsoContainReferenceColumns()
+    {
+        var comparison = CompareTable(
+            "Figures in Rand Note 2025 2024\nNon-current assets\nComponent alpha    1  50,000  25,000\nCurrent assets\nComponent beta    2  91,716  13,835\nComponent gamma    3  842,766  1,027,525\n    934,482  1,041,360\nTotal Assets    992,269  1,128,446",
+            "Figures in Rand Note 2025 2024\nNon-current assets\nComponent alpha    1  50,000  25,000\nCurrent assets\nComponent beta    2  91,716  13,835\nComponent gamma    3  842,765  1,027,525\n    934,481  1,041,360\nTotal Assets    992,268  1,128,446");
+
+        Assert.Contains(comparison.TableCellDiffs, finding =>
+            finding.Label == "Component gamma" && finding.ValueAfs1 == "842,766" && finding.ValueAfs2 == "842,765");
+        var subtotal = Assert.Single(comparison.TableCellDiffs.Where(finding => finding.Label.StartsWith("Subtotal of ")));
+        Assert.Equal("934,482", subtotal.ValueAfs1);
+        Assert.Equal("934,481", subtotal.ValueAfs2);
+        Assert.Contains(comparison.TableCellDiffs, finding =>
+            finding.Label == "Total Assets" && finding.ValueAfs1 == "992,269" && finding.ValueAfs2 == "992,268");
+    }
+
+    [Fact]
     public void ChangedRowMovedAcrossPagesIsMatchedAndKeepsEachDocumentPage()
     {
         string[] originalPages =

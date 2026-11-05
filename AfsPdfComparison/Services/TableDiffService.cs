@@ -241,15 +241,18 @@ public class TableDiffService
         foreach (var amountLine in amountOnlyLines)
         {
             var priorRows = retainedRows
-                .Where(row => row.SourceRow < amountLine.SourceRow &&
-                              row.Values.Count == amountLine.Values.Count &&
-                              (NormalizeLabel(row.Heading) == NormalizeLabel(amountLine.Heading) ||
-                               string.IsNullOrWhiteSpace(row.Heading) ||
-                               string.IsNullOrWhiteSpace(amountLine.Heading)))
+                .Where(row => row.SourceRow < amountLine.SourceRow)
                 .OrderBy(row => row.SourceRow)
                 .ToList();
 
-            var components = FindAdditiveSubtotalComponents(priorRows, amountLine.Values);
+            var subtotalHeaders = FindColumnHeaders(lines, amountLine.SourceRow - 1, amountLine.Values.Count);
+            var sameHeadingRows = priorRows
+                .Where(row => NormalizeLabel(row.Heading) == NormalizeLabel(amountLine.Heading) ||
+                              string.IsNullOrWhiteSpace(row.Heading) ||
+                              string.IsNullOrWhiteSpace(amountLine.Heading))
+                .ToList();
+            var components = FindAdditiveSubtotalComponents(sameHeadingRows, amountLine.Values, subtotalHeaders)
+                ?? FindAdditiveSubtotalComponents(priorRows, amountLine.Values, subtotalHeaders);
             if (components == null || components.Count < 2)
                 continue;
 
@@ -257,9 +260,7 @@ public class TableDiffService
             retainedRows.Add(new TableRow(
                 subtotalLabel,
                 amountLine.Values,
-                components[0].ColumnHeaders.Count == amountLine.Values.Count
-                    ? components[0].ColumnHeaders
-                    : FindColumnHeaders(lines, amountLine.SourceRow - 1, amountLine.Values.Count),
+                subtotalHeaders,
                 amountLine.SourceText,
                 amountLine.SourceRow,
                 amountLine.Heading,
@@ -271,7 +272,8 @@ public class TableDiffService
 
     private static List<TableRow>? FindAdditiveSubtotalComponents(
         IReadOnlyList<TableRow> priorRows,
-        IReadOnlyList<string> subtotalValues)
+        IReadOnlyList<string> subtotalValues,
+        IReadOnlyList<string> subtotalHeaders)
     {
         for (int componentCount = 2; componentCount <= priorRows.Count; componentCount++)
         {
@@ -288,7 +290,8 @@ public class TableDiffService
                 decimal sum = 0;
                 foreach (var component in components)
                 {
-                    if (!TryParseAmount(component.Values[column], out decimal value))
+                    int componentColumn = FindMatchingColumnIndex(component, column, subtotalValues.Count, subtotalHeaders);
+                    if (componentColumn < 0 || !TryParseAmount(component.Values[componentColumn], out decimal value))
                     {
                         matchesEveryColumn = false;
                         break;
@@ -308,6 +311,27 @@ public class TableDiffService
         }
 
         return null;
+    }
+
+    private static int FindMatchingColumnIndex(
+        TableRow row,
+        int subtotalColumn,
+        int subtotalColumnCount,
+        IReadOnlyList<string> subtotalHeaders)
+    {
+        if (subtotalHeaders.Count == subtotalColumnCount && row.ColumnHeaders.Count == row.Values.Count)
+        {
+            string targetHeader = subtotalHeaders[subtotalColumn];
+            int matchedIndex = Enumerable.Range(0, row.ColumnHeaders.Count)
+                .FirstOrDefault(index => string.Equals(
+                    row.ColumnHeaders[index], targetHeader, StringComparison.OrdinalIgnoreCase), -1);
+            if (matchedIndex >= 0)
+                return matchedIndex;
+        }
+
+        return row.Values.Count == subtotalColumnCount && row.ColumnHeaders.Count != row.Values.Count
+            ? subtotalColumn
+            : -1;
     }
 
     private static bool TryExtractAmountOnlyValues(string source, out IReadOnlyList<string> values)
@@ -541,6 +565,17 @@ public class TableDiffService
             var years = YearToken.Matches(lines[index]).Select(match => match.Value).ToList();
             if (years.Count == valueCount && years.Distinct(StringComparer.Ordinal).Count() == valueCount)
                 return years;
+
+            int referenceColumns = valueCount - years.Count;
+            if (years.Count > 0 && years.Distinct(StringComparer.Ordinal).Count() == years.Count &&
+                referenceColumns > 0 &&
+                Regex.IsMatch(lines[index], @"\b(?:notes?|refs?|references?)\b", RegexOptions.IgnoreCase))
+            {
+                return Enumerable.Range(1, referenceColumns)
+                    .Select(column => $"reference:{column}")
+                    .Concat(years)
+                    .ToList();
+            }
         }
 
         return Array.Empty<string>();

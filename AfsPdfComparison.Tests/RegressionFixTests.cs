@@ -193,6 +193,16 @@ public class RegressionFixTests
         Assert.Equal("same", result);
     }
 
+    [Fact]
+    public void LineComparatorService_OptionalPluralFormattingDoesNotCreateAHighlight()
+    {
+        var result = Assert.Single(new LineComparatorService()
+            .CompareLines("Figures in Rand  Note(s)  2025  2024", "Figures in Rand  Note  2025  2024"));
+
+        Assert.Equal("same", result.Status);
+        Assert.Empty(result.WordDiff.Where(word => word.Tag != "same"));
+    }
+
     [Theory]
     [InlineData("Total assets 1 500", "total assets 1,500.00", "same")]
     [InlineData("Date: 06 October 1990", "Date: 6 October 1990", "same")]
