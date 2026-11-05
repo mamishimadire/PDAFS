@@ -49,6 +49,8 @@ public class TableDiffService
         IReadOnlyList<TableRow> SecondRows,
         IReadOnlyList<RowMatch> RowMatches);
 
+    private sealed record UnmatchedTableRow(TablePagePair Table, TableRow Row);
+
     public List<TableCellDiff> Diff(ComparisonResult cmp)
     {
         var results = new List<TableCellDiff>();
@@ -94,6 +96,7 @@ public class TableDiffService
             results.AddRange(pageFindings);
         }
 
+        ReconcileRowsAcrossPageBreaks(tablePairs, results);
         cmp.CalculationRelationships = ValidateCalculations(tablePairs, results);
         foreach (var finding in results)
         {
@@ -172,6 +175,7 @@ public class TableDiffService
     {
         string[] lines = (pageText ?? "").Split('\n');
         var candidates = new List<(TableRow Row, bool Strong)>();
+        var amountOnlyLines = new List<(int SourceRow, string Heading, string SourceText, IReadOnlyList<string> Values)>();
         string heading = "";
 
         for (int lineIndex = 0; lineIndex < lines.Length; lineIndex++)
@@ -189,6 +193,12 @@ public class TableDiffService
             if (TryExtractSpacedRow(source, lineIndex + 1, heading, lines, out var spacedRow))
             {
                 candidates.Add((spacedRow, true));
+                continue;
+            }
+
+            if (TryExtractAmountOnlyValues(source, out var amountOnlyValues))
+            {
+                amountOnlyLines.Add((lineIndex + 1, heading, source, amountOnlyValues));
                 continue;
             }
 
@@ -224,9 +234,221 @@ public class TableDiffService
             i = end;
         }
 
-        return candidates.Select(candidate => candidate.Row)
+        var retainedRows = candidates.Select(candidate => candidate.Row)
             .Where(retained.Contains)
             .ToList();
+
+        foreach (var amountLine in amountOnlyLines)
+        {
+            var priorRows = retainedRows
+                .Where(row => row.SourceRow < amountLine.SourceRow &&
+                              row.Values.Count == amountLine.Values.Count &&
+                              (NormalizeLabel(row.Heading) == NormalizeLabel(amountLine.Heading) ||
+                               string.IsNullOrWhiteSpace(row.Heading) ||
+                               string.IsNullOrWhiteSpace(amountLine.Heading)))
+                .OrderBy(row => row.SourceRow)
+                .ToList();
+
+            var components = FindAdditiveSubtotalComponents(priorRows, amountLine.Values);
+            if (components == null || components.Count < 2)
+                continue;
+
+            string subtotalLabel = "Subtotal of " + string.Join(" + ", components.Select(row => row.Label));
+            retainedRows.Add(new TableRow(
+                subtotalLabel,
+                amountLine.Values,
+                components[0].ColumnHeaders.Count == amountLine.Values.Count
+                    ? components[0].ColumnHeaders
+                    : FindColumnHeaders(lines, amountLine.SourceRow - 1, amountLine.Values.Count),
+                amountLine.SourceText,
+                amountLine.SourceRow,
+                amountLine.Heading,
+                0.92));
+        }
+
+        return retainedRows.OrderBy(row => row.SourceRow).ToList();
+    }
+
+    private static List<TableRow>? FindAdditiveSubtotalComponents(
+        IReadOnlyList<TableRow> priorRows,
+        IReadOnlyList<string> subtotalValues)
+    {
+        for (int componentCount = 2; componentCount <= priorRows.Count; componentCount++)
+        {
+            var components = priorRows.Skip(priorRows.Count - componentCount).ToList();
+            bool matchesEveryColumn = true;
+            for (int column = 0; column < subtotalValues.Count; column++)
+            {
+                if (!TryParseAmount(subtotalValues[column], out decimal expected))
+                {
+                    matchesEveryColumn = false;
+                    break;
+                }
+
+                decimal sum = 0;
+                foreach (var component in components)
+                {
+                    if (!TryParseAmount(component.Values[column], out decimal value))
+                    {
+                        matchesEveryColumn = false;
+                        break;
+                    }
+                    sum += value;
+                }
+
+                if (!matchesEveryColumn || sum != expected)
+                {
+                    matchesEveryColumn = false;
+                    break;
+                }
+            }
+
+            if (matchesEveryColumn)
+                return components;
+        }
+
+        return null;
+    }
+
+    private static bool TryExtractAmountOnlyValues(string source, out IReadOnlyList<string> values)
+    {
+        string text = source ?? "";
+        values = Array.Empty<string>();
+        var matches = FinancialToken.Matches(text).Cast<Match>().ToList();
+        if (matches.Count < 2)
+            return false;
+
+        var remainder = new StringBuilder(text.Length);
+        int last = 0;
+        foreach (var match in matches)
+        {
+            remainder.Append(text, last, match.Index - last);
+            remainder.Append(' ', match.Length);
+            last = match.Index + match.Length;
+        }
+        remainder.Append(text, last, text.Length - last);
+        if (!string.IsNullOrWhiteSpace(remainder.ToString()))
+            return false;
+
+        var parsed = matches.Select(match => match.Value.Trim()).ToList();
+        if (parsed.Any(value => AuditTextNormalizer.ExtractNormalizedNumbers(value).Count != 1))
+            return false;
+
+        values = parsed;
+        return true;
+    }
+
+    private static void ReconcileRowsAcrossPageBreaks(
+        IReadOnlyList<TablePagePair> tables,
+        List<TableCellDiff> findings)
+    {
+        var removedRows = tables.SelectMany(table => table.RowMatches
+                .Where(match => match.First != null && match.Second == null)
+                .Select(match => new UnmatchedTableRow(table, match.First!)))
+            .ToList();
+        var addedRows = tables.SelectMany(table => table.RowMatches
+                .Where(match => match.First == null && match.Second != null)
+                .Select(match => new UnmatchedTableRow(table, match.Second!)))
+            .ToList();
+
+        var candidates = (from removed in removedRows
+                          from added in addedRows
+                          let rowScore = RowSimilarity(removed.Row, added.Row)
+                          let headingScore = PageAlignmentService.SequenceSimilarity(
+                              NormalizeLabel(removed.Row.Heading), NormalizeLabel(added.Row.Heading))
+                          let sameColumns = HaveCompatibleColumns(removed.Row, added.Row)
+                          where sameColumns && rowScore >= 0.80 &&
+                                (headingScore >= 0.70 || NormalizeLabel(removed.Row.Label) == NormalizeLabel(added.Row.Label))
+                          select (Removed: removed, Added: added, Score: (0.8 * rowScore) + (0.2 * headingScore)))
+            .ToList();
+
+        var confident = candidates.Where(candidate =>
+                candidate.Score - candidates.Where(other => ReferenceEquals(other.Removed.Row, candidate.Removed.Row) &&
+                                                           !ReferenceEquals(other.Added.Row, candidate.Added.Row))
+                    .Select(other => other.Score).DefaultIfEmpty(0).Max() >= 0.08 &&
+                candidate.Score - candidates.Where(other => ReferenceEquals(other.Added.Row, candidate.Added.Row) &&
+                                                           !ReferenceEquals(other.Removed.Row, candidate.Removed.Row))
+                    .Select(other => other.Score).DefaultIfEmpty(0).Max() >= 0.08)
+            .OrderByDescending(candidate => candidate.Score)
+            .ToList();
+
+        var consumedRemoved = new HashSet<string>(StringComparer.Ordinal);
+        var consumedAdded = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var candidate in confident)
+        {
+            var removed = candidate.Removed;
+            var added = candidate.Added;
+            string removedKey = $"{removed.Table.TableId}|{removed.Row.SourceRow}";
+            string addedKey = $"{added.Table.TableId}|{added.Row.SourceRow}";
+            if (consumedRemoved.Contains(removedKey) || consumedAdded.Contains(addedKey))
+                continue;
+            consumedRemoved.Add(removedKey);
+            consumedAdded.Add(addedKey);
+
+            findings.RemoveAll(finding =>
+                finding.TableId == removed.Table.TableId &&
+                finding.Status == "removed" &&
+                finding.SourceRowAfs1 == removed.Row.SourceRow);
+            findings.RemoveAll(finding =>
+                finding.TableId == added.Table.TableId &&
+                finding.Status == "added" &&
+                finding.SourceRowAfs2 == added.Row.SourceRow);
+
+            var relocatedPair = new PageDiffResult
+            {
+                PairIndex = removed.Table.PagePair.PairIndex,
+                PageAfs1 = removed.Table.PagePair.PageAfs1,
+                PageAfs2 = added.Table.PagePair.PageAfs2,
+                StructuralChangeType = "section-relocation",
+            };
+            var rowMatch = new RowMatch(removed.Row, added.Row, Math.Min(candidate.Score, 0.96));
+            var matchedColumns = MatchColumns(removed.Row, added.Row)
+                .Select(column => new
+                {
+                    Column = column,
+                    FirstValue = column.FirstIndex.HasValue ? removed.Row.Values[column.FirstIndex.Value] : "",
+                    SecondValue = column.SecondIndex.HasValue ? added.Row.Values[column.SecondIndex.Value] : "",
+                })
+                .ToList();
+            var changedColumns = matchedColumns.Where(item =>
+                    item.FirstValue.Length == 0 || item.SecondValue.Length == 0 ||
+                    !AuditTextNormalizer.FinancialValuesEquivalent(item.FirstValue, item.SecondValue))
+                .ToList();
+
+            if (changedColumns.Count == 0)
+            {
+                var finding = CreateCellFinding(
+                    removed.Table.TableId,
+                    rowMatch,
+                    1,
+                    string.Join(" | ", removed.Row.Values),
+                    string.Join(" | ", added.Row.Values),
+                    "changed",
+                    relocatedPair,
+                    "row");
+                finding.DifferenceType = "financial-row-relocated";
+                finding.StructuralChangeType = "section-relocation";
+                finding.SemanticClassification = "structural-change";
+                finding.HighlightEligible = false;
+                findings.Add(finding);
+                continue;
+            }
+
+            foreach (var item in changedColumns)
+            {
+                var finding = CreateCellFinding(
+                    removed.Table.TableId,
+                    rowMatch,
+                    item.Column.Index,
+                    item.FirstValue,
+                    item.SecondValue,
+                    item.FirstValue.Length == 0 ? "added" : item.SecondValue.Length == 0 ? "removed" : "changed",
+                    relocatedPair,
+                    item.Column.Identity);
+                finding.StructuralChangeType = "section-relocation";
+                findings.Add(finding);
+            }
+        }
     }
 
     private static bool TryExtractSpacedRow(
@@ -379,6 +601,19 @@ public class TableDiffService
         return matches.OrderBy(match => match.First?.SourceRow ?? int.MaxValue)
             .ThenBy(match => match.Second?.SourceRow ?? int.MaxValue)
             .ToList();
+    }
+
+    private static bool HaveCompatibleColumns(TableRow first, TableRow second)
+    {
+        if (first.Values.Count != second.Values.Count)
+            return false;
+
+        var firstKeys = ColumnKeys(first);
+        var secondKeys = ColumnKeys(second);
+        bool firstIsPositional = firstKeys.All(key => key.StartsWith("column:", StringComparison.Ordinal));
+        bool secondIsPositional = secondKeys.All(key => key.StartsWith("column:", StringComparison.Ordinal));
+        return firstIsPositional || secondIsPositional ||
+               firstKeys.SequenceEqual(secondKeys, StringComparer.OrdinalIgnoreCase);
     }
 
     private static double RowSimilarity(TableRow first, TableRow second)
@@ -535,17 +770,18 @@ public class TableDiffService
                 if (!AggregateLabel.IsMatch(target.First!.Label) || !AggregateLabel.IsMatch(target.Second!.Label))
                     continue;
 
-                int start = targetIndex - 1;
-                while (start >= 0 && !AggregateLabel.IsMatch(orderedRows[start].First!.Label))
-                    start--;
-                var componentCandidates = new List<List<RowMatch>>
+                int previousAggregate = targetIndex - 1;
+                while (previousAggregate >= 0 && !AggregateLabel.IsMatch(orderedRows[previousAggregate].First!.Label))
+                    previousAggregate--;
+                int firstCandidateIndex = Math.Max(0, previousAggregate);
+                var componentCandidates = new List<List<RowMatch>>();
+                for (int componentCount = 2; componentCount <= targetIndex - firstCandidateIndex; componentCount++)
                 {
-                    orderedRows.Skip(start + 1).Take(targetIndex - start - 1).ToList(),
-                };
-                if (start >= 0)
-                    componentCandidates.Add(orderedRows.Skip(start).Take(targetIndex - start).ToList());
+                    for (int candidateStart = targetIndex - componentCount; candidateStart >= firstCandidateIndex; candidateStart--)
+                        componentCandidates.Add(orderedRows.Skip(candidateStart).Take(componentCount).ToList());
+                }
 
-                if (componentCandidates.All(candidate => candidate.Count == 0))
+                if (componentCandidates.Count == 0)
                     continue;
 
                 foreach (var targetColumn in MatchColumns(target.First, target.Second))

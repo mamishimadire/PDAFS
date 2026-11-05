@@ -886,10 +886,7 @@ public class PageExtractorService
     {
         try
         {
-            double pageHeight = page.Height;
-            var lineGroups = page.GetWords()
-                .GroupBy(w => (int)(Math.Round((pageHeight - w.BoundingBox.Top) / 5.0) * 5))
-                .OrderBy(g => g.Key);
+            var lineGroups = GroupWordsIntoVisualLines(page.GetWords());
 
             var rawLines = new List<string>();
             foreach (var lineGroup in lineGroups)
@@ -973,5 +970,63 @@ public class PageExtractorService
         {
             return string.Empty;
         }
+    }
+
+    private static List<List<Word>> GroupWordsIntoVisualLines(IEnumerable<Word> sourceWords)
+    {
+        var lines = new List<List<Word>>();
+        var orderedWords = sourceWords
+            .Where(word => StripInvisible(word.Text ?? string.Empty).Trim().Length > 0)
+            .OrderByDescending(word => (word.BoundingBox.Top + word.BoundingBox.Bottom) / 2.0)
+            .ThenBy(word => word.BoundingBox.Left)
+            .ToList();
+
+        foreach (var word in orderedWords)
+        {
+            double wordTop = word.BoundingBox.Top;
+            double wordBottom = word.BoundingBox.Bottom;
+            double wordCenter = (wordTop + wordBottom) / 2.0;
+            double wordHeight = Math.Max(0.1, wordTop - wordBottom);
+            int bestLineIndex = -1;
+            double bestScore = double.NegativeInfinity;
+
+            for (int lineIndex = lines.Count - 1; lineIndex >= 0; lineIndex--)
+            {
+                var line = lines[lineIndex];
+                double lineCenter = line.Average(item => (item.BoundingBox.Top + item.BoundingBox.Bottom) / 2.0);
+                var heights = line.Select(item => Math.Max(0.1, item.BoundingBox.Top - item.BoundingBox.Bottom))
+                    .OrderBy(height => height)
+                    .ToList();
+                double lineHeight = heights[heights.Count / 2];
+                if (lineCenter - wordCenter > Math.Max(wordHeight, lineHeight) * 0.9)
+                    break;
+
+                double lineTop = line.Max(item => item.BoundingBox.Top);
+                double lineBottom = line.Min(item => item.BoundingBox.Bottom);
+                double referenceHeight = Math.Min(wordHeight, lineHeight);
+                double overlap = Math.Max(0, Math.Min(wordTop, lineTop) - Math.Max(wordBottom, lineBottom));
+                double overlapRatio = overlap / referenceHeight;
+                double centerDistance = Math.Abs(wordCenter - lineCenter);
+                bool aligned = overlapRatio >= 0.35 || centerDistance <= Math.Max(0.8, referenceHeight * 0.28);
+                if (!aligned)
+                    continue;
+
+                double score = Math.Max(overlapRatio, 1.0 - (centerDistance / referenceHeight));
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestLineIndex = lineIndex;
+                }
+            }
+
+            if (bestLineIndex >= 0)
+                lines[bestLineIndex].Add(word);
+            else
+                lines.Add(new List<Word> { word });
+        }
+
+        return lines
+            .OrderByDescending(line => line.Average(word => word.BoundingBox.Top))
+            .ToList();
     }
 }

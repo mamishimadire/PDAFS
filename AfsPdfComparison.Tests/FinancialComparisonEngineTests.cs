@@ -78,6 +78,67 @@ public class FinancialComparisonEngineTests
     }
 
     [Fact]
+    public void UnlabeledSubtotalIsReconstructedOnlyWhenItsColumnsValidateArithmetically()
+    {
+        var comparison = CompareTable(
+            "Reporting periods 2025 2024\nOpening resource    50,000  25,000\nComponent alpha    63,000  312,000\nComponent beta    607,531  840,725\nComponent gamma    534,044  293,217\n    1,204,575  1,445,942",
+            "Reporting periods 2025 2024\nOpening resource    50,000  25,000\nComponent alpha    63,000  312,000\nComponent beta    607,532  840,725\nComponent gamma    534,044  293,217\n    1,204,576  1,445,942");
+
+        Assert.Equal(2, comparison.TableCellDiffs.Count);
+        Assert.Contains(comparison.TableCellDiffs, finding => finding.Label == "Component beta");
+        var subtotal = Assert.Single(comparison.TableCellDiffs.Where(finding => finding.Label.StartsWith("Subtotal of ")));
+        Assert.Equal("1,204,575", subtotal.ValueAfs1);
+        Assert.Equal("1,204,576", subtotal.ValueAfs2);
+        Assert.True(subtotal.CalculationValidated);
+        Assert.NotNull(subtotal.RootFindingId);
+    }
+
+    [Fact]
+    public void ChangedRowMovedAcrossPagesIsMatchedAndKeepsEachDocumentPage()
+    {
+        string[] originalPages =
+        {
+            "Schedule\nReporting periods 2025 2024\nCurrent reserve    100  90",
+            "Schedule\nReporting periods 2025 2024\nBank balances    842,766  1,027,525",
+        };
+        string[] revisedPages =
+        {
+            "Schedule\nReporting periods 2025 2024\nBank balances    842,765  1,027,525",
+            "Schedule\nReporting periods 2025 2024\nCurrent reserve    100  90",
+        };
+        var comparison = new ComparisonResult
+        {
+            Report1 = new PdfReport { Pages = originalPages.ToList(), FullText = string.Join("\n", originalPages) },
+            Report2 = new PdfReport { Pages = revisedPages.ToList(), FullText = string.Join("\n", revisedPages) },
+            PageDiffs = new()
+            {
+                new PageDiffResult { PairIndex = 0, PageAfs1 = 1, PageAfs2 = 1 },
+                new PageDiffResult { PairIndex = 1, PageAfs1 = 2, PageAfs2 = 2 },
+            },
+        };
+
+        comparison.TableCellDiffs = new TableDiffService().Diff(comparison);
+
+        var bankChange = Assert.Single(comparison.TableCellDiffs.Where(finding => finding.Label == "Bank balances"));
+        Assert.Equal("changed", bankChange.Status);
+        Assert.Equal("842,766", bankChange.ValueAfs1);
+        Assert.Equal("842,765", bankChange.ValueAfs2);
+        Assert.Equal(2, bankChange.PageAfs1);
+        Assert.Equal(1, bankChange.PageAfs2);
+        Assert.True(bankChange.HighlightEligible);
+        Assert.DoesNotContain(comparison.TableCellDiffs, finding =>
+            finding.Label == "Bank balances" && finding.Status is "added" or "removed");
+
+        var relocatedUnchangedRow = Assert.Single(comparison.TableCellDiffs.Where(finding =>
+            finding.Label == "Current reserve"));
+        Assert.Equal("section-relocation", relocatedUnchangedRow.StructuralChangeType);
+        Assert.Equal("structural-change", relocatedUnchangedRow.SemanticClassification);
+        Assert.False(relocatedUnchangedRow.HighlightEligible);
+        Assert.Equal(1, relocatedUnchangedRow.PageAfs1);
+        Assert.Equal(2, relocatedUnchangedRow.PageAfs2);
+    }
+
+    [Fact]
     public void ConsequentialTotalChangesRemainIndividualHighlights()
     {
         var comparison = CompareTable(
@@ -425,6 +486,73 @@ public class FinancialComparisonEngineTests
     }
 
     [Fact]
+    public async Task RelocatedFinancialCellHighlightsItsIndependentPageOnEachPdf()
+    {
+        QuestPDF.Settings.License = LicenseType.Community;
+        byte[] originalPdf = CreateTwoPageFinancialPdf("842,766", amountPage: 2);
+        byte[] revisedPdf = CreateTwoPageFinancialPdf("842,765", amountPage: 1);
+        string originalPath = Path.Combine(Path.GetTempPath(), $"afs-relocated-original-{Guid.NewGuid():N}.pdf");
+        string revisedPath = Path.Combine(Path.GetTempPath(), $"afs-relocated-revised-{Guid.NewGuid():N}.pdf");
+
+        try
+        {
+            await File.WriteAllBytesAsync(originalPath, originalPdf);
+            await File.WriteAllBytesAsync(revisedPath, revisedPdf);
+            var finding = new TableCellDiff
+            {
+                FindingId = "relocated-financial-cell",
+                TableId = "matched-schedule",
+                RowId = "row-bank-balances",
+                ColumnId = "2025",
+                Label = "Bank balances",
+                ValueAfs1 = "842,766",
+                ValueAfs2 = "842,765",
+                SourceTextAfs1 = "Bank balances 842,766 1,027,525",
+                SourceTextAfs2 = "Bank balances 842,765 1,027,525",
+                Status = "changed",
+                HighlightEligible = true,
+                Confidence = 0.96,
+                PageAfs1 = 2,
+                PageAfs2 = 1,
+            };
+            var containingPair = new PageDiffResult { PairIndex = 0, PageAfs1 = 2, PageAfs2 = 2 };
+            var originalSpec = CreateExactCellSpec(finding, originalSide: true);
+            var revisedSpec = CreateExactCellSpec(finding, originalSide: false);
+            originalSpec.OriginalPageNumber = 2;
+            revisedSpec.RevisedPageNumber = 1;
+            originalSpec.SourceCoordinates = ResolveCoordinates(originalPath, containingPair, originalSpec, 1);
+            revisedSpec.SourceCoordinates = ResolveCoordinates(revisedPath, containingPair, revisedSpec, 2);
+
+            Assert.All(originalSpec.SourceCoordinates, coordinate => Assert.Equal(2, coordinate.PageNumber));
+            Assert.All(revisedSpec.SourceCoordinates, coordinate => Assert.Equal(1, coordinate.PageNumber));
+            AssertCoordinatesResolveToAmount(originalPdf, originalSpec.SourceCoordinates, "842766");
+            AssertCoordinatesResolveToAmount(revisedPdf, revisedSpec.SourceCoordinates, "842765");
+
+            var renderer = new PageSnapshotService();
+            string originalBase64 = await renderer.RenderPageToBase64(originalPdf, 1, new List<string>());
+            string revisedBase64 = await renderer.RenderPageToBase64(revisedPdf, 0, new List<string>());
+            string originalMarkedBase64 = await renderer.RenderPageToBase64(originalPdf, 1, new List<HighlightSpec> { originalSpec });
+            string revisedMarkedBase64 = await renderer.RenderPageToBase64(revisedPdf, 0, new List<HighlightSpec> { revisedSpec });
+            using var originalBase = SKBitmap.Decode(Convert.FromBase64String(originalBase64));
+            using var revisedBase = SKBitmap.Decode(Convert.FromBase64String(revisedBase64));
+            using var originalMarked = SKBitmap.Decode(Convert.FromBase64String(originalMarkedBase64));
+            using var revisedMarked = SKBitmap.Decode(Convert.FromBase64String(revisedMarkedBase64));
+
+            Assert.NotNull(originalBase);
+            Assert.NotNull(revisedBase);
+            Assert.NotNull(originalMarked);
+            Assert.NotNull(revisedMarked);
+            Assert.True(ChangedPixelsInCoordinates(originalBase!, originalMarked!, originalSpec.SourceCoordinates) > 20);
+            Assert.True(ChangedPixelsInCoordinates(revisedBase!, revisedMarked!, revisedSpec.SourceCoordinates) > 20);
+        }
+        finally
+        {
+            File.Delete(originalPath);
+            File.Delete(revisedPath);
+        }
+    }
+
+    [Fact]
     public void TextHighlightsExcludeUnchangedNumbersFromTheSameLine()
     {
         QuestPDF.Settings.License = LicenseType.Community;
@@ -565,6 +693,47 @@ public class FinancialComparisonEngineTests
                 table.Cell().Padding(4).AlignRight().Text("90,000");
             });
         })).GeneratePdf();
+
+    private static byte[] CreateTwoPageFinancialPdf(string amount, int amountPage) => Document.Create(document =>
+    {
+        for (int pageNumber = 1; pageNumber <= 2; pageNumber++)
+        {
+            document.Page(page =>
+            {
+                page.Size(PageSizes.A4);
+                page.Margin(40);
+                page.DefaultTextStyle(style => style.FontSize(12));
+                page.Content().Table(table =>
+                {
+                    table.ColumnsDefinition(columns =>
+                    {
+                        columns.RelativeColumn(3);
+                        columns.RelativeColumn(1);
+                        columns.RelativeColumn(1);
+                    });
+
+                    table.Header(header =>
+                    {
+                        header.Cell().Padding(4).Text("Description");
+                        header.Cell().Padding(4).AlignRight().Text("2025");
+                        header.Cell().Padding(4).AlignRight().Text("2024");
+                    });
+                    if (pageNumber == amountPage)
+                    {
+                        table.Cell().Padding(4).Text("Bank balances");
+                        table.Cell().Padding(4).AlignRight().Text(amount);
+                        table.Cell().Padding(4).AlignRight().Text("1,027,525");
+                    }
+                    else
+                    {
+                        table.Cell().Padding(4).Text("Unchanged information");
+                        table.Cell().Padding(4).AlignRight().Text("500");
+                        table.Cell().Padding(4).AlignRight().Text("400");
+                    }
+                });
+            });
+        }
+    }).GeneratePdf();
 
     private static byte[] CreateFinancialPdfWithNoteColumn(string amount) => Document.Create(document =>
         document.Page(page =>
@@ -734,14 +903,21 @@ public class FinancialComparisonEngineTests
         IReadOnlyList<PdfSourceCoordinates> coordinates)
     {
         using var document = PdfDocument.Open(pdfBytes);
-        var page = document.GetPage(1);
-        var words = page.GetWords()
-            .Where(word => coordinates.Any(rect =>
-                rect.X <= word.BoundingBox.Right && rect.X + rect.Width >= word.BoundingBox.Left &&
-                rect.Y <= page.Height - word.BoundingBox.Bottom &&
-                rect.Y + rect.Height >= page.Height - word.BoundingBox.Top))
-            .Select(word => word.Text ?? "")
-            .ToList();
+        var words = new List<string>();
+        foreach (int pageNumber in coordinates.Select(rect => rect.PageNumber).Distinct())
+        {
+            if (pageNumber < 1 || pageNumber > document.NumberOfPages)
+                continue;
+
+            var page = document.GetPage(pageNumber);
+            var pageCoordinates = coordinates.Where(rect => rect.PageNumber == pageNumber).ToList();
+            words.AddRange(page.GetWords()
+                .Where(word => pageCoordinates.Any(rect =>
+                    rect.X <= word.BoundingBox.Right && rect.X + rect.Width >= word.BoundingBox.Left &&
+                    rect.Y <= page.Height - word.BoundingBox.Bottom &&
+                    rect.Y + rect.Height >= page.Height - word.BoundingBox.Top))
+                .Select(word => word.Text ?? ""));
+        }
         return words.ToArray();
     }
 

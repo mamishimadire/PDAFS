@@ -1409,6 +1409,7 @@ public class AfsController : Controller
         bool afs1 = afsNum == 1;
         var ownReport = afs1 ? cmp.Report1 : cmp.Report2;
         var oppositeReport = afs1 ? cmp.Report2 : cmp.Report1;
+        int? ownPageNumber = afs1 ? pageDiff.PageAfs1 : pageDiff.PageAfs2;
         int? oppositePageNumber = afs1 ? pageDiff.PageAfs2 : pageDiff.PageAfs1;
         var siblingPageTexts = GetSharedSnapshotSiblingPageTexts(cmp, pageDiff, afsNum);
 
@@ -1423,6 +1424,7 @@ public class AfsController : Controller
             .Where(d => afs1
                 ? d.Status == "changed" || d.Status == "removed"
                 : d.Status == "changed" || d.Status == "added")
+            .Where(d => IsLineDiffGroundedOnPage(ownReport, ownPageNumber, d, afsNum))
             .Where(d => d.HighlightEligible && d.Confidence >= 0.62)
             .Where(d => !IsCoveredByFinancialCell(d, cmp, pageDiff, afsNum))
             .ToList();
@@ -1469,7 +1471,6 @@ public class AfsController : Controller
 
         var cellSpecs = cmp.TableCellDiffs
             .Where(cell => (cell.HighlightEligible || IsStructuralPaginationFinding(cell)) && cell.Confidence >= 0.82 &&
-                           cell.PairIndex == pageDiff.PairIndex &&
                            (afs1 ? cell.PageAfs1 == pageDiff.PageAfs1 : cell.PageAfs2 == pageDiff.PageAfs2) &&
                            (cell.Status == "changed" || (afs1 ? cell.Status == "removed" : cell.Status == "added")))
             .Select(cell => BuildFinancialCellHighlightSpec(cell, afsNum))
@@ -1487,8 +1488,8 @@ public class AfsController : Controller
             var cellFinding = cmp.TableCellDiffs.FirstOrDefault(finding => finding.FindingId == spec.FindingId);
             spec.OriginalDocumentId = cmp.Report1.Filename;
             spec.RevisedDocumentId = cmp.Report2.Filename;
-            spec.OriginalPageNumber = pageDiff.PageAfs1;
-            spec.RevisedPageNumber = pageDiff.PageAfs2;
+            spec.OriginalPageNumber = cellFinding?.PageAfs1 ?? pageDiff.PageAfs1;
+            spec.RevisedPageNumber = cellFinding?.PageAfs2 ?? pageDiff.PageAfs2;
             spec.MatchedSectionId = cellFinding?.TableId ?? $"pair-{pageDiff.PairIndex}";
             spec.OriginalValue = cellFinding?.ValueAfs1 ?? lineFinding?.Line1 ?? "";
             spec.RevisedValue = cellFinding?.ValueAfs2 ?? lineFinding?.Line2 ?? "";
@@ -1530,6 +1531,30 @@ public class AfsController : Controller
         finding.SemanticClassification == "structural-change" &&
         finding.StructuralChangeType is "pagination-shift" or "reference-renumbering";
 
+    private static bool IsLineDiffGroundedOnPage(
+        PdfReport report,
+        int? pageNumber,
+        LineDiffResult finding,
+        int documentSide)
+    {
+        if (!pageNumber.HasValue || pageNumber.Value < 1 || pageNumber.Value > report.Pages.Count)
+            return false;
+
+        string sourceLine = documentSide == 1 ? finding.Line1 : finding.Line2;
+        string sourceNorm = SnapNorm(sourceLine);
+        if (sourceNorm.Length < 4)
+            return false;
+
+        var candidates = (report.Pages[pageNumber.Value - 1] ?? "")
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(SnapNorm)
+            .Where(line => line.Length > 0)
+            .Select(line => SnapshotLineMatchScore(line, sourceNorm))
+            .ToList();
+
+        return candidates.Any(score => score >= 0.72);
+    }
+
     private static HighlightSpec BuildFinancialCellHighlightSpec(TableCellDiff finding, int afsNum)
     {
         bool afs1 = afsNum == 1;
@@ -1549,7 +1574,7 @@ public class AfsController : Controller
                 : TableDiffService.GetVisualTokens(value)
                     .Where(token => AuditTextNormalizer.ExtractNormalizedNumbers(token).Count == 0)
                     .ToList(),
-            AnchorWords = Regex.Matches(finding.Label ?? "", @"[\p{L}\p{N}]+")
+            AnchorWords = Regex.Matches(afs1 ? finding.SourceTextAfs1 : finding.SourceTextAfs2, @"[\p{L}\p{N}]+")
                 .Select(match => match.Value)
                 .Where(word => word.Length >= 3)
                 .Take(8)
@@ -1577,7 +1602,9 @@ public class AfsController : Controller
             if (string.IsNullOrWhiteSpace(pdfPath) || !System.IO.File.Exists(pdfPath))
                 return new();
 
-            int? pageNumber = afsNum == 1 ? pageDiff.PageAfs1 : pageDiff.PageAfs2;
+            int? pageNumber = afsNum == 1
+                ? spec.OriginalPageNumber ?? pageDiff.PageAfs1
+                : spec.RevisedPageNumber ?? pageDiff.PageAfs2;
             if (!pageNumber.HasValue || pageNumber.Value < 1)
                 return new();
 
@@ -1826,7 +1853,6 @@ public class AfsController : Controller
             return false;
 
         return comparison.TableCellDiffs.Any(cell =>
-            cell.PairIndex == pageDiff.PairIndex &&
             (afsNum == 1 ? cell.PageAfs1 == pageDiff.PageAfs1 : cell.PageAfs2 == pageDiff.PageAfs2) &&
             (afsNum == 1 ? cell.SourceTextAfs1 : cell.SourceTextAfs2) is string source &&
             SnapshotComparisonLineNorm(source) == normalized);
