@@ -123,6 +123,7 @@ public class AfsController : Controller
                 PageAfs2 = pd.PageAfs2,
                 AlignSim = pd.AlignSim,
                 StructuralChangeType = pd.StructuralChangeType,
+                StructuralPageOffset = pd.StructuralPageOffset,
                 MatchConfidence = pd.MatchConfidence,
                 PctSame = pd.PctSame,
                 Same = pd.Same,
@@ -842,6 +843,7 @@ public class AfsController : Controller
                 pageAfs2  = p.PageAfs2,
                 alignSim  = p.AlignSim,
                 structuralChangeType = p.StructuralChangeType,
+                structuralPageOffset = p.StructuralPageOffset,
                 matchConfidence = p.MatchConfidence,
                 pctSame   = p.PctSame,
                 same      = p.Same,
@@ -988,7 +990,7 @@ public class AfsController : Controller
                     t.SourceTextAfs1, t.SourceTextAfs2,
                     t.SourceCoordinatesAfs1, t.SourceCoordinatesAfs2,
                     t.Confidence, t.HighlightEligible, t.DifferenceType,
-                    t.SemanticClassification, t.RootFindingId, t.DependencyFindingIds,
+                    t.StructuralChangeType, t.SemanticClassification, t.RootFindingId, t.DependencyFindingIds,
                     t.CalculationValidated, t.CalculationConfidence,
                     t.PageAfs1, t.PageAfs2, t.PairIndex,
                 }).ToList(),
@@ -1268,6 +1270,7 @@ public class AfsController : Controller
             cellFindings,
             calculationRelationships,
             structuralChangeType = pageDiff.StructuralChangeType,
+            structuralPageOffset = pageDiff.StructuralPageOffset,
             matchConfidence = pageDiff.MatchConfidence,
         });
     }
@@ -1538,7 +1541,7 @@ public class AfsController : Controller
                 .Where(word => word.Length >= 3)
                 .Take(8)
                 .ToList(),
-            ChangedPhrases = wholeRow ? new List<string> { finding.Label } : new List<string> { value },
+            ChangedPhrases = wholeRow ? new List<string> { finding.Label ?? "" } : new List<string> { value },
             WholeLineMode = wholeRow,
             HighlightEligible = finding.HighlightEligible,
             Confidence = finding.Confidence,
@@ -1591,21 +1594,31 @@ public class AfsController : Controller
                 (ordered.Count > 1 && ordered[0].Score - ordered[1].Score < 0.04))
                 return new();
 
+            string activeValue = afsNum == 1 ? spec.OriginalValue : spec.RevisedValue;
+            string otherValue = afsNum == 1 ? spec.RevisedValue : spec.OriginalValue;
+            bool financialValueChanged = !AuditTextNormalizer.FinancialValuesEquivalent(activeValue, otherValue);
             var changedTokens = spec.ChangedWords
+                .Where(word => financialValueChanged || AuditTextNormalizer.ExtractNormalizedNumbers(word).Count == 0)
                 .Select(SnapTokenNormRaw)
                 .Where(token => token.Length > 0)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
-            string activeValue = afsNum == 1 ? spec.OriginalValue : spec.RevisedValue;
-            var changedNumbers = AuditTextNormalizer.ExtractNormalizedNumbers(activeValue);
+            var activeNumbers = AuditTextNormalizer.ExtractNormalizedNumbers(activeValue);
+            var otherNumbers = AuditTextNormalizer.ExtractNormalizedNumbers(otherValue);
+            var changedNumbers = activeNumbers.Except(otherNumbers, StringComparer.Ordinal).ToHashSet(StringComparer.Ordinal);
+            if (changedNumbers.Count == 0 && financialValueChanged)
+                changedNumbers = activeNumbers;
             var words = ordered[0].Line.Words;
-            var changedWords = spec.ChangedWords.Count == 0 || spec.WholeLineMode
+            bool wholeLineWithoutNumericTarget = spec.ChangedWords.Count == 0 && !spec.WholeLineMode ||
+                                                 spec.WholeLineMode && changedNumbers.Count == 0;
+            var changedWords = wholeLineWithoutNumericTarget
                 ? words
                 : words.Where(word =>
                 {
                     string token = SnapTokenNormRaw(word.Text ?? "");
                     return changedTokens.Contains(token) ||
-                           AuditTextNormalizer.ExtractNormalizedNumbers(word.Text ?? "")
-                               .Overlaps(changedNumbers);
+                           (changedNumbers.Count > 0 &&
+                            AuditTextNormalizer.ExtractNormalizedNumbers(word.Text ?? "")
+                                .Overlaps(changedNumbers));
                 }).ToList();
             if (changedWords.Count == 0)
                 return new();
@@ -2450,7 +2463,8 @@ public class AfsController : Controller
             var tailWords = ExtractTrailingNumericFieldWords(lineText);
             if (tailWords.Count > 0)
             {
-                changedWords = tailWords.ToList();
+                if (changedWords.Count == 0)
+                    changedWords = tailWords.ToList();
                 anchorWords.AddRange(ExtractTrailingFieldContextWords(lineText, tailWords.Count));
                 changedPhrases.Add(string.Join(" ", tailWords));
             }
@@ -2516,24 +2530,17 @@ public class AfsController : Controller
                 .ToList()
         };
 
-        // If all changed tokens are short numeric strings (e.g. SA financial amounts
-        // "2 074 640" tokenised as ["2","074","640"], or TOC page refs like "6"→"16"),
-        // clear word-level paint data and use WholeLineMode so the renderer highlights
-        // the entire matching line at the relaxed 0.45 threshold.
-        // This covers: TOC entries, financial table rows, and any pure-number change.
         bool onlyNumbersChanged =
             spec.ChangedWords.Count > 0 &&
             spec.ChangedWords.All(w =>
                 System.Text.RegularExpressions.Regex.IsMatch(
-                    (w ?? "").Trim(), @"^\d{1,5}[-–]?\d{0,5}$"));
+                    (w ?? "").Trim(), @"^\d{1,5}[-–]?\d{0,5}$")) &&
+            !AuditTextNormalizer.FinancialValuesEquivalent(diff.Line1 ?? "", diff.Line2 ?? "");
 
         if (onlyNumbersChanged)
         {
             spec.ChangedWords.Clear();
-            if (lineText.Length > 0)
-            {
-                spec.ChangedPhrases = new List<string> { lineText };
-            }
+            spec.ChangedPhrases = lineText.Length > 0 ? new List<string> { lineText } : new List<string>();
             spec.WholeLineMode = true;
         }
 

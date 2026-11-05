@@ -322,6 +322,7 @@ public class PageDiffResult
 
     /// <summary>Structural relationship inferred from matched content and page positions.</summary>
     public string StructuralChangeType { get; set; } = "none";
+    public int? StructuralPageOffset { get; set; }
 
     /// <summary>Confidence of the semantic page match used for this comparison.</summary>
     public double MatchConfidence { get; set; }
@@ -623,6 +624,7 @@ public class TableCellDiff
     public string  Currency { get; set; } = "";
     public string  Unit { get; set; } = "";
     public string  DifferenceType { get; set; } = "financial-cell";
+    public string  StructuralChangeType { get; set; } = "none";
     public string  SemanticClassification { get; set; } = "confirmed-change";
     public List<PdfSourceCoordinates> SourceCoordinatesAfs1 { get; set; } = new();
     public List<PdfSourceCoordinates> SourceCoordinatesAfs2 { get; set; } = new();

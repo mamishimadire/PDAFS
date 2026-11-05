@@ -1824,6 +1824,8 @@ async function showPageDiff() {
         <span style="color:#64748B">align: ${Number(p.alignSim || 0).toFixed(3)}</span>
         ${p.structuralChangeType && p.structuralChangeType !== 'none'
             ? `<span style="color:#FBBF24">${esc(p.structuralChangeType.replaceAll('-', ' '))}</span>` : ''}
+        ${Number.isFinite(p.structuralPageOffset)
+            ? `<span style="color:#FBBF24">reference shift: ${p.structuralPageOffset > 0 ? '+' : ''}${p.structuralPageOffset} page(s)</span>` : ''}
         ${Number.isFinite(p.matchConfidence)
             ? `<span style="color:#94A3B8">match confidence: ${Math.round(p.matchConfidence * 100)}%</span>` : ''}
     </div>`;

@@ -28,6 +28,41 @@ public class FinancialComparisonEngineTests
     }
 
     [Fact]
+    public void OrderedPageReferenceRowsBecomeStructuralPaginationFindings()
+    {
+        var comparison = CompareTable(
+            "Index\nPage\nGovernance oversight    3\nAudit services    8\nFinancial statements    12",
+            "Index\nPage\nGovernance oversight    5\nAudit services    10\nFinancial statements    14");
+
+        Assert.Equal(3, comparison.TableCellDiffs.Count);
+        Assert.All(comparison.TableCellDiffs, finding =>
+        {
+            Assert.Equal("pagination-reference", finding.DifferenceType);
+            Assert.Equal("pagination-shift", finding.StructuralChangeType);
+            Assert.Equal("structural-change", finding.SemanticClassification);
+            Assert.False(finding.HighlightEligible);
+        });
+        Assert.Equal("pagination-shift", comparison.PageDiffs[0].StructuralChangeType);
+        Assert.Equal(2, comparison.PageDiffs[0].StructuralPageOffset);
+    }
+
+    [Fact]
+    public void MultiPageReferenceRowsUseTheirSharedDynamicOffset()
+    {
+        var comparison = CompareTable(
+            "Contents\nPage\nAudit report    5  7\nPolicy section    12  15\nNotes section    16  20",
+            "Contents\nPage\nAudit report    6  8\nPolicy section    13  16\nNotes section    17  21");
+
+        Assert.Equal(6, comparison.TableCellDiffs.Count);
+        Assert.All(comparison.TableCellDiffs, finding =>
+        {
+            Assert.Equal("pagination-reference", finding.DifferenceType);
+            Assert.False(finding.HighlightEligible);
+        });
+        Assert.Equal(1, comparison.PageDiffs[0].StructuralPageOffset);
+    }
+
+    [Fact]
     public void ChangedAmountAndMathematicallyValidatedSubtotalAreBothReported()
     {
         var comparison = CompareTable(
@@ -242,6 +277,14 @@ public class FinancialComparisonEngineTests
             Assert.NotNull(revisedBase);
             Assert.NotNull(originalMarked);
             Assert.NotNull(revisedMarked);
+            using var originalPdfDocument = PdfDocument.Open(originalPdf);
+            using var revisedPdfDocument = PdfDocument.Open(revisedPdf);
+            var originalPdfPage = originalPdfDocument.GetPage(1);
+            var revisedPdfPage = revisedPdfDocument.GetPage(1);
+            Assert.True(DarkPixelsInCoordinates(originalBase!, originalSpec.SourceCoordinates,
+                originalPdfPage.Width, originalPdfPage.Height) > 0);
+            Assert.True(DarkPixelsInCoordinates(revisedBase!, revisedSpec.SourceCoordinates,
+                revisedPdfPage.Width, revisedPdfPage.Height) > 0);
             Assert.True(ChangedPixelsInCoordinates(originalBase!, originalMarked!, originalSpec.SourceCoordinates) > 20);
             Assert.True(ChangedPixelsInCoordinates(revisedBase!, revisedMarked!, revisedSpec.SourceCoordinates) > 20);
 
@@ -259,6 +302,56 @@ public class FinancialComparisonEngineTests
             using var encoded = image.Encode(SKEncodedImageFormat.Png, 90);
             await File.WriteAllBytesAsync(visualArtifact, encoded.ToArray());
             Assert.True(new FileInfo(visualArtifact).Length > 10_000);
+        }
+        finally
+        {
+            File.Delete(originalPath);
+            File.Delete(revisedPath);
+        }
+    }
+
+    [Fact]
+    public void TextHighlightsExcludeUnchangedNumbersFromTheSameLine()
+    {
+        QuestPDF.Settings.License = LicenseType.Community;
+        const string originalLine = "Note 2025 2024";
+        const string revisedLine = "Index 2025 2024";
+        byte[] originalPdf = CreateTextPdf(originalLine);
+        byte[] revisedPdf = CreateTextPdf(revisedLine);
+        string originalPath = Path.Combine(Path.GetTempPath(), $"afs-text-original-{Guid.NewGuid():N}.pdf");
+        string revisedPath = Path.Combine(Path.GetTempPath(), $"afs-text-revised-{Guid.NewGuid():N}.pdf");
+
+        try
+        {
+            File.WriteAllBytes(originalPath, originalPdf);
+            File.WriteAllBytes(revisedPath, revisedPdf);
+            var diff = new LineDiffResult
+            {
+                Status = "changed",
+                Line1 = originalLine,
+                Line2 = revisedLine,
+                WordDiff = new()
+                {
+                    new WordDiffToken { Word = "Note", Tag = "removed" },
+                    new WordDiffToken { Word = "Index", Tag = "added" },
+                    new WordDiffToken { Word = "2025", Tag = "same" },
+                    new WordDiffToken { Word = "2024", Tag = "same" },
+                },
+            };
+            var pagePair = new PageDiffResult { PairIndex = 0, PageAfs1 = 1, PageAfs2 = 1 };
+            var originalSpec = InvokePrivateStatic<HighlightSpec>(typeof(AfsController), "BuildHighlightSpec", diff, 1);
+            var revisedSpec = InvokePrivateStatic<HighlightSpec>(typeof(AfsController), "BuildHighlightSpec", diff, 2);
+            originalSpec.OriginalValue = originalLine;
+            originalSpec.RevisedValue = revisedLine;
+            revisedSpec.OriginalValue = originalLine;
+            revisedSpec.RevisedValue = revisedLine;
+
+            var originalCoordinates = ResolveCoordinates(originalPath, pagePair, originalSpec, 1);
+            var revisedCoordinates = ResolveCoordinates(revisedPath, pagePair, revisedSpec, 2);
+            Assert.NotEmpty(originalCoordinates);
+            Assert.NotEmpty(revisedCoordinates);
+            Assert.Equal(new[] { "Note" }, WordsAtCoordinates(originalPdf, originalCoordinates));
+            Assert.Equal(new[] { "Index" }, WordsAtCoordinates(revisedPdf, revisedCoordinates));
         }
         finally
         {
@@ -359,6 +452,15 @@ public class FinancialComparisonEngineTests
             });
         })).GeneratePdf();
 
+    private static byte[] CreateTextPdf(string text) => Document.Create(document =>
+        document.Page(page =>
+        {
+            page.Size(PageSizes.A4);
+            page.Margin(40);
+            page.DefaultTextStyle(style => style.FontSize(12));
+            page.Content().Text(text);
+        })).GeneratePdf();
+
     private static string ExtractPageText(byte[] pdfBytes)
     {
         using var document = PdfDocument.Open(pdfBytes);
@@ -426,10 +528,43 @@ public class FinancialComparisonEngineTests
         return changed;
     }
 
+    private static int DarkPixelsInCoordinates(
+        SKBitmap bitmap,
+        IReadOnlyList<PdfSourceCoordinates> coordinates,
+        double pageWidth,
+        double pageHeight)
+    {
+        int darkPixels = 0;
+        foreach (var rect in coordinates)
+        {
+            int left = Math.Clamp((int)(rect.X * bitmap.Width / pageWidth), 0, bitmap.Width - 1);
+            int top = Math.Clamp((int)(rect.Y * bitmap.Height / pageHeight), 0, bitmap.Height - 1);
+            int right = Math.Clamp((int)((rect.X + rect.Width) * bitmap.Width / pageWidth) + 1, left + 1, bitmap.Width);
+            int bottom = Math.Clamp((int)((rect.Y + rect.Height) * bitmap.Height / pageHeight) + 1, top + 1, bitmap.Height);
+            for (int y = top; y < bottom; y++)
+            for (int x = left; x < right; x++)
+            {
+                var pixel = bitmap.GetPixel(x, y);
+                if (pixel.Red < 130 && pixel.Green < 130 && pixel.Blue < 130)
+                    darkPixels++;
+            }
+        }
+
+        return darkPixels;
+    }
+
     private static void AssertCoordinatesResolveToAmount(
         byte[] pdfBytes,
         IReadOnlyList<PdfSourceCoordinates> coordinates,
         string expectedDigits)
+    {
+        string digits = System.Text.RegularExpressions.Regex.Replace(string.Join("", WordsAtCoordinates(pdfBytes, coordinates)), @"\D", "");
+        Assert.Equal(expectedDigits, digits);
+    }
+
+    private static string[] WordsAtCoordinates(
+        byte[] pdfBytes,
+        IReadOnlyList<PdfSourceCoordinates> coordinates)
     {
         using var document = PdfDocument.Open(pdfBytes);
         var page = document.GetPage(1);
@@ -440,8 +575,7 @@ public class FinancialComparisonEngineTests
                 rect.Y + rect.Height >= page.Height - word.BoundingBox.Top))
             .Select(word => word.Text ?? "")
             .ToList();
-        string digits = System.Text.RegularExpressions.Regex.Replace(string.Join("", words), @"\D", "");
-        Assert.Equal(expectedDigits, digits);
+        return words.ToArray();
     }
 
     private static T InvokePrivateStatic<T>(Type type, string methodName, params object?[] args)

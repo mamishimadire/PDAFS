@@ -18,6 +18,11 @@ public class TableDiffService
         @"(?<![\p{L}\p{N}])(?:\(?\s*(?:ZAR|USD|EUR|GBP|AUD|CAD|JPY|CHF|R|[$€£¥₹])\s*)?[-−+]?\s*\d+(?:[ ,]\d{3})*(?:[.,]\d+)?\s*%?\)?(?![\p{L}\p{N}])",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex YearToken = new(@"\b(?:19|20)\d{2}\b", RegexOptions.Compiled);
+    private static readonly Regex ReferenceHeader = new(
+        @"\b(?:page|pages|folio|index|contents)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex DotLeaderPageReference = new(
+        @"(?:\.{2,}|…+|·{3,})\s*\d+\s*$", RegexOptions.Compiled);
+    private static readonly Regex IntegerReference = new(@"^\s*\d+\s*$", RegexOptions.Compiled);
     private static readonly Regex AggregateLabel = new(
         @"\b(?:total|subtotal|net|balance)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex CurrencyToken = new(
@@ -63,7 +68,30 @@ public class TableDiffService
             string tableId = BuildTableId(pagePair.PairIndex, heading);
             var rowMatches = MatchRows(firstRows, secondRows);
             tablePairs.Add(new TablePagePair(tableId, heading, pagePair, firstRows, secondRows, rowMatches));
-            results.AddRange(DiffRows(tableId, rowMatches, pagePair));
+            var pageFindings = DiffRows(tableId, rowMatches, pagePair).ToList();
+            if (IsReferenceIndex(firstRows, secondRows))
+            {
+                int? pageOffset = GetSystematicReferenceOffset(rowMatches);
+                string structuralType = pageOffset.HasValue ? "pagination-shift" : "reference-renumbering";
+                foreach (var finding in pageFindings.Where(finding =>
+                             IsPageReferenceValue(finding.ValueAfs1) || IsPageReferenceValue(finding.ValueAfs2)))
+                {
+                    finding.DifferenceType = "pagination-reference";
+                    finding.StructuralChangeType = structuralType;
+                    finding.SemanticClassification = "structural-change";
+                    finding.HighlightEligible = false;
+                    finding.Confidence = Math.Min(finding.Confidence, 0.95);
+                }
+
+                if (pageFindings.Any(finding => finding.DifferenceType == "pagination-reference") &&
+                    pagePair.StructuralChangeType == "none")
+                {
+                    pagePair.StructuralChangeType = structuralType;
+                    pagePair.StructuralPageOffset = pageOffset;
+                }
+            }
+
+            results.AddRange(pageFindings);
         }
 
         cmp.CalculationRelationships = ValidateCalculations(tablePairs, results);
@@ -73,6 +101,71 @@ public class TableDiffService
             finding.RevisedDocumentId = cmp.Report2.Filename;
         }
         return results;
+    }
+
+    private static bool IsReferenceIndex(
+        IReadOnlyList<TableRow> firstRows,
+        IReadOnlyList<TableRow> secondRows)
+    {
+        var rows = firstRows.Concat(secondRows).ToList();
+        if (rows.Count < 3 || rows.Any(row => row.ColumnHeaders.Count > 0))
+            return false;
+
+        var referenceRows = rows.Where(row => row.Values.Count > 0 &&
+                                              row.Values.All(IsPageReferenceValue)).ToList();
+        if (referenceRows.Count < 3 || referenceRows.Count / (double)rows.Count < 0.75)
+            return false;
+
+        bool explicitReferenceContext = rows.Any(row => ReferenceHeader.IsMatch(row.Heading));
+        bool dotLeaderContext = rows.Any(row => DotLeaderPageReference.IsMatch(row.SourceText));
+        return explicitReferenceContext || dotLeaderContext ||
+               IsMostlyAscendingPageSequence(firstRows) && IsMostlyAscendingPageSequence(secondRows);
+    }
+
+    private static bool IsMostlyAscendingPageSequence(IReadOnlyList<TableRow> rows)
+    {
+        var values = rows.OrderBy(row => row.SourceRow)
+            .Select(row => row.Values.Count == 1 && int.TryParse(row.Values[0], NumberStyles.None,
+                CultureInfo.InvariantCulture, out int value) ? value : (int?)null)
+            .Where(value => value.HasValue)
+            .Select(value => value!.Value)
+            .ToList();
+        if (values.Count < 3)
+            return false;
+
+        int orderedSteps = values.Zip(values.Skip(1), (first, second) => second >= first ? 1 : 0).Sum();
+        return orderedSteps >= Math.Ceiling((values.Count - 1) * 0.7);
+    }
+
+    private static bool IsPageReferenceValue(string value) =>
+        IntegerReference.IsMatch(value ?? "") &&
+        int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out int number) && number > 0;
+
+    private static int? GetSystematicReferenceOffset(IReadOnlyList<RowMatch> rowMatches)
+    {
+        var offsets = rowMatches
+            .Where(match => match.First != null && match.Second != null &&
+                            match.First.Values.Count == match.Second.Values.Count &&
+                            match.First.Values.All(IsPageReferenceValue) &&
+                            match.Second.Values.All(IsPageReferenceValue))
+            .SelectMany(match => Enumerable.Range(0, match.First!.Values.Count)
+                .Select(index => int.TryParse(match.Second!.Values[index], NumberStyles.None, CultureInfo.InvariantCulture, out int revised) &&
+                                 int.TryParse(match.First.Values[index], NumberStyles.None, CultureInfo.InvariantCulture, out int original)
+                    ? revised - original
+                    : (int?)null))
+            .Where(offset => offset.HasValue)
+            .Select(offset => offset!.Value)
+            .ToList();
+        if (offsets.Count < 2)
+            return null;
+
+        var dominant = offsets.GroupBy(offset => offset)
+            .OrderByDescending(group => group.Count())
+            .ThenBy(group => group.Key)
+            .First();
+        return dominant.Key != 0 && dominant.Count() / (double)offsets.Count >= 0.6
+            ? dominant.Key
+            : null;
     }
 
     private static List<TableRow> ExtractRows(string pageText)
