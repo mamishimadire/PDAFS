@@ -183,6 +183,94 @@ public class FinancialComparisonEngineTests
     }
 
     [Fact]
+    public void InsertedParagraphIsReportedOnceOnItsPageWithoutChangingTheFollowingHeading()
+    {
+        const string insertedText = "An explanatory sentence was added before the schedule begins.";
+        const string oldParagraph = "The entity reviewed the supporting schedule and confirmed that amounts agreed with records.";
+        const string revisedParagraph = "The entity rechecked the supporting schedule and confirmed that amounts agreed with records.";
+        string[] originalPages =
+        {
+            "The preceding section explains the preparation and review of the annual report.\n" +
+            "Supporting records are retained for the review.\n" +
+            "Management confirms the approved reporting basis.\n" +
+            "The accounting period is described in the accompanying statements.\n" +
+            "Evidence is available to authorized reviewers.\n" +
+            "The governance section records approval responsibilities.\n" +
+            "Financial schedules follow the narrative disclosures.\n" +
+            "All amounts are presented using the stated measurement basis.",
+            $"Continuation\n{oldParagraph}\nSchedule heading\nExisting schedule body remains unchanged for the reporting period.",
+        };
+        string[] revisedPages =
+        {
+            originalPages[0],
+            $"Continuation\n{revisedParagraph}\n{insertedText}\nSchedule heading\nExisting schedule body remains unchanged for the reporting period.",
+        };
+
+        var report1 = new PdfReport { Pages = originalPages.ToList() };
+        var report2 = new PdfReport { Pages = revisedPages.ToList() };
+        var alignment = Enumerable.Range(0, originalPages.Length)
+            .Select(index => new AlignmentEntry { I1 = index, I2 = index, Sim = 1.0 })
+            .ToList();
+        var pageDiffs = new LineComparatorService().CompareAlignedPages(report1, report2, alignment);
+
+        var insertedFindings = pageDiffs
+            .SelectMany(page => page.Diffs.Select(diff => (Page: page, Diff: diff)))
+            .Where(item => item.Diff.Status == "added" && item.Diff.Line2 == insertedText)
+            .ToList();
+        var inserted = Assert.Single(insertedFindings);
+        Assert.Equal(2, inserted.Page.PageAfs1);
+        Assert.Equal(2, inserted.Page.PageAfs2);
+
+        var schedulePage = Assert.Single(pageDiffs.Where(page => page.PageAfs1 == 2 && page.PageAfs2 == 2));
+        Assert.Contains(schedulePage.Diffs, diff =>
+            diff.Status == "changed" && diff.Line1 == oldParagraph && diff.Line2 == revisedParagraph);
+        Assert.Contains(schedulePage.Diffs, diff =>
+            diff.Status == "same" && diff.Line1 == "Schedule heading" && diff.Line2 == "Schedule heading");
+        Assert.DoesNotContain(pageDiffs.Where(page => page.PageAfs1 == 1), page =>
+            page.Diffs.Any(diff => diff.Line1 == "Schedule heading" || diff.Line2 == "Schedule heading" ||
+                                   diff.Line1 == oldParagraph || diff.Line2 == oldParagraph ||
+                                   diff.Line1 == revisedParagraph || diff.Line2 == revisedParagraph ||
+                                   diff.Line1 == insertedText || diff.Line2 == insertedText));
+    }
+
+    [Fact]
+    public void ExactTextMovedAcrossAdjacentPagesIsClassifiedAsCrossPageEquivalent()
+    {
+        const string movedText = "A supplementary explanation remains unchanged in the revised document.";
+        var report1 = new PdfReport
+        {
+            Pages = new()
+            {
+                $"Prior section\n{movedText}",
+                "Continuation\nSchedule heading\nExisting schedule body remains unchanged.",
+            },
+        };
+        var report2 = new PdfReport
+        {
+            Pages = new()
+            {
+                "Prior section",
+                $"Continuation\n{movedText}\nSchedule heading\nExisting schedule body remains unchanged.",
+            },
+        };
+        var alignment = new List<AlignmentEntry>
+        {
+            new() { I1 = 0, I2 = 0, Sim = 1.0 },
+            new() { I1 = 1, I2 = 1, Sim = 1.0 },
+        };
+
+        var pageDiffs = new LineComparatorService().CompareAlignedPages(report1, report2, alignment);
+
+        Assert.Contains(pageDiffs[0].Diffs, diff =>
+            diff.Status == "same-cross-page" && diff.Line1 == movedText);
+        Assert.Contains(pageDiffs[1].Diffs, diff =>
+            diff.Status == "same-cross-page" && diff.Line2 == movedText);
+        Assert.DoesNotContain(pageDiffs.SelectMany(page => page.Diffs), diff =>
+            (diff.Line1 == movedText || diff.Line2 == movedText) &&
+            diff.Status is "changed" or "added" or "removed");
+    }
+
+    [Fact]
     public void ReorderedSectionsAreMatchedAsRelocations()
     {
         string first = NarrativePage("resources", "The organization records its resources, short term balances, and obligations in the annual financial report.");

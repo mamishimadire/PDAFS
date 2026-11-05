@@ -68,8 +68,6 @@ public class LineComparatorService
 
     private const double LengthRatioThreshold = 0.55;
 
-    private const int NeighbourContextLines = 8;
-
     // Regex: strip page-number stamps before number extraction.
     // Matches lines that are PURELY a page stamp (e.g. "- 40 -", "Page 3 of 10").
     // Reference: Python _PAGE_NUM_RE
@@ -408,14 +406,18 @@ public class LineComparatorService
         var alignedI2   = new HashSet<int>(matchedEntries.Select(e => e.I2));
 
         // Each page pair's diff is fully independent — compute all in parallel.
+        // Compare only text extracted from the aligned pages. Adding neighbouring
+        // page fringes here made one inserted or edited paragraph appear in several
+        // page pairs, and could pair it with an unrelated nearby heading. Exact
+        // cross-page moves are reconciled below from page-local added/removed lines.
         var matchedResults = new PageDiffResult[matchedEntries.Count];
         System.Threading.Tasks.Parallel.For(0, matchedEntries.Count, idx =>
         {
             var entry = matchedEntries[idx];
             int i1 = entry.I1, i2 = entry.I2;
-            string context1 = BuildNeighbourContext(report1.Pages, i1, NeighbourContextLines);
-            string context2 = BuildNeighbourContext(report2.Pages, i2, NeighbourContextLines);
-            var diff = CompareLinesGreedy(SplitLines(context1), SplitLines(context2));
+            var diff = CompareLinesGreedy(
+                SplitLines(report1.Pages[i1]),
+                SplitLines(report2.Pages[i2]));
             diff = SuppressBleedDiffsV2(diff, report1, report2, i1, i2);
             diff = MergeParagraphReflowArtefacts(diff);
 
@@ -619,32 +621,6 @@ public class LineComparatorService
         }
 
         return result;
-    }
-
-    private static string BuildNeighbourContext(
-        List<string> pages,
-        int pageIndex,
-        int fringeLines)
-    {
-        var sb = new StringBuilder();
-
-        if (pageIndex > 0)
-        {
-            var prevLines = SplitLines(pages[pageIndex - 1]);
-            foreach (var line in prevLines.TakeLast(fringeLines))
-                sb.AppendLine(line);
-        }
-
-        sb.Append(pages[pageIndex]);
-
-        if (pageIndex < pages.Count - 1)
-        {
-            var nextLines = SplitLines(pages[pageIndex + 1]);
-            foreach (var line in nextLines.Take(fringeLines))
-                sb.AppendLine(line);
-        }
-
-        return sb.ToString();
     }
 
     private static List<LineDiffResult> SuppressBleedDiffs(
